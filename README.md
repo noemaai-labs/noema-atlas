@@ -22,7 +22,7 @@ Prebuilt downloads sit on the [latest release](https://github.com/noemaai-labs/n
 
 For Noema Atlas, open `Noema-Atlas-macos.dmg` on a Mac and drag the app into your Applications folder, run `Noema-Atlas-Setup.exe` on Windows, or mark `Noema-Atlas-x86_64.AppImage` executable on Linux and launch it. Release builds for macOS are Developer ID signed and notarized when the signing secrets are configured, which lets them open without a Gatekeeper prompt; otherwise the first launch is a right click and Open.
 
-Noema Atlas Studio is attached to the same release, and its installers carry the word Studio in their names. The macOS build needs nothing further, because WebKit comes with the system. On Windows it installs the WebView2 runtime for you if your machine lacks it, and on Linux it expects `webkit2gtk` to be present, which `apt install libwebkit2gtk-4.1-0` will provide.
+Noema Studio is attached to the same release, and its installers carry the word Studio in their names. The macOS build needs nothing further, because WebKit comes with the system. On Windows it installs the WebView2 runtime for you if your machine lacks it, and on Linux it expects `webkit2gtk` to be present, which `apt install libwebkit2gtk-4.1-0` will provide.
 
 If you would rather build from source, a recent Rust toolchain is enough for Atlas:
 
@@ -30,7 +30,7 @@ If you would rather build from source, a recent Rust toolchain is enough for Atl
 cargo run -p noema-desktop --release
 ```
 
-Atlas Studio lives in its own workspace and asks for a newer compiler, since the Tauri libraries underneath it want Rust 1.88 or later. Its installers come from `scripts/bundle-studio.sh`, and the development loop is written up in [`crates/studio/README.md`](crates/studio/README.md).
+Studio lives in its own workspace and asks for a newer compiler, since the Tauri libraries underneath it want Rust 1.88 or later. Its installers come from `scripts/bundle-studio.sh`, and the development loop is written up in [`crates/studio/README.md`](crates/studio/README.md).
 
 ## Working from the terminal
 
