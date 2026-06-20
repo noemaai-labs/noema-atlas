@@ -20,9 +20,9 @@ serde.workspace = true
 serde_json.workspace = true
 tracing-subscriber.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }
-rfd = { version = "0.14", default-features = false, features = ["gtk3"] }
+rfd = { version = "0.17", default-features = false, features = ["gtk3"] }
 
-eframe = { version = "0.28", default-features = false, features = [
+eframe = { version = "0.34", default-features = false, features = [
     "glow",
     "default_fonts",
     "x11",

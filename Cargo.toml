@@ -26,13 +26,13 @@ serde_json = "1"
 ciborium = "0.2"
 
 blake3 = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 hex = "0.4"
 base64 = "0.22"
 
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "net", "signal"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "http2", "gzip", "socks"] }
@@ -41,12 +41,12 @@ bytes = "1"
 url = "2"
 async-trait = "0.1"
 
-thiserror = "1"
+thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive", "env"] }
-time = { version = ">=0.3, <0.3.49", features = ["formatting", "parsing", "macros"] }
+time = { version = ">=0.3, <0.3.50", features = ["formatting", "parsing", "macros"] }
 
 reflink-copy = "0.1"
 
