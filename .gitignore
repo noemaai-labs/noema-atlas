@@ -36,6 +36,9 @@ Thumbs.db
 .vscode/
 
 # AI agent local state
+MEMORY
+MEMORY.md
+memory.md
 AGENTS.md
 agents.md
 CLAUDE.md
