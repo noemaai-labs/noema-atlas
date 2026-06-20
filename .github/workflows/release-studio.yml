@@ -11,21 +11,41 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      os:
+        description: "Which OS to build on a manual run"
+        type: choice
+        options: [all, linux, windows]
+        default: all
 
 permissions:
   contents: write
 
 jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        shell: bash
+        run: |
+          sel="${{ github.event.inputs.os || 'all' }}"
+          linux='{"os":"ubuntu-latest","target":"linux"}'
+          windows='{"os":"windows-latest","target":"windows"}'
+          case "$sel" in
+            linux)   inc="[$linux]" ;;
+            windows) inc="[$windows]" ;;
+            *)       inc="[$linux,$windows]" ;;
+          esac
+          echo "matrix={\"include\":$inc}" >> "$GITHUB_OUTPUT"
+
   studio:
+    needs: setup
     name: studio (${{ matrix.os }})
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: linux
-          - os: windows-latest
-            target: windows
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
