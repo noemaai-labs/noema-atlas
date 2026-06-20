@@ -16,4 +16,4 @@ crate-type = ["cdylib", "staticlib", "lib"]
 noema-core.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
-uniffi = "0.28"
+uniffi = "0.31"
