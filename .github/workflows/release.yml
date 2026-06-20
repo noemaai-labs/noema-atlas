@@ -17,17 +17,12 @@ jobs:
         include:
           - os: ubuntu-latest
             target: linux-x86_64
-          - os: macos-latest
-            target: macos-arm64
           - os: windows-latest
             target: windows-x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          # macOS: add x86_64 so bundle-macos.sh can build a universal app.
-          targets: ${{ runner.os == 'macOS' && 'x86_64-apple-darwin,aarch64-apple-darwin' || '' }}
       - uses: Swatinem/rust-cache@v2
 
       - name: install GUI build deps (Linux)
@@ -58,48 +53,7 @@ jobs:
           tar -C target/release -czf "out/noema-atlas-${{ matrix.target }}.tar.gz" \
             noema noema-desktop noema-registry
 
-      # ====================================================================
-      # macOS: signed + notarized .dmg (one-click) + CLI tarball
-      # ====================================================================
-      - name: import signing certificate (macOS)
-        if: runner.os == 'macOS'
-        env:
-          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
-          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
-        run: |
-          if [ -z "$MACOS_CERT_P12" ]; then
-            echo "No MACOS_CERT_P12 secret set — the app will be ad-hoc signed (not notarized)."
-            exit 0
-          fi
-          KEYCHAIN="$RUNNER_TEMP/build.keychain"
-          security create-keychain -p actions "$KEYCHAIN"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN"
-          security default-keychain -s "$KEYCHAIN"
-          security unlock-keychain -p actions "$KEYCHAIN"
-          echo "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
-          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
-            -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple:,codesign: \
-            -s -k actions "$KEYCHAIN"
-          rm -f "$RUNNER_TEMP/cert.p12"
-
-      - name: package (macOS)
-        if: runner.os == 'macOS'
-        env:
-          SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
-          NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
-          NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
-          NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
-        run: |
-          mkdir -p out
-          # Universal (arm64 + x86_64) app, packaged as a drag-to-install dmg.
-          # Signed + notarized when the secrets above are present.
-          bash scripts/bundle-macos.sh --universal --dmg dist
-          cp "dist/Noema-Atlas-macos-universal.dmg" "out/Noema-Atlas-macos.dmg"
-          # CLI/registry tarball (host arch) for terminal users.
-          cargo build --release -p noema-cli -p noema-registry
-          tar -C target/release -czf "out/noema-atlas-${{ matrix.target }}-cli.tar.gz" \
-            noema noema-registry
+      # macOS builds are produced and notarized locally, not in CI.
 
       # ====================================================================
       # Windows: NSIS installer (one-click) + portable zip

@@ -1,10 +1,8 @@
 name: Release Studio
 
-# Builds Noema Studio (the Tauri app) for macOS, Linux, and Windows on a tag
-# push and attaches the installers to the same GitHub release as the Desktop
-# build (see release.yml). macOS builds are Developer ID-signed and notarized
-# when the signing secrets are present, and fall back to an ad-hoc signature
-# otherwise so the workflow still produces a runnable app.
+# Builds Noema Studio (the Tauri app) for Linux and Windows on a tag push and
+# attaches the installers to the same GitHub release as the Desktop build (see
+# release.yml). macOS builds are produced and notarized locally, not in CI.
 #
 # Studio is its own workspace pinned to rustc >= 1.88; current stable on the
 # GitHub runners clears that, so `dtolnay/rust-toolchain@stable` is enough.
@@ -24,22 +22,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
-            target: macos
-            args: "--target universal-apple-darwin"
           - os: ubuntu-latest
             target: linux
-            args: ""
           - os: windows-latest
             target: windows
-            args: ""
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -64,23 +55,8 @@ jobs:
       - name: install tauri-cli
         run: cargo install tauri-cli --version "^2" --locked
 
-      # macOS: signed + notarized .dmg via Tauri's bundler. The Apple env reuses
-      # the same secrets as the Desktop workflow; when they are unset Tauri
-      # ad-hoc signs instead and the dmg is unsigned (still runnable locally).
-      - name: build Studio (macOS)
-        if: runner.os == 'macOS'
-        working-directory: crates/studio
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.MACOS_CERT_P12 }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
-          APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
-        run: cargo tauri build --features custom-protocol ${{ matrix.args }}
-
+      # macOS builds are produced and notarized locally, not in CI.
       - name: build Studio (Linux / Windows)
-        if: runner.os != 'macOS'
         working-directory: crates/studio
         run: cargo tauri build --features custom-protocol
 
