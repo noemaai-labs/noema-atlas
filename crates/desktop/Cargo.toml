@@ -1,0 +1,30 @@
+[package]
+name = "noema-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Native, low-RAM desktop GUI for Noema Atlas (egui — no webview, no HTML)."
+
+[[bin]]
+name = "noema-desktop"
+path = "src/main.rs"
+
+[dependencies]
+noema-core = { workspace = true, features = ["iroh"] }
+tokio.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing-subscriber.workspace = true
+image = { version = "0.25", default-features = false, features = ["png"] }
+rfd = { version = "0.14", default-features = false, features = ["gtk3"] }
+
+eframe = { version = "0.28", default-features = false, features = [
+    "glow",
+    "default_fonts",
+    "x11",
+    "wayland",
+] }

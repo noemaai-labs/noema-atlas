@@ -1,0 +1,61 @@
+[package]
+name = "noema-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Core engine for Noema Atlas: hashing, manifests, content-addressed cache, verification, source adapters."
+
+[lib]
+name = "noema_core"
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[features]
+default = ["http", "huggingface", "ipfs", "os-keystore"]
+http = ["dep:reqwest", "dep:url"]
+huggingface = ["http"]
+ipfs = ["http"]
+iroh = ["dep:iroh", "dep:iroh-blobs", "dep:async-channel", "dep:anyhow"]
+os-keystore = ["dep:keyring"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+ciborium.workspace = true
+
+blake3.workspace = true
+sha2.workspace = true
+sha1 = "0.10"
+ed25519-dalek.workspace = true
+rand_core.workspace = true
+hex.workspace = true
+base64.workspace = true
+
+rusqlite.workspace = true
+
+tokio.workspace = true
+async-trait.workspace = true
+futures-util.workspace = true
+bytes.workspace = true
+reqwest = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+
+thiserror.workspace = true
+tracing.workspace = true
+time.workspace = true
+reflink-copy.workspace = true
+
+keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "linux-native"], optional = true }
+
+iroh = { version = "0.28", optional = true }
+iroh-blobs = { version = "0.28", optional = true }
+async-channel = { version = "2", optional = true }
+anyhow = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true }
+anyhow.workspace = true
+axum = "0.7"

@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="icon" type="image/png" href="/favicon.png" />
+<title>Noema Atlas</title>
+<style>
+  :root {
+    --bg:#0e1116; --panel:#171c24; --panel2:#1e242e; --line:#2a313c;
+    --fg:#e6edf3; --muted:#8b97a7; --accent:#5db0ff; --good:#56d364; --warn:#e3b341; --bad:#f8634a;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+         background:var(--bg); color:var(--fg); }
+  header { padding:16px 24px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:12px; }
+  header h1 { font-size:18px; margin:0; font-weight:650; letter-spacing:.2px; }
+  header .tag { color:var(--muted); font-size:12px; }
+  .wrap { display:grid; grid-template-columns:340px 1fr; gap:0; height:calc(100vh - 57px); }
+  .side { border-right:1px solid var(--line); overflow:auto; }
+  .main { overflow:auto; padding:20px 24px; }
+  .tabs { display:flex; gap:4px; padding:10px 12px; border-bottom:1px solid var(--line); }
+  .tab { padding:5px 10px; border-radius:6px; cursor:pointer; color:var(--muted); font-size:13px; }
+  .tab.active { background:var(--panel2); color:var(--fg); }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px 14px; margin:10px 12px; cursor:pointer; }
+  .card:hover { border-color:var(--accent); }
+  .card.sel { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset; }
+  .card h3 { margin:0 0 4px; font-size:14px; }
+  .badges { display:flex; gap:6px; flex-wrap:wrap; margin-top:6px; }
+  .badge { font-size:11px; padding:2px 7px; border-radius:999px; background:var(--panel2); color:var(--muted); border:1px solid var(--line); }
+  .badge.good { color:var(--good); border-color:#1f4427; }
+  .badge.bad { color:var(--bad); border-color:#5a2620; }
+  .badge.warn { color:var(--warn); border-color:#5a4a1a; }
+  .badge.accent { color:var(--accent); border-color:#1c3a55; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:18px 20px; margin-bottom:18px; }
+  .panel h2 { margin:0 0 12px; font-size:16px; }
+  .row { display:flex; justify-content:space-between; gap:12px; padding:6px 0; border-bottom:1px solid var(--line); }
+  .row:last-child { border-bottom:0; }
+  .k { color:var(--muted); }
+  .mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12px; }
+  button { background:var(--accent); color:#04121f; border:0; border-radius:8px; padding:8px 14px; font-weight:600; cursor:pointer; }
+  button.ghost { background:var(--panel2); color:var(--fg); border:1px solid var(--line); }
+  button:disabled { opacity:.5; cursor:default; }
+  input, textarea { background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:8px; padding:8px; width:100%; font-family:inherit; }
+  textarea { min-height:90px; font-family:ui-monospace,monospace; font-size:12px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line); }
+  th { color:var(--muted); font-weight:500; }
+  .src { display:flex; align-items:center; gap:8px; padding:6px 0; }
+  .empty { color:var(--muted); padding:24px; text-align:center; }
+  .toast { position:fixed; bottom:18px; right:18px; background:var(--panel2); border:1px solid var(--line); padding:10px 14px; border-radius:8px; max-width:420px; }
+  .toast.bad { border-color:var(--bad); }
+  .actions { display:flex; gap:8px; align-items:center; margin-top:14px; flex-wrap:wrap; }
+  a { color:var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1><img src="/logo.png" alt="" style="height:1.4em;vertical-align:-0.3em;margin-right:.3em" /> Noema Atlas</h1>
+  <span class="tag">verified multi-source distribution for local LLM weights</span>
+</header>
+<div class="wrap">
+  <div class="side">
+    <div class="tabs">
+      <div class="tab active" data-tab="models">Models</div>
+      <div class="tab" data-tab="cache">Cache</div>
+      <div class="tab" data-tab="health">Sources</div>
+    </div>
+    <div id="list"></div>
+  </div>
+  <div class="main" id="main"><div class="empty">Select a model, or import a manifest.</div></div>
+</div>
+<script>
+const $ = (s,el=document)=>el.querySelector(s);
+let state = { tab:'models', selected:null };
+
+function toast(msg, bad=false){
+  const t=document.createElement('div'); t.className='toast'+(bad?' bad':''); t.textContent=msg;
+  document.body.appendChild(t); setTimeout(()=>t.remove(), 4200);
+}
+async function api(path, opts){ const r=await fetch(path,opts); if(!r.ok){ let m; try{m=(await r.json()).error}catch{m=r.statusText} throw new Error(m||('HTTP '+r.status)); } return r.json(); }
+function badge(text, cls=''){ return `<span class="badge ${cls}">${text}</span>`; }
+function bytes(n){ if(n<1024)return n+' B'; const u=['KB','MB','GB','TB']; let i=-1; do{n/=1024;i++}while(n>=1024&&i<u.length-1); return n.toFixed(1)+' '+u[i]; }
+
+document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{
+  document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+  t.classList.add('active'); state.tab=t.dataset.tab; render();
+});
+
+async function render(){
+  const list=$('#list');
+  if(state.tab==='models'){
+    const ms=await api('/api/manifests');
+    list.innerHTML = `<div style="padding:10px 12px"><button class="ghost" id="imp" style="width:100%">+ Import manifest</button></div>` +
+      (ms.length? ms.map(m=>`
+        <div class="card ${state.selected===m.manifest_id?'sel':''}" data-id="${m.manifest_id}">
+          <h3>${esc(m.model_name)}</h3>
+          <div class="mono" style="color:var(--muted);font-size:11px">${m.manifest_id}</div>
+          <div class="badges">
+            ${badge(m.license_spdx)}
+            ${m.signed?badge('signed','good'):badge('unsigned','warn')}
+            ${m.gated?badge('gated','bad'):''}
+            ${badge(m.redistribution,'accent')}
+          </div>
+        </div>`).join('') : `<div class="empty">No manifests yet.</div>`);
+    $('#imp').onclick=importDialog;
+    list.querySelectorAll('.card').forEach(c=>c.onclick=()=>{ state.selected=c.dataset.id; render(); showModel(c.dataset.id); });
+  } else if(state.tab==='cache'){
+    const c=await api('/api/cache');
+    list.innerHTML = `<div class="empty">${c.length} cached blob(s)</div>`;
+    showCache(c);
+  } else {
+    const h=await api('/api/health');
+    list.innerHTML = `<div class="empty">${h.length} known source(s)</div>`;
+    showHealth(h);
+  }
+}
+
+function importDialog(){
+  $('#main').innerHTML = `<div class="panel"><h2>Import a signed manifest</h2>
+    <textarea id="mjson" placeholder="paste manifest JSON here"></textarea>
+    <div class="actions"><button id="doimp">Import</button></div></div>`;
+  $('#doimp').onclick=async()=>{
+    try{ const r=await api('/api/import',{method:'POST',body:$('#mjson').value});
+      toast(`Imported ${r.manifest_id} — policy: ${r.policy_allowed?'allow':'DENY'}`, !r.policy_allowed);
+      state.selected=r.manifest_id; render(); showModel(r.manifest_id);
+    }catch(e){ toast(e.message,true); }
+  };
+}
+
+async function showModel(id){
+  const m=await api('/api/manifest/'+encodeURIComponent(id));
+  const arts=m.artifacts.map(a=>`
+    <tr><td class="mono">${esc(a.path)}</td><td>${a.role}</td><td>${bytes(a.size_bytes)}</td>
+    <td>${a.format||'—'}</td><td>${a.cached?badge('cached','good'):badge('missing','warn')}</td></tr>`).join('');
+  const srcs=m.artifacts.flatMap(a=>a.sources).map(s=>`
+    <div class="src">${badge(s.class,'accent')} <span class="mono" style="color:var(--muted)">${esc(s.source_id)}</span>
+    ${s.auth!=='None'?badge('auth:'+s.auth,'warn'):''}</div>`).join('');
+  $('#main').innerHTML = `
+    <div class="panel">
+      <h2>${esc(m.model.name)}</h2>
+      <div class="badges" style="margin-bottom:10px">
+        ${m.signed?badge('signed','good'):badge('unsigned','warn')}
+        ${m.access.gated?badge('gated','bad'):''}
+        ${badge(m.license.spdx)} ${badge(m.license.redistribution,'accent')}
+      </div>
+      <div class="row"><span class="k">Manifest id</span><span class="mono">${m.manifest_id}</span></div>
+      <div class="row"><span class="k">Publisher</span><span>${esc(m.publisher)}</span></div>
+      <div class="row"><span class="k">Revision</span><span class="mono">${m.model.revision||'—'}</span></div>
+      <div class="row"><span class="k">Valid signatures</span><span>${m.valid_signatures.length}</span></div>
+      <div class="actions">
+        <button id="dl">Download &amp; verify</button>
+        <input id="inst" placeholder="install target dir" style="max-width:280px">
+        <button class="ghost" id="doinst">Install</button>
+      </div>
+    </div>
+    <div class="panel"><h2>Artifacts</h2><table>
+      <tr><th>Path</th><th>Role</th><th>Size</th><th>Format</th><th>Status</th></tr>${arts}</table></div>
+    <div class="panel"><h2>Sources</h2>${srcs||'<div class="empty">none</div>'}</div>
+    <div class="panel"><h2>Fetch plan</h2><div class="mono" style="white-space:pre-wrap">${esc(JSON.stringify(m.plan,null,2))}</div></div>`;
+  $('#dl').onclick=async(ev)=>{
+    ev.target.disabled=true; ev.target.textContent='Downloading…';
+    try{ const r=await api('/api/download/'+encodeURIComponent(id),{method:'POST'});
+      const prov=r.artifacts.map(a=>a.from_cache?`${a.artifact_path}: already cached`:`${a.artifact_path}: from ${a.source_id}`).join('; ');
+      toast('Verified ✓ '+prov); showModel(id);
+    }catch(e){ toast(e.message,true); ev.target.disabled=false; ev.target.textContent='Download & verify'; }
+  };
+  $('#doinst').onclick=async()=>{
+    const t=$('#inst').value.trim(); if(!t){toast('enter a target dir',true);return;}
+    try{ const r=await api('/api/install/'+encodeURIComponent(id),{method:'POST',body:t});
+      toast('Installed '+r.installed.length+' file(s) ('+(r.installed[0]?.link_kind||'')+')');
+    }catch(e){ toast(e.message,true); }
+  };
+}
+
+function showCache(c){
+  if(!c.length){ $('#main').innerHTML=`<div class="empty">Cache is empty.</div>`; return; }
+  const rows=c.map(b=>`<tr><td class="mono">${b.blake3.slice(0,20)}…</td><td>${bytes(b.size_bytes)}</td><td>${b.state}</td><td>${b.committed_at}</td></tr>`).join('');
+  const total=c.reduce((s,b)=>s+b.size_bytes,0);
+  $('#main').innerHTML=`<div class="panel"><h2>Content-addressed cache — ${bytes(total)} across ${c.length} blob(s)</h2>
+    <table><tr><th>BLAKE3</th><th>Size</th><th>State</th><th>Committed</th></tr>${rows}</table></div>`;
+}
+function showHealth(h){
+  if(!h.length){ $('#main').innerHTML=`<div class="empty">No source history yet.</div>`; return; }
+  const rows=h.map(x=>`<tr><td class="mono">${esc(x.source_id)}</td><td>${x.success}</td><td>${x.failure}</td>
+    <td>${x.integrity_failures}</td><td>${x.banned?badge('BANNED','bad'):badge('ok','good')}</td>
+    <td>${x.last_latency_ms??'—'}</td></tr>`).join('');
+  $('#main').innerHTML=`<div class="panel"><h2>Source health</h2>
+    <table><tr><th>Source</th><th>OK</th><th>Fail</th><th>Integrity</th><th>Status</th><th>Latency ms</th></tr>${rows}</table></div>`;
+}
+function esc(s){ return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+render();
+</script>
+</body>
+</html>

@@ -1,0 +1,110 @@
+name: Release Studio
+
+# Builds Noema Studio (the Tauri app) for macOS, Linux, and Windows on a tag
+# push and attaches the installers to the same GitHub release as the Desktop
+# build (see release.yml). macOS builds are Developer ID-signed and notarized
+# when the signing secrets are present, and fall back to an ad-hoc signature
+# otherwise so the workflow still produces a runnable app.
+#
+# Studio is its own workspace pinned to rustc >= 1.88; current stable on the
+# GitHub runners clears that, so `dtolnay/rust-toolchain@stable` is enough.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  studio:
+    name: studio (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: macos
+            args: "--target universal-apple-darwin"
+          - os: ubuntu-latest
+            target: linux
+            args: ""
+          - os: windows-latest
+            target: windows
+            args: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/studio
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: install Tauri Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+            libayatana-appindicator3-dev patchelf libfuse2 file
+
+      - name: install front-end dependencies
+        working-directory: crates/studio
+        run: npm --prefix ui ci
+
+      - name: install tauri-cli
+        run: cargo install tauri-cli --version "^2" --locked
+
+      # macOS: signed + notarized .dmg via Tauri's bundler. The Apple env reuses
+      # the same secrets as the Desktop workflow; when they are unset Tauri
+      # ad-hoc signs instead and the dmg is unsigned (still runnable locally).
+      - name: build Studio (macOS)
+        if: runner.os == 'macOS'
+        working-directory: crates/studio
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.MACOS_CERT_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+        run: cargo tauri build --features custom-protocol ${{ matrix.args }}
+
+      - name: build Studio (Linux / Windows)
+        if: runner.os != 'macOS'
+        working-directory: crates/studio
+        run: cargo tauri build --features custom-protocol
+
+      - name: collect installers
+        shell: bash
+        run: |
+          mkdir -p out
+          find crates/studio/target -path '*/release/bundle/*' \
+            \( -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' \
+               -o -name '*.msi' -o -name '*.exe' \) \
+            -exec sh -c 'cp "$1" "out/$(basename "$1")"' _ {} \;
+          echo "Collected:" && ls -la out
+
+      - name: upload to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: upload artifacts (non-tag runs)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: noema-studio-${{ matrix.target }}
+          path: out/*

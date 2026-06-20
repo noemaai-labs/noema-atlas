@@ -1,0 +1,6 @@
+# Frontend build artifacts and deps
+ui/node_modules/
+ui/dist/
+
+# Tauri generated sources (schemas, etc.)
+gen/

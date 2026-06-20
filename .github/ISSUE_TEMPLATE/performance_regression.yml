@@ -1,0 +1,56 @@
+name: Performance regression
+description: Report a measurable slowdown, excessive resource use, or transfer regression.
+title: "[Perf]: "
+labels: ["performance", "needs-triage"]
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Download planner
+        - Hashing / verification
+        - Cache / install path
+        - CLI
+        - Native Atlas desktop app
+        - Studio desktop app
+        - P2P / Iroh / LAN discovery
+        - Packaging / startup
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: version_good
+    attributes:
+      label: Last known good version or commit
+  - type: input
+    id: version_bad
+    attributes:
+      label: First known bad version or commit
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform and hardware
+      placeholder: "OS, CPU, memory, disk type, network type"
+    validations:
+      required: true
+  - type: textarea
+    id: workload
+    attributes:
+      label: Workload
+      description: Describe the model/file size, source type, command or UI path, and network conditions.
+    validations:
+      required: true
+  - type: textarea
+    id: measurements
+    attributes:
+      label: Measurements
+      description: Include before/after numbers for time, throughput, memory, CPU, disk, or peer count behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Additional notes

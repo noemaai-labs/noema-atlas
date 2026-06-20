@@ -1,0 +1,26 @@
+[workspace]
+
+[package]
+name = "noema-studio"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "Apache-2.0"
+authors = ["Noema Atlas contributors"]
+repository = "https://github.com/noemaai-labs/noema-atlas"
+description = "Noema Atlas Studio — opt-in polished desktop UI (Tauri + Svelte)"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+noema-core = { path = "../core", features = ["iroh"] }
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tokio = { version = "1", features = ["sync"] }
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]

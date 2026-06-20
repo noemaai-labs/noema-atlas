@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/noemaai-labs/noema-atlas/security/advisories/new
+    about: Report suspected vulnerabilities privately.
+  - name: Questions and ideas
+    url: https://github.com/noemaai-labs/noema-atlas/discussions
+    about: Use discussions for open-ended questions once the public repository enables them.

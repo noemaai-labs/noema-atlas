@@ -1,0 +1,52 @@
+name: Feature request
+description: Propose a focused change or new capability.
+title: "[Feature]: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Core engine
+        - CLI
+        - Native Atlas desktop app
+        - Studio desktop app
+        - P2P / Iroh / LAN discovery
+        - Registry / manifests
+        - Installers / packaging
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or workflow
+      description: What are you trying to do, and where does the current project fall short?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the smallest useful shape of the feature.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Include workarounds, existing tools, or reasons this belongs in Noema Atlas.
+  - type: textarea
+    id: risks
+    attributes:
+      label: Security, privacy, or compatibility considerations
+      description: Note any impact on manifests, sharing defaults, credentials, storage, or cross-platform behavior.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Preflight
+      options:
+        - label: I searched existing issues and discussions.
+          required: true

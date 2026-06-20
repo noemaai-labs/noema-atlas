@@ -1,0 +1,19 @@
+[package]
+name = "noema-mobile-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "UniFFI bindings exposing the Noema Atlas engine to Swift (iOS) and Kotlin (Android)."
+
+[lib]
+name = "noema_mobile"
+crate-type = ["cdylib", "staticlib", "lib"]
+
+[dependencies]
+noema-core.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+uniffi = "0.28"

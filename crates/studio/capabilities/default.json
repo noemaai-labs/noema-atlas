@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Core permissions for the main Studio window: window controls and the event channel used for live download progress.",
+  "windows": ["main"],
+  "permissions": ["core:default", "dialog:default"]
+}

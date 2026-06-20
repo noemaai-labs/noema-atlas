@@ -1,0 +1,32 @@
+[package]
+name = "noema-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Cross-platform CLI for Noema Atlas (worldwide P2P)."
+
+[[bin]]
+name = "noema"
+path = "src/main.rs"
+
+[features]
+iroh = ["noema-core/iroh"]
+
+[dependencies]
+noema-core = { workspace = true }
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+time.workspace = true
+futures-util.workspace = true
+bytes.workspace = true
+axum = "0.7"
+tokio-util = { version = "0.7", features = ["io"] }

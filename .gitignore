@@ -1,0 +1,57 @@
+# Rust build output
+/target
+**/target
+
+# Packaging output
+/dist
+/out
+/Noema-Atlas-*.zip
+/Noema-Atlas-*.dmg
+/Noema-Atlas-*.AppImage
+
+# This is an application workspace — Cargo.lock IS committed (do not ignore it).
+
+# Runtime / local data
+/registry-data
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Secrets (never commit)
+.env
+.env.*
+!.env.example
+*.hex
+*.key
+*.pem
+*.p12
+*.pfx
+secret.hex
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# AI agent local state
+AGENTS.md
+agents.md
+CLAUDE.md
+GEMINI.md
+.claude/
+.codex/
+.cursor/
+.cursorrules
+.windsurf/
+.windsurfrules
+.aider*
+.continue/
+.gemini/
+.openhands/
+.opencode/
+.qwen/
+.roo/
+.roocode/
+.kiro/

@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Noema Atlas — verified, peer-to-peer model distribution</title>
+<meta name="description" content="Download and share local LLM weights the resilient way: content-addressed, signed, and peer-to-peer worldwide. Hugging Face is one source, not the only one." />
+<link rel="icon" type="image/png" href="/logo.png" />
+<meta property="og:title" content="Noema Atlas — verified model distribution" />
+<meta property="og:description" content="Every open model. Verified. From anywhere." />
+<meta property="og:type" content="website" />
+<meta property="og:url" content="https://atlas.noemaai.com/" />
+<meta property="og:image" content="/logo.png" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Bodoni+Moda:ital,opsz,wght@0,6..96,400..600;1,6..96,400..600&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+<style>
+  :root{
+    --bg:#fafafa; --fg:#1a1a1a; --muted:#737373; --muted-soft:#9a9a9a;
+    --border:#e7e7e7; --border-soft:#efefef; --card:#ffffff;
+    --primary:#0a0a0a; --primary-fg:#fafafa;
+    --serif:"Bodoni Moda",Georgia,"Times New Roman",serif;
+    --sans:"Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --shadow-elegant:0 24px 60px -16px rgba(0,0,0,.12);
+    --shadow-glow:0 10px 34px -8px rgba(0,0,0,.12);
+    --shadow-card:0 2px 14px rgba(0,0,0,.045);
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font-family:var(--sans);font-size:16px;line-height:1.6;
+    font-feature-settings:"cv11","ss01";
+    -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
+    overflow-x:hidden;}
+  a{color:inherit;text-decoration:none}
+  ::selection{background:var(--primary);color:var(--primary-fg)}
+  .wrap{max-width:1120px;margin:0 auto;padding:0 24px}
+  nav{position:fixed;top:16px;left:0;right:0;z-index:50;display:flex;justify-content:center;padding:0 16px;
+    transition:all .5s ease}
+  .navbar{width:100%;max-width:980px;display:flex;align-items:center;gap:14px;
+    padding:11px 12px 11px 20px;border-radius:999px;
+    border:1px solid transparent;background:transparent;transition:all .5s ease}
+  nav.scrolled .navbar{background:rgba(250,250,250,.78);backdrop-filter:saturate(180%) blur(18px);
+    -webkit-backdrop-filter:saturate(180%) blur(18px);
+    border-color:rgba(0,0,0,.08);box-shadow:0 12px 40px -12px rgba(0,0,0,.18)}
+  .navbrand{display:flex;align-items:center;gap:11px}
+  .navbrand img{width:30px;height:30px;border-radius:7px}
+  .navbrand .name{font-family:var(--serif);font-size:1.28rem;font-weight:500;letter-spacing:-.01em}
+  .navlinks{margin-left:auto;display:flex;gap:30px;align-items:center}
+  .navlinks a{font-size:.9rem;font-weight:500;color:var(--muted);transition:color .2s}
+  .navlinks a:hover{color:var(--fg)}
+  .btn{display:inline-flex;align-items:center;justify-content:center;gap:.55em;
+    background:var(--primary);color:var(--primary-fg);
+    padding:.95rem 1.9rem;border-radius:999px;font-weight:500;font-size:1rem;letter-spacing:.01em;
+    border:1px solid var(--primary);box-shadow:var(--shadow-glow);cursor:pointer;
+    transition:transform .25s ease,box-shadow .25s ease}
+  .btn:hover{transform:scale(1.045);box-shadow:var(--shadow-elegant)}
+  .btn:active{transform:scale(.97)}
+  .btn.sm{padding:.6rem 1.3rem;font-size:.9rem}
+  .btn.ghost{background:transparent;color:var(--fg);border:1px solid var(--border);box-shadow:none}
+  .btn.ghost:hover{background:rgba(0,0,0,.045);border-color:#d6d6d6;transform:none}
+  .btn .arr{transition:transform .25s ease}
+  .btn:hover .arr{transform:translateX(3px)}
+  .hero{position:relative;min-height:94vh;display:flex;flex-direction:column;align-items:center;
+    justify-content:center;text-align:center;padding:150px 0 60px}
+  .glow{position:absolute;left:50%;top:42%;transform:translate(-50%,-50%);
+    width:82vw;height:78vh;max-width:1100px;border-radius:50%;pointer-events:none;z-index:0;
+    background:radial-gradient(circle,rgba(0,0,0,.06),rgba(0,0,0,.02) 45%,transparent 70%);
+    filter:blur(40px);opacity:.8}
+  .hero .wrap{position:relative;z-index:1}
+  .badge{display:inline-flex;align-items:center;gap:.7rem;padding:.55rem 1.05rem;border-radius:999px;
+    border:1px solid rgba(0,0,0,.10);background:rgba(0,0,0,.035);backdrop-filter:blur(8px);
+    font-size:.7rem;font-weight:600;letter-spacing:.2em;text-transform:uppercase;color:var(--muted)}
+  .ping{position:relative;display:inline-flex;height:8px;width:8px;flex:0 0 8px}
+  .ping i{position:absolute;inset:0;border-radius:50%;background:var(--fg)}
+  .ping i.a{animation:ping 1.7s cubic-bezier(0,0,.2,1) infinite;opacity:.7}
+  @keyframes ping{75%,100%{transform:scale(2.6);opacity:0}}
+  .hero h1{font-family:var(--serif);font-weight:400;
+    font-size:clamp(44px,8.2vw,104px);line-height:.92;letter-spacing:-.03em;
+    margin:30px auto 0;max-width:13ch}
+  .hero h1 .it{font-style:italic;color:var(--muted)}
+  .hero p.sub{font-size:clamp(17px,2.1vw,21px);color:var(--muted);font-weight:300;letter-spacing:-.01em;
+    line-height:1.55;max-width:660px;margin:28px auto 36px}
+  .cta{display:flex;gap:14px;justify-content:center;flex-wrap:wrap}
+  .net{position:relative;z-index:1;margin:54px auto 0;max-width:760px;background:var(--card);
+    border:1px solid var(--border);border-radius:1.5rem;padding:30px 26px 24px;
+    box-shadow:var(--shadow-elegant)}
+  .net .row{display:grid;grid-template-columns:repeat(3,1fr)}
+  .net .cell{text-align:center;padding:4px 8px;position:relative}
+  .net .cell+.cell::before{content:"";position:absolute;left:0;top:14%;height:72%;width:1px;background:var(--border)}
+  .net .n{font-size:clamp(34px,5vw,46px);font-weight:600;letter-spacing:-.02em;color:var(--fg);
+    font-variant-numeric:tabular-nums;line-height:1}
+  .net .l{font-size:.82rem;color:var(--muted);margin-top:9px;letter-spacing:.02em}
+  .live{display:inline-flex;align-items:center;gap:8px;color:var(--muted);font-size:.78rem;
+    margin-top:22px;text-transform:uppercase;letter-spacing:.16em;font-weight:500}
+  .live .ping i{background:#16a34a}
+  .live .ping i.a{background:#16a34a}
+  section{position:relative;padding:90px 0;border-top:1px solid var(--border-soft)}
+  .kicker{font-size:.72rem;font-weight:600;letter-spacing:.22em;text-transform:uppercase;color:var(--muted)}
+  h2{font-family:var(--serif);font-weight:400;font-size:clamp(28px,4.2vw,48px);line-height:1.04;
+    letter-spacing:-.025em;margin:.4em 0 .3em;max-width:18ch}
+  h2 .it{font-style:italic;color:var(--muted)}
+  .lead{color:var(--muted);max-width:680px;font-size:1.06rem;font-weight:300;line-height:1.7}
+  .lead strong{color:var(--fg);font-weight:600}
+
+  .grid{display:grid;grid-template-columns:repeat(2,1fr);gap:18px;margin-top:40px}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:1.25rem;padding:28px;
+    box-shadow:var(--shadow-card);transition:transform .3s ease,box-shadow .3s ease,border-color .3s ease}
+  .card:hover{transform:translateY(-4px);box-shadow:var(--shadow-elegant);border-color:#dcdcdc}
+  .card .ico{width:46px;height:46px;border-radius:50%;display:grid;place-items:center;
+    background:var(--fg);color:var(--bg);margin-bottom:18px}
+  .card .ico svg{width:22px;height:22px}
+  .card h3{font-size:1.08rem;font-weight:600;letter-spacing:-.01em;margin:0 0 .4em}
+  .card p{margin:0;color:var(--muted);font-size:.96rem;line-height:1.65}
+
+  .steps{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;margin-top:48px;counter-reset:s}
+  .step{background:var(--card);border:1px solid var(--border);border-radius:1.25rem;padding:34px 26px 26px;
+    position:relative;box-shadow:var(--shadow-card)}
+  .step::before{counter-increment:s;content:counter(s);position:absolute;top:-19px;left:26px;
+    width:38px;height:38px;border-radius:50%;background:var(--fg);color:var(--bg);display:grid;
+    place-items:center;font-weight:600;font-size:.95rem;box-shadow:var(--shadow-glow)}
+  .step h3{margin:.2em 0 .45em;font-size:1.05rem;font-weight:600;letter-spacing:-.01em}
+  .step p{margin:0;color:var(--muted);font-size:.95rem;line-height:1.6}
+  .step em{font-style:italic;color:var(--fg)}
+
+  code,kbd{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#f0f0f0;
+    border:1px solid var(--border);border-radius:6px;padding:2px 7px;font-size:.85em}
+  pre{background:var(--primary);color:#ededed;border-radius:1rem;padding:22px 24px;overflow:auto;
+    font-size:.86rem;line-height:1.7;margin-top:30px;box-shadow:var(--shadow-elegant)}
+  pre code{background:none;border:none;color:inherit;padding:0}
+  pre .c{color:#8a8a8a}
+
+  .dl{display:flex;gap:14px;flex-wrap:wrap;margin-top:34px}
+  .hashline{font-family:ui-monospace,monospace;color:var(--muted-soft);font-size:.84rem;
+    word-break:break-all;margin-top:26px;letter-spacing:.01em}
+
+  footer{position:relative;border-top:1px solid var(--border-soft);padding:80px 0 48px;overflow:hidden}
+  .footglow{position:absolute;top:0;left:50%;transform:translateX(-50%);width:80vw;height:40vh;
+    background:radial-gradient(circle at 50% 0,rgba(0,0,0,.05),transparent 65%);filter:blur(60px);
+    pointer-events:none}
+  .footgrid{position:relative;display:flex;gap:24px;flex-wrap:wrap;align-items:flex-start}
+  .footbrand{display:flex;align-items:center;gap:12px;margin-bottom:14px}
+  .footbrand img{width:30px;height:30px;border-radius:7px}
+  .footbrand .name{font-family:var(--serif);font-size:1.4rem;font-weight:500;letter-spacing:-.01em}
+  .foottag{color:var(--muted);font-weight:300;max-width:320px;line-height:1.6;font-size:.96rem}
+  .footlinks{margin-left:auto;display:flex;gap:28px;flex-wrap:wrap}
+  .footlinks a{color:var(--muted);font-size:.92rem;transition:color .2s}
+  .footlinks a:hover{color:var(--fg)}
+  .footnote{margin-top:46px;padding-top:24px;border-top:1px solid var(--border-soft);
+    color:var(--muted-soft);font-size:.84rem;display:flex;justify-content:space-between;gap:14px;flex-wrap:wrap}
+
+  @media(max-width:820px){.navlinks{display:none}}
+  @media(max-width:720px){
+    .grid,.steps{grid-template-columns:1fr}
+    .net .row{grid-template-columns:1fr;gap:24px}
+    .net .cell+.cell::before{display:none}
+    section{padding:64px 0}
+  }
+</style>
+</head>
+<body>
+
+<nav id="nav"><div class="navbar">
+  <a class="navbrand" href="/">
+    <img src="/logo.png" alt="Noema Atlas" />
+    <span class="name">Noema&nbsp;Atlas</span>
+  </a>
+  <span class="navlinks">
+    <a href="#how">How it works</a>
+    <a href="#network">Network</a>
+    <a href="#p2p">Peer to peer</a>
+    <a href="#download">Download</a>
+  </span>
+  <a class="btn sm" href="#download">Get Atlas</a>
+</div></nav>
+
+<header class="hero">
+  <div class="glow"></div>
+  <div class="wrap">
+    <span class="badge"><span class="ping"><i class="a"></i><i></i></span>Verified multi-source distribution</span>
+    <h1>Every open model.<br /><span class="it">Verified.</span> From anywhere.</h1>
+    <p class="sub">Download and share local LLM weights the resilient way — content-addressed,
+      cryptographically signed, and peer-to-peer worldwide. Hugging Face is one source, not the only one.</p>
+    <div class="cta">
+      <a class="btn" href="#download">Get Noema Atlas
+        <svg class="arr" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+      </a>
+      <a class="btn ghost" href="#how">See how it works</a>
+    </div>
+
+    <div id="network" class="net">
+      <div class="row">
+        <div class="cell"><div class="n" id="s-files">—</div><div class="l">files shared</div></div>
+        <div class="cell"><div class="n" id="s-peers">—</div><div class="l">peers online</div></div>
+        <div class="cell"><div class="n" id="s-manifests">—</div><div class="l">signed manifests</div></div>
+      </div>
+      <div style="text-align:center"><span class="live"><span class="ping"><i class="a"></i><i></i></span>The Atlas network, live</span></div>
+    </div>
+  </div>
+</header>
+
+<section><div class="wrap">
+  <div class="kicker">Why</div>
+  <h2>An excellent downloader first. <span class="it">A network second.</span></h2>
+  <p class="lead">The local-LLM community keeps asking for the same things: don't depend on one host,
+    publish hashes, make it fast, and reuse what's already on disk. Atlas does exactly that.</p>
+  <div class="grid">
+    <div class="card">
+      <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg></div>
+      <h3>Verified, always</h3>
+      <p>Every artifact is identified by its content hash (BLAKE3 + SHA-256) and described by an
+        Ed25519-signed manifest. Corruption and poisoning are caught while bytes stream in; bad sources are banned.</p>
+    </div>
+    <div class="card">
+      <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg></div>
+      <h3>Many sources, one file</h3>
+      <p>The same weights from Hugging Face, an HTTPS mirror, IPFS, or a worldwide Iroh peer
+        all collapse into one verified blob. If one source is slow or gone, Atlas fails over automatically.</p>
+    </div>
+    <div class="card">
+      <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7v10a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-7L9 4H5a2 2 0 0 0-2 2z"/></svg></div>
+      <h3>Stored once</h3>
+      <p>A content-addressed cache means identical files across quants, mirrors, and sources are stored a single
+        time; installs are reflinks/hardlinks, not copies.</p>
+    </div>
+    <div class="card">
+      <div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/></svg></div>
+      <h3>Yours, and resilient</h3>
+      <p>If it's local and verified, access can't be silently altered or withdrawn. Seed what you download and
+        help preserve open models for everyone.</p>
+    </div>
+  </div>
+</div></section>
+
+<section id="how"><div class="wrap">
+  <div class="kicker">How it works</div>
+  <h2>Search. Pick a version. <span class="it">Download — verified.</span></h2>
+  <div class="steps">
+    <div class="step"><h3>Search any model</h3><p>Type a name and browse live results from Hugging Face —
+      downloads, likes, license, quant variants.</p></div>
+    <div class="step"><h3>Pick a version</h3><p>Choose a quant. Atlas shows every place it can come from, and
+      its <em>Content ID</em> — the file's P2P address.</p></div>
+    <div class="step"><h3>Get it, verified</h3><p>Pulled from Hugging Face or a nearby/worldwide peer, checked
+      against its hash byte-for-byte, and deduplicated.</p></div>
+  </div>
+</div></section>
+
+<section id="p2p"><div class="wrap">
+  <div class="kicker">Peer to peer</div>
+  <h2>The file's hash <span class="it">is its address.</span></h2>
+  <p class="lead">Because identity is the content hash, Atlas can find a model anywhere. Peers announce what
+    they have to this tracker; transfers run over Iroh (QUIC, NAT-traversing) — directly between machines when
+    possible. Turn on <strong>Share my models worldwide</strong> and your openly-licensed downloads help
+    seed the swarm. Gated/licensed and privately-imported models stay on your machine unless you opt them
+    in — Atlas verifies content, not licenses, so you decide (and are responsible for) what you redistribute.</p>
+  <p class="hashline">content-id (sha256): a few bytes → the same file, everywhere · verified, whoever serves it</p>
+</div></section>
+
+<section id="download"><div class="wrap">
+  <div class="kicker">Download</div>
+  <h2>Get Noema Atlas</h2>
+  <p class="lead">A native, low-RAM desktop app for macOS, Windows, and Linux — no browser, no Electron.
+    Or drive everything from the cross-platform CLI.</p>
+  <div class="dl">
+    <a class="btn" href="https://github.com/noemaai-labs/noema-atlas/releases">macOS</a>
+    <a class="btn" href="https://github.com/noemaai-labs/noema-atlas/releases">Windows</a>
+    <a class="btn" href="https://github.com/noemaai-labs/noema-atlas/releases">Linux</a>
+    <a class="btn ghost" href="https://github.com/noemaai-labs/noema-atlas">Source on GitHub</a>
+  </div>
+  <pre><code><span class="c"># or from the terminal</span>
+noema hf search "llama 3 gguf"
+noema hf get bartowski/Llama-3.2-1B-Instruct-GGUF q4_k_m --into ./models</code></pre>
+</div></section>
+
+<section id="publish"><div class="wrap">
+  <div class="kicker">For builders</div>
+  <h2>Publish models <span class="it">people can trust.</span></h2>
+  <p class="lead">Sign a manifest with your Ed25519 key and publish it here. Anyone can then fetch your model
+    from any source and prove it's exactly what you released. Atlas is open source and built on a shared Rust core
+    that also powers the desktop, CLI, and mobile apps.</p>
+</div></section>
+
+<footer>
+  <div class="footglow"></div>
+  <div class="wrap">
+    <div class="footgrid">
+      <div>
+        <a class="footbrand" href="/">
+          <img src="/logo.png" alt="Noema Atlas" />
+          <span class="name">Noema&nbsp;Atlas</span>
+        </a>
+        <p class="foottag">Verified, peer-to-peer distribution for open model weights. Part of Noema.</p>
+      </div>
+      <div class="footlinks">
+        <a href="#how">How it works</a>
+        <a href="#network">Network</a>
+        <a href="#download">Download</a>
+        <a href="https://github.com/noemaai-labs/noema-atlas">GitHub</a>
+        <a href="https://noemaai.com">noemaai.com</a>
+      </div>
+    </div>
+    <div class="footnote">
+      <span>© Noema — Atlas. This page is also the live network tracker.</span>
+      <span>Every open model. Verified. From anywhere.</span>
+    </div>
+  </div>
+</footer>
+
+<script>
+  var nav = document.getElementById('nav');
+  function onScroll(){ if(window.scrollY > 40){ nav.classList.add('scrolled'); } else { nav.classList.remove('scrolled'); } }
+  window.addEventListener('scroll', onScroll, {passive:true}); onScroll();
+  function fmt(n){ if(n>=1e6) return (n/1e6).toFixed(1)+'M'; if(n>=1e3) return (n/1e3).toFixed(1)+'k'; return ''+n; }
+  async function refresh(){
+    try{
+      const r = await fetch('/stats',{cache:'no-store'});
+      const d = await r.json();
+      document.getElementById('s-files').textContent = fmt(d.files_shared||0);
+      document.getElementById('s-peers').textContent = fmt(d.peers_online||0);
+      document.getElementById('s-manifests').textContent = fmt(d.manifests||0);
+    }catch(e){}
+  }
+  refresh(); setInterval(refresh, 5000);
+</script>
+</body>
+</html>
