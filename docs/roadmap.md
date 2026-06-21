@@ -36,6 +36,16 @@ manifest, and policy layers are mature.
   QUIC, BLAKE3-verified, with n0 discovery + relay for NAT traversal. Exposed via
   `iroh-serve` / `iroh-fetch` and wired into the engine as an `iroh` source.
   Verified with a live two-process transfer (byte-identical, hash-checked).
+* ✅ **Multi-peer swarm aggregation (Iroh)**: when the tracker returns several
+  peers for a large blob, the leecher splits the blob's chunk space into pieces
+  and pulls them from *all* peers at once over per-peer connections (work-stealing,
+  so fast peers do more and a dead peer's piece is re-served), making throughput
+  the sum of the peers rather than the speed of one. Each piece is bao-verified
+  against the file hash as it streams; the full-file dual-hash gate still runs
+  before commit. **Crucially leecher-side only**: no change to content identity,
+  the manifest, seeding, or the wire protocol — every peer already serving a whole
+  blob answers ranged requests, so the existing swarm aggregates with no re-seed.
+  One peer / small files fall back to the plain single-peer download.
 * ❌ **mDNS LAN discovery** (`serve --mdns` + `discover`): built then **removed**.
   Worldwide tracker + Iroh discovery (NAT-traversing) superseded LAN-only peering.
 * ✅ **Mobile FFI**: `crates/mobile-ffi` (UniFFI) compiles; remaining is the
@@ -54,8 +64,10 @@ manifest, and policy layers are mature.
   available for headless/remote boxes.
 * ✅ **Multi-connection downloads**: a single large HTTP(S)/Hugging Face source
   is split into parallel range requests (aria2-style) and verified whole-file
-  before commit. **Next:** fetch disjoint ranges from *several different sources*
-  at once (the planner and verifier already support the pieces).
+  before commit. Multi-*peer* striping across Iroh peers also ships (see above).
+  **Next:** fetch disjoint ranges from *several different HTTP sources* at once,
+  and mix HTTP + peer stripes in one transfer (the planner and verifier already
+  support the pieces).
 * **Optional ClamAV/YARA** hook for sidecar files.
 * **Availability/preservation**: source-health dashboards, curated preservation
   nodes for long-tail/huge checkpoints, registry availability hints.

@@ -1859,12 +1859,16 @@ impl Engine {
         let size = artifact.size_bytes;
         let what = artifact.path.clone();
         let temp_buf = temp.to_path_buf();
+        let cancel = self.cancel.clone();
         tokio::task::spawn_blocking(move || {
             use std::io::Read;
             let mut v = StreamingVerifier::new(expected, size, None, what);
             let mut f = std::fs::File::open(&temp_buf).map_err(|e| Error::fs(&temp_buf, e))?;
             let mut buf = vec![0u8; 1 << 20];
             loop {
+                if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(Error::Cancelled);
+                }
                 let n = f.read(&mut buf).map_err(|e| Error::fs(&temp_buf, e))?;
                 if n == 0 {
                     break;
@@ -1906,37 +1910,44 @@ impl Engine {
         let ct = chunk_tree.clone();
         let what = artifact.path.clone();
         let temp_buf = temp.to_path_buf();
-        let validated: Option<StreamingVerifier> = tokio::task::spawn_blocking(move || {
-            use std::io::Read;
-            let mut v = StreamingVerifier::new(expected, size, ct, what);
-            let mut f = match std::fs::File::open(&temp_buf) {
-                Ok(f) => f,
-                Err(_) => return None,
-            };
-            let mut remaining = want;
-            let mut buf = vec![0u8; 1 << 20];
-            while remaining > 0 {
-                let take = (buf.len() as u64).min(remaining) as usize;
-                let n = match f.read(&mut buf[..take]) {
-                    Ok(0) | Err(_) => return None, // short read or io error => discard
-                    Ok(n) => n,
+        let cancel = self.cancel.clone();
+        // Ok(Some) = validated prefix, Ok(None) = discard & restart, Err = cancelled.
+        let validated: std::result::Result<Option<StreamingVerifier>, ()> =
+            tokio::task::spawn_blocking(move || {
+                use std::io::Read;
+                let mut v = StreamingVerifier::new(expected, size, ct, what);
+                let mut f = match std::fs::File::open(&temp_buf) {
+                    Ok(f) => f,
+                    Err(_) => return Ok(None),
                 };
-                if v.feed(&buf[..n]).is_err() {
-                    return None; // corrupt prefix (caught with a chunk tree)
+                let mut remaining = want;
+                let mut buf = vec![0u8; 1 << 20];
+                while remaining > 0 {
+                    if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Err(());
+                    }
+                    let take = (buf.len() as u64).min(remaining) as usize;
+                    let n = match f.read(&mut buf[..take]) {
+                        Ok(0) | Err(_) => return Ok(None), // short read or io error => discard
+                        Ok(n) => n,
+                    };
+                    if v.feed(&buf[..n]).is_err() {
+                        return Ok(None); // corrupt prefix (caught with a chunk tree)
+                    }
+                    remaining -= n as u64;
                 }
-                remaining -= n as u64;
-            }
-            Some(v)
-        })
-        .await
-        .map_err(|e| Error::other(format!("resume task join: {e}")))?;
+                Ok(Some(v))
+            })
+            .await
+            .map_err(|e| Error::other(format!("resume task join: {e}")))?;
 
         match validated {
-            Some(v) => Ok((v, want)),
-            None => {
+            Ok(Some(v)) => Ok((v, want)),
+            Ok(None) => {
                 truncate_to(temp, 0).await?;
                 Ok((fresh(), 0))
             }
+            Err(()) => Err(Error::Cancelled),
         }
     }
 
@@ -1945,6 +1956,11 @@ impl Engine {
     /// offloaded to a blocking thread.
     async fn finalize_blob(&self, artifact: &Artifact, meta: &BlobMeta) -> Result<()> {
         self.db.upsert_cache_blob(meta, "ready")?;
+        // The blob is already committed; the chunk-tree pass re-reads the whole
+        // (multi-GB) file, so a Stop/Pause skips it instead of waiting it out.
+        if self.is_cancelled() {
+            return Ok(());
+        }
         if self.cas.load_chunk_tree(&meta.blake3)?.is_none() {
             let leaf_size = artifact
                 .chunking
@@ -1954,8 +1970,11 @@ impl Engine {
             if let Ok(blob_path) = self.cas.blob_path(&meta.blake3) {
                 let cas = self.cas.clone();
                 let blake3 = meta.blake3.clone();
+                let cancel = self.cancel.clone();
                 let _ = tokio::task::spawn_blocking(move || {
-                    if let Ok(tree) = ChunkTree::from_file(&blob_path, leaf_size) {
+                    if let Ok(tree) =
+                        ChunkTree::from_file_cancellable(&blob_path, leaf_size, Some(&cancel))
+                    {
                         let _ = cas.store_chunk_tree(&blake3, &tree);
                     }
                 })

@@ -654,7 +654,7 @@ mod iroh_adapter {
         async fn open(
             &self,
             source: &Source,
-            _artifact: &Artifact,
+            artifact: &Artifact,
             _range: Option<ByteRange>,
             ctx: &FetchCtx,
         ) -> Result<Opened> {
@@ -691,8 +691,15 @@ mod iroh_adapter {
             // A full BlobTicket string also works; otherwise treat entries as
             // node tickets and fetch the blob by its blake3 hash.
             let result = if blob_hash.len() == 64 {
-                node.fetch_from_providers(blob_hash, tickets, &tmp, cancel, on_bytes)
-                    .await
+                node.fetch_from_providers(
+                    blob_hash,
+                    tickets,
+                    &tmp,
+                    artifact.size_bytes,
+                    cancel,
+                    on_bytes,
+                )
+                .await
             } else {
                 node.fetch_to_file(&tickets[0], &tmp, cancel, on_bytes)
                     .await

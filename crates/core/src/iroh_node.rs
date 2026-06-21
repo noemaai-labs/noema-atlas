@@ -96,6 +96,70 @@ fn fetch_stalled(
     }
 }
 
+/// Stripe piece size. A whole multiple of the 16 KiB bao chunk group so a stripe
+/// boundary never splits a group (which would make peers ship overlapping spine).
+const STRIPE_PIECE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Below this, with one peer, striping isn't worth its per-connection overhead.
+const MULTIPEER_MIN_BYTES: u64 = 2 * STRIPE_PIECE_BYTES;
+
+const MAX_STRIPE_PEERS: usize = 16;
+
+/// blake3 leaf chunk size; `ChunkNum`/`RangeSpec` count in these units.
+const BLAKE3_CHUNK: u64 = 1024;
+
+/// Split a blob into contiguous `[start_chunk, end_chunk)` stripe pieces. Pure for
+/// unit testing.
+fn stripe_pieces(size: u64) -> std::collections::VecDeque<(u64, u64)> {
+    let total_chunks = size.div_ceil(BLAKE3_CHUNK);
+    let piece_chunks = STRIPE_PIECE_BYTES / BLAKE3_CHUNK;
+    let mut pieces = std::collections::VecDeque::new();
+    let mut c = 0u64;
+    while c < total_chunks {
+        let end = (c + piece_chunks).min(total_chunks);
+        pieces.push_back((c, end));
+        c = end;
+    }
+    pieces
+}
+
+/// Fetch one chunk range of `hash` over `conn`, bao-verified against the root and
+/// written to `file` at the leaves' absolute offsets. A bad peer fails before any
+/// byte is written.
+async fn get_blob_range(
+    conn: &Connection,
+    hash: Hash,
+    start_chunk: u64,
+    end_chunk: u64,
+    file: &mut iroh_io::File,
+) -> Result<()> {
+    use bao_tree::{ChunkNum, ChunkRanges};
+    use iroh_blobs::get::fsm::{ConnectedNext, EndBlobNext};
+    use iroh_blobs::protocol::{GetRequest, RangeSpecSeq};
+
+    let ranges = ChunkRanges::from(ChunkNum(start_chunk)..ChunkNum(end_chunk));
+    let request = GetRequest::new(hash, RangeSpecSeq::from_ranges([ranges]));
+    let connected = iroh_blobs::get::fsm::start(conn.clone(), request)
+        .next()
+        .await
+        .map_err(|e| ierr("stripe connect", e))?;
+    let ConnectedNext::StartRoot(start_root) =
+        connected.next().await.map_err(|e| ierr("stripe next", e))?
+    else {
+        return Err(ierr("stripe", "expected StartRoot"));
+    };
+    let at_end = start_root
+        .next()
+        .write_all(&mut *file)
+        .await
+        .map_err(|e| ierr("stripe decode/write", e))?;
+    let EndBlobNext::Closing(closing) = at_end.next() else {
+        return Err(ierr("stripe", "expected closing"));
+    };
+    closing.next().await.map_err(|e| ierr("stripe close", e))?;
+    Ok(())
+}
+
 /// Live provider-side counters for the worldwide Iroh seeder.
 ///
 /// These are intentionally small and cloneable so the desktop UI can sample the
@@ -766,18 +830,15 @@ impl IrohNode {
     }
 
     /// Fetch a blob by its blake3 hash from the given provider node tickets (as
-    /// returned by the tracker), exporting it to `dest`.
-    ///
-    /// All reachable providers are handed to the downloader **at once** so it can
-    /// dial them concurrently and pull from whichever responds first — rather than
-    /// probing each peer serially (which stalls on every dead/stale entry before
-    /// reaching a live one). This is the torrent-like "start now, gather peers as
-    /// you go" behavior: an offline peer no longer blocks the ones that are up.
+    /// returned by the tracker), exporting it to `dest`. With several peers and a
+    /// large file this stripes the blob across all of them ([`fetch_striped`]);
+    /// otherwise, or on failure, it falls back to a single-peer download.
     pub async fn fetch_from_providers(
         &self,
         blake3_hex: &str,
         node_tickets: &[String],
         dest: &Path,
+        size: u64,
         cancel: Option<Arc<AtomicBool>>,
         on_bytes: Option<BytesProgress>,
     ) -> Result<()> {
@@ -799,8 +860,192 @@ impl IrohNode {
                 "no reachable peers are online for this file right now",
             ));
         }
+        if nodes.len() >= 2 && size >= MULTIPEER_MIN_BYTES {
+            match self
+                .fetch_striped(
+                    hash,
+                    nodes.clone(),
+                    dest,
+                    size,
+                    cancel.clone(),
+                    on_bytes.clone(),
+                )
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(Error::Cancelled) => return Err(Error::Cancelled),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "striped multi-peer fetch failed; falling back to single-peer download"
+                    );
+                }
+            }
+        }
         self.fetch_hash(hash, BlobFormat::Raw, nodes, dest, cancel, on_bytes)
             .await
+    }
+
+    /// Pull one blob from many peers at once. The blob is split into pieces in a
+    /// shared queue; one worker per peer pulls pieces (work-stealing, so fast peers
+    /// do more and a piece a dead peer drops is re-queued) and fetches each as a
+    /// bao-verified range written straight to `dest` at its absolute offset.
+    pub async fn fetch_striped(
+        &self,
+        hash: Hash,
+        nodes: Vec<iroh::net::NodeAddr>,
+        dest: &Path,
+        size: u64,
+        cancel: Option<Arc<AtomicBool>>,
+        on_bytes: Option<BytesProgress>,
+    ) -> Result<()> {
+        use std::collections::VecDeque;
+        use std::sync::Mutex as StdMutex;
+
+        // Pre-size so workers can write their stripes at absolute offsets.
+        {
+            let f = std::fs::File::create(dest).map_err(|e| Error::fs(dest, e))?;
+            f.set_len(size).map_err(|e| Error::fs(dest, e))?;
+        }
+
+        let total_pieces = stripe_pieces(size).len() as u64;
+        // (start_chunk, end_chunk, attempts)
+        let queue: Arc<StdMutex<VecDeque<(u64, u64, u32)>>> = Arc::new(StdMutex::new(
+            stripe_pieces(size).into_iter().map(|(s, e)| (s, e, 0)).collect(),
+        ));
+        let pieces_left = Arc::new(AtomicU64::new(total_pieces));
+        let bytes_done = Arc::new(AtomicU64::new(0));
+        let last_emit = Arc::new(AtomicU64::new(0));
+        // Set when a piece has failed on every peer: striping can't finish.
+        let fatal = Arc::new(AtomicBool::new(false));
+        let max_attempts = nodes.len() as u32 + 2;
+
+        let n_workers = nodes.len().min(MAX_STRIPE_PEERS);
+        let mut workers: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        for node in nodes.into_iter().take(n_workers) {
+            let endpoint = self.endpoint.clone();
+            let dest = dest.to_path_buf();
+            let queue = queue.clone();
+            let pieces_left = pieces_left.clone();
+            let bytes_done = bytes_done.clone();
+            let last_emit = last_emit.clone();
+            let fatal = fatal.clone();
+            let cancel = cancel.clone();
+            let on_bytes = on_bytes.clone();
+            workers.spawn(async move {
+                let stopped = |c: &Option<Arc<AtomicBool>>| {
+                    c.as_ref().map(|f| f.load(Ordering::SeqCst)).unwrap_or(false)
+                };
+                // One QUIC connection per peer, reused for every piece it serves.
+                let conn = match tokio::time::timeout(
+                    CONNECT_TIMEOUT,
+                    endpoint.connect(node, iroh_blobs::protocol::ALPN),
+                )
+                .await
+                {
+                    Ok(Ok(c)) => c,
+                    _ => return,
+                };
+                // Per-worker handle: positioned writes to disjoint offsets are safe
+                // across independent handles to the same file.
+                let mut file = match std::fs::OpenOptions::new().write(true).open(&dest) {
+                    Ok(f) => iroh_io::File::from_std(f),
+                    Err(_) => return,
+                };
+                let mut idle_polls = 0u32;
+                loop {
+                    if fatal.load(Ordering::SeqCst) || stopped(&cancel) {
+                        return;
+                    }
+                    let next = { queue.lock().unwrap().pop_front() };
+                    let Some((start, end, attempts)) = next else {
+                        if pieces_left.load(Ordering::SeqCst) == 0 {
+                            return;
+                        }
+                        // Empty for now but not done: another worker may re-queue a
+                        // failed piece. Back off and re-check, bounded so a wedged
+                        // peer set can't spin forever.
+                        idle_polls += 1;
+                        if idle_polls > 200 {
+                            return;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    };
+                    idle_polls = 0;
+                    let outcome = tokio::time::timeout(
+                        STALL_TIMEOUT,
+                        get_blob_range(&conn, hash, start, end, &mut file),
+                    )
+                    .await;
+                    match outcome {
+                        Ok(Ok(())) => {
+                            let nbytes =
+                                (end * BLAKE3_CHUNK).min(size) - (start * BLAKE3_CHUNK).min(size);
+                            let done = bytes_done.fetch_add(nbytes, Ordering::SeqCst) + nbytes;
+                            pieces_left.fetch_sub(1, Ordering::SeqCst);
+                            if let Some(sink) = on_bytes.as_deref() {
+                                let prev = last_emit.load(Ordering::SeqCst);
+                                if done.saturating_sub(prev) >= (1 << 20) || done >= size {
+                                    last_emit.store(done, Ordering::SeqCst);
+                                    sink(done.min(size), size);
+                                }
+                            }
+                        }
+                        _ => {
+                            // Re-queue for another peer, then drop this connection.
+                            let attempts = attempts + 1;
+                            if attempts >= max_attempts {
+                                fatal.store(true, Ordering::SeqCst);
+                            } else {
+                                queue.lock().unwrap().push_back((start, end, attempts));
+                            }
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+
+        // Drive the workers, applying the connect/stall watchdog over aggregate bytes.
+        let started = std::time::Instant::now();
+        let mut last_bytes = 0u64;
+        let mut last_advance = started;
+        loop {
+            tokio::select! {
+                done = workers.join_next() => {
+                    if done.is_none() {
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
+                    if cancel.as_ref().map(|f| f.load(Ordering::SeqCst)).unwrap_or(false) {
+                        workers.abort_all();
+                        return Err(Error::Cancelled);
+                    }
+                    let now = bytes_done.load(Ordering::SeqCst);
+                    if now > last_bytes {
+                        last_bytes = now;
+                        last_advance = std::time::Instant::now();
+                    }
+                    if fetch_stalled(started.elapsed(), last_bytes > 0, last_advance.elapsed()) {
+                        tracing::warn!("striped fetch watchdog: no aggregate progress, aborting");
+                        fatal.store(true, Ordering::SeqCst);
+                        workers.abort_all();
+                        return Err(Error::transport("iroh", TransportErrorKind::NotFound));
+                    }
+                }
+            }
+        }
+
+        if pieces_left.load(Ordering::SeqCst) == 0 {
+            if let Some(sink) = on_bytes.as_deref() {
+                sink(size, size);
+            }
+            Ok(())
+        } else {
+            Err(Error::transport("iroh", TransportErrorKind::NotFound))
+        }
     }
 
     /// Run the (`!Send`) download + export on the blob store's local pool. The
@@ -1032,6 +1277,44 @@ mod tests {
         ));
         // Connected but silent past the stall window: abort (peer dropped).
         assert!(fetch_stalled(CONNECT_TIMEOUT * 100, true, STALL_TIMEOUT));
+    }
+
+    /// The stripe partition must tile the blob: contiguous, full-size interior
+    /// pieces, and the last piece reaching exactly the end.
+    #[test]
+    fn stripe_pieces_tile_the_blob_without_gaps() {
+        let piece_chunks = STRIPE_PIECE_BYTES / BLAKE3_CHUNK;
+        for &size in &[
+            0u64,
+            1,
+            BLAKE3_CHUNK - 1,
+            BLAKE3_CHUNK + 1,
+            STRIPE_PIECE_BYTES,
+            STRIPE_PIECE_BYTES + 1,
+            12 * 1024 * 1024 + 123,
+        ] {
+            let pieces = stripe_pieces(size);
+            let total_chunks = size.div_ceil(BLAKE3_CHUNK);
+            if total_chunks == 0 {
+                assert!(pieces.is_empty(), "empty blob needs no pieces");
+                continue;
+            }
+            // Contiguous from 0 to total_chunks, every interior piece full-size.
+            let mut expected_start = 0u64;
+            for (i, &(s, e)) in pieces.iter().enumerate() {
+                assert_eq!(s, expected_start, "piece {i} must start where the last ended");
+                assert!(e > s, "piece {i} must be non-empty");
+                if i + 1 < pieces.len() {
+                    assert_eq!(e - s, piece_chunks, "interior piece {i} must be full-size");
+                }
+                expected_start = e;
+            }
+            assert_eq!(
+                pieces.back().unwrap().1,
+                total_chunks,
+                "the last piece must reach the end of the blob"
+            );
+        }
     }
 
     /// A full transfer (peer starts from zero) must count exactly the blob size.

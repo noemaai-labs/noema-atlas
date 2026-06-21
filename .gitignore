@@ -9,6 +9,9 @@
 /Noema-Atlas-*.dmg
 /Noema-Atlas-*.AppImage
 
+# Local release notes
+/docs/releasing.md
+
 # This is an application workspace — Cargo.lock IS committed (do not ignore it).
 
 # Runtime / local data

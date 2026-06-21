@@ -292,11 +292,24 @@ pub struct ChunkTree {
 impl ChunkTree {
     /// Build a chunk tree by reading a file from disk.
     pub fn from_file(path: &Path, leaf_size: u64) -> Result<Self> {
+        Self::from_file_cancellable(path, leaf_size, None)
+    }
+
+    /// As [`from_file`], but aborts with [`Error::Cancelled`] when `cancel` flips —
+    /// the read is a whole (multi-GB) blob pass that runs after a download succeeds.
+    pub fn from_file_cancellable(
+        path: &Path,
+        leaf_size: u64,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<Self> {
         let leaf_size = leaf_size.max(1);
         let mut f = std::fs::File::open(path).map_err(|e| Error::fs(path, e))?;
         let mut leaves = Vec::new();
         let mut buf = vec![0u8; leaf_size as usize];
         loop {
+            if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst)) {
+                return Err(Error::Cancelled);
+            }
             let mut filled = 0usize;
             // Read until we fill a full leaf or hit EOF.
             while filled < buf.len() {
@@ -465,5 +478,23 @@ mod tests {
         let mut bad = leaf0.to_vec();
         bad[0] ^= 0xFF;
         assert!(!tree.verify_leaf(0, &bad));
+    }
+
+    #[test]
+    fn from_file_cancellable_aborts_when_flag_is_set() {
+        let data = vec![7u8; (DEFAULT_LEAF_SIZE as usize) * 2 + 123];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob.bin");
+        std::fs::write(&path, &data).unwrap();
+
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        assert!(matches!(
+            ChunkTree::from_file_cancellable(&path, DEFAULT_LEAF_SIZE, Some(&cancel)),
+            Err(Error::Cancelled)
+        ));
+
+        cancel.store(false, std::sync::atomic::Ordering::SeqCst);
+        let tree = ChunkTree::from_file_cancellable(&path, DEFAULT_LEAF_SIZE, Some(&cancel)).unwrap();
+        assert_eq!(tree.num_leaves(), 3);
     }
 }
