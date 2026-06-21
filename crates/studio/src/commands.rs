@@ -821,8 +821,19 @@ pub struct LocalImportView {
     share_link: Option<String>,
 }
 
+/// `import://progress` payload: the current phase and, for `hashing`, how far
+/// the file read has got. Lets the UI show "Hashing… 47%" instead of a dead
+/// "Working…" label while a multi-gigabyte import is read.
+#[derive(Clone, Serialize)]
+struct ImportProgressEvent {
+    phase: &'static str,
+    bytes_done: u64,
+    bytes_total: u64,
+}
+
 #[tauri::command]
 pub async fn import_local(
+    app: AppHandle,
     state: State<'_, AppState>,
     path: String,
     title: Option<String>,
@@ -846,20 +857,43 @@ pub async fn import_local(
         skip_hf_match,
         publish,
     };
+
+    // Stream hashing progress (the import's long pole) so the modal shows a live
+    // phase + percentage instead of an indefinite spinner.
+    let app_cb = app.clone();
+    let on_hash: noema_core::engine::ImportProgress = Arc::new(move |done, total| {
+        let _ = app_cb.emit(
+            "import://progress",
+            ImportProgressEvent {
+                phase: "hashing",
+                bytes_done: done,
+                bytes_total: total,
+            },
+        );
+    });
+
     let out = state
         .engine
-        .import_local_file_with_meta(std::path::Path::new(&path), meta)
+        .import_local_file_with_meta_progress(std::path::Path::new(&path), meta, Some(on_hash))
         .await
         .map_err(|e| e.to_string())?;
+
+    // The bytes are now durably in the cache — the import has succeeded. Announce
+    // to the worldwide mesh in the *background*: a slow or unreachable seeder /
+    // tracker must never keep the user staring at "Working…" after the import is
+    // already done on disk. `SeederHandle` is cloneable + `Send` for exactly this.
     if out.shareable {
-        if let Some(w) = state.share.lock().await.as_ref() {
-            if let Ok(items) = state.engine.share_announce_items() {
-                w.seeder_handle()
-                    .announce(&items, &StudioSettings::load(&state.root).tracker())
-                    .await;
+        if let Ok(items) = state.engine.share_announce_items() {
+            let handle = state.share.lock().await.as_ref().map(|w| w.seeder_handle());
+            if let Some(handle) = handle {
+                let tracker = StudioSettings::load(&state.root).tracker();
+                tauri::async_runtime::spawn(async move {
+                    handle.announce(&items, &tracker).await;
+                });
             }
         }
     }
+
     let share_link = link_for(state.engine.as_ref(), &out.manifest_id);
     Ok(LocalImportView {
         manifest_id: out.manifest_id,

@@ -145,6 +145,13 @@
 </div>
 
 {#if composer}
-  <ShareComposer model={composer.model} onClose={() => (composer = null)} onSaved={load} />
+  <ShareComposer
+    model={composer.model}
+    onClose={() => (composer = null)}
+    onSaved={(msg) => {
+      load();
+      if (msg) flash(msg);
+    }}
+  />
 {/if}
 {#if toast}<div class="toast">{toast}</div>{/if}

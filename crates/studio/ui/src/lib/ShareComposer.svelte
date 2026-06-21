@@ -1,8 +1,10 @@
 <script>
-  import { api, pickModelFile, copyText } from "./api.js";
+  import { onDestroy } from "svelte";
+  import { api, pickModelFile, onImportProgress } from "./api.js";
   export let model = null;
   export let initialPath = "";
   export let onClose = () => {};
+  // Called with a short success message so the parent can flash a toast.
   export let onSaved = () => {};
 
   const isEdit = !!model;
@@ -17,7 +19,22 @@
   let publish = model ? !!model.shareable : false;
   let busy = false;
   let error = "";
-  let resultLink = "";
+  let phase = "";
+  let pct = 0;
+  let unlisten = null;
+
+  function stopProgress() {
+    if (unlisten) {
+      unlisten();
+      unlisten = null;
+    }
+  }
+  onDestroy(stopProgress);
+
+  // Button label while working: a live phase ("Hashing… 47%") beats a dead
+  // "Working…" so a multi-gigabyte import never looks frozen.
+  $: workingLabel =
+    phase === "hashing" && pct > 0 ? `Hashing… ${pct}%` : "Working…";
 
   async function pick() {
     error = "";
@@ -33,9 +50,14 @@
   }
 
   async function save() {
+    if (!isEdit && !path) {
+      error = "Choose a model file first.";
+      return;
+    }
     busy = true;
     error = "";
-    resultLink = "";
+    phase = "";
+    pct = 0;
     try {
       if (isEdit) {
         await api.editModel({
@@ -49,14 +71,16 @@
           originUrl,
           publish,
         });
-        onSaved();
+        onSaved("Changes saved");
         onClose();
       } else {
-        if (!path) {
-          error = "Choose a model file first.";
-          busy = false;
-          return;
-        }
+        phase = "hashing";
+        unlisten = await onImportProgress((p) => {
+          phase = p.phase;
+          pct = p.bytes_total
+            ? Math.round((p.bytes_done / p.bytes_total) * 100)
+            : 0;
+        });
         const r = await api.importLocal({
           path,
           title,
@@ -69,13 +93,13 @@
           skipHfMatch: !checkHf,
           publish,
         });
-        resultLink = r.share_link || "";
-        onSaved();
-        if (!resultLink) onClose();
+        onSaved(r.shareable ? "Imported · now sharing worldwide" : "Imported");
+        onClose();
       }
     } catch (e) {
       error = String(e);
     } finally {
+      stopProgress();
       busy = false;
     }
   }
@@ -114,17 +138,11 @@
     <label class="check"><input type="checkbox" bind:checked={publish} /> Publish to Explore (share worldwide)</label>
 
     {#if error}<p class="err">{error}</p>{/if}
-    {#if resultLink}
-      <div class="variant">
-        <input readonly value={resultLink} />
-        <button class="btn primary" on:click={() => copyText(resultLink)}>Copy link</button>
-      </div>
-    {/if}
 
     <div class="actions">
       <button class="btn" on:click={onClose}>Close</button>
       <button class="btn primary" on:click={save} disabled={busy}>
-        {busy ? "Working…" : isEdit ? "Save changes" : "Import & create link"}
+        {busy ? workingLabel : isEdit ? "Save changes" : "Import & create link"}
       </button>
     </div>
   </div>
