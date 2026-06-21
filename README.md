@@ -106,6 +106,8 @@ cargo run --release --features iroh -p noema-cli -- iroh-fetch '<ticket>' ./out.
 
 Since Iroh addresses content by the same hash Noema relies on everywhere else, the transfer is verified from one end to the other. Noema Studio is built with this feature already on, so its worldwide sharing works the moment you open it.
 
+When more than one peer is seeding the same model, a download does not pick a single one and hope it is fast. The file is cut into pieces and pulled from all of the available peers at once, with the quicker peers naturally taking on more of the work and any piece a peer fails to deliver handed to another, so the speed you see is closer to the sum of the swarm than to any one machine. Each piece is checked against the file's hash as it arrives, and the whole file is verified again before it is committed. This needs nothing special from the peers: a machine that is already seeding a whole model answers requests for byte ranges of it, so the swarm you already have starts aggregating without anyone re-sharing anything.
+
 ## How it stays portable
 
 The engine is plain Rust and steers clear of anything that would pin it to one platform. TLS comes from rustls instead of a system OpenSSL, SQLite is compiled in from source so there is nothing to install alongside it, and secrets go into whatever native keystore the operating system offers, with a read-only fallback to the environment for headless boxes. When it installs a model it prefers a reflink where the filesystem can make one, and where it cannot it falls back to a hard link, and failing that to an ordinary copy. macOS, Windows, and Linux are supported now, and the same `noema-core` compiles into the static and dynamic libraries that the iOS and Android wrappers wrap.
