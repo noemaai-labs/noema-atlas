@@ -58,6 +58,8 @@ export const pickModelFile = () =>
 export const onProgress = (cb) =>
   listen("download://progress", (e) => cb(e.payload));
 export const onDone = (cb) => listen("download://done", (e) => cb(e.payload));
+export const onImportProgress = (cb) =>
+  listen("import://progress", (e) => cb(e.payload));
 
 export async function copyText(text) {
   try {

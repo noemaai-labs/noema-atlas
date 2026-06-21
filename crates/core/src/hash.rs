@@ -187,30 +187,47 @@ pub fn git_blob_oid(data: &[u8]) -> String {
 
 /// Hash an entire file from disk, returning dual digests and the byte length.
 pub fn hash_file(path: &Path) -> Result<(Hashes, u64)> {
-    hash_file_inner(path, false)
+    hash_file_inner(path, false, &mut |_, _| {})
 }
 
 /// Like [`hash_file`], but *also* computes the git blob OID. Used to verify a
 /// non-LFS sidecar file against the Hub's published `blobId`.
 pub fn hash_file_with_git(path: &Path) -> Result<(Hashes, u64)> {
-    hash_file_inner(path, true)
+    hash_file_inner(path, true, &mut |_, _| {})
 }
 
-fn hash_file_inner(path: &Path, want_git: bool) -> Result<(Hashes, u64)> {
+/// Like [`hash_file`], but reports `(bytes_hashed, bytes_total)` after each chunk
+/// so a UI can show live progress while a multi-gigabyte file is read (a local
+/// import's dominant cost). `bytes_total` is the file's size, taken up front.
+pub fn hash_file_with_progress(
+    path: &Path,
+    mut on_progress: impl FnMut(u64, u64),
+) -> Result<(Hashes, u64)> {
+    hash_file_inner(path, false, &mut on_progress)
+}
+
+fn hash_file_inner(
+    path: &Path,
+    want_git: bool,
+    on_progress: &mut dyn FnMut(u64, u64),
+) -> Result<(Hashes, u64)> {
     let mut f = std::fs::File::open(path).map_err(|e| Error::fs(path, e))?;
+    let total = f.metadata().map_err(|e| Error::fs(path, e))?.len();
     let mut hasher = if want_git {
-        let len = f.metadata().map_err(|e| Error::fs(path, e))?.len();
-        DualHasher::with_git_blob_len(len)
+        DualHasher::with_git_blob_len(total)
     } else {
         DualHasher::new()
     };
     let mut buf = vec![0u8; 1 << 20];
+    let mut done = 0u64;
     loop {
         let n = f.read(&mut buf).map_err(|e| Error::fs(path, e))?;
         if n == 0 {
             break;
         }
         hasher.update(&buf[..n]);
+        done += n as u64;
+        on_progress(done, total);
     }
     let len = hasher.len();
     Ok((hasher.finalize(), len))

@@ -1,64 +1,111 @@
-# Releasing — one-click installers for macOS, Windows, Linux
+# Releasing Noema Atlas
 
-Tagging a release builds and attaches a one-click installer for every OS:
+This repo uses a split release flow:
 
-| OS | Artifact | How users run it |
-|----|----------|------------------|
-| macOS | `Noema-Atlas-macos.dmg` (universal arm64 + x86_64) | Open the dmg, drag **Noema Atlas** to Applications. Developer ID-signed + notarized → opens with no warning. |
-| Windows | `Noema-Atlas-Setup.exe` (+ `Noema-Atlas-windows-x86_64.zip` portable) | Run the installer (Start-menu + desktop shortcuts, uninstaller). |
-| Linux | `Noema-Atlas-x86_64.AppImage` (+ `noema-atlas-linux-x86_64.tar.gz`) | `chmod +x` and double-click / run. |
+- GitHub Actions builds and uploads Linux and Windows artifacts for Atlas and Atlas Studio.
+- macOS artifacts are built, signed, and notarized locally, then uploaded to the same GitHub release.
+- No GitHub web UI step is required unless you want to edit release notes, title, or prerelease status.
 
-```sh
-git tag v0.1.0 && git push --tags     # → .github/workflows/release.yml
-```
+## Normal push checks
 
-Without the signing secrets below, the workflow still succeeds: macOS falls back
-to an **ad-hoc** signature (Gatekeeper warns; right-click → Open), Windows ships
-unsigned, and Linux is unaffected (AppImages aren't signed).
-
-## macOS signing + notarization (Noema developer account)
-
-Set these as repository **Actions secrets**. They map onto `scripts/bundle-macos.sh`.
-
-| Secret | What it is |
-|--------|-----------|
-| `MACOS_CERT_P12` | Base64 of your **Developer ID Application** certificate exported as `.p12`. Create with `base64 -i cert.p12 \| pbcopy`. |
-| `MACOS_CERT_PASSWORD` | The password you set when exporting the `.p12`. |
-| `MACOS_SIGN_IDENTITY` | The identity string, e.g. `Developer ID Application: Noema, Inc. (TEAMID)`. Run `security find-identity -v -p codesigning` to see it. |
-| `MACOS_NOTARY_APPLE_ID` | The Apple ID email of the developer account. |
-| `MACOS_NOTARY_PASSWORD` | An **app-specific password** (appleid.apple.com → Sign-In & Security → App-Specific Passwords), *not* your Apple ID password. |
-| `MACOS_NOTARY_TEAM_ID` | Your 10-char Apple Team ID. |
-
-How it works in CI:
-1. The cert is imported into a temporary keychain.
-2. `bundle-macos.sh --universal --dmg` signs the app with the hardened runtime +
-   a secure timestamp (the prerequisites for notarization) and builds the dmg.
-3. The dmg is submitted to Apple (`notarytool ... --wait`) and the ticket is
-   **stapled** so the app opens offline with no Gatekeeper prompt.
-
-To sign/notarize locally instead of in CI:
+Regular pushes to `main` or `master`, and pull requests, run the lightweight CI workflow:
 
 ```sh
-export SIGN_IDENTITY="Developer ID Application: Noema, Inc. (TEAMID)"
-# Either store creds once: xcrun notarytool store-credentials noema --apple-id … --team-id … --password …
-export NOTARY_KEYCHAIN_PROFILE="noema"
-# …or pass them inline:
-export NOTARY_APPLE_ID="you@example.com" NOTARY_PASSWORD="app-specific-pw" NOTARY_TEAM_ID="TEAMID"
-scripts/bundle-macos.sh --universal --dmg dist
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
-## Windows signing (optional)
+There is no CodeQL workflow in this repo.
 
-| Secret | What it is |
-|--------|-----------|
-| `WINDOWS_CERT_PFX_PATH` | Path to an Authenticode `.pfx` on the runner (or wire a base64 import step like macOS). |
-| `WINDOWS_CERT_PASSWORD` | The `.pfx` password. |
+## Release sequence
 
-`scripts/bundle-windows.ps1` signs each binary and the installer with `signtool`
-when these are set; otherwise the installer is unsigned (SmartScreen may warn
-until the certificate builds reputation).
+Use a version tag that starts with `v`, such as `v1.2.3`.
 
-## Linux
+1. Make sure the release commit is pushed:
 
-No secrets needed. The AppImage is built with `linuxdeploy` so it bundles the
-shared libraries the egui app needs and runs across distros.
+   ```sh
+   git push origin main
+   ```
+
+2. Build, sign, and notarize the macOS artifacts locally.
+
+   Atlas:
+
+   ```sh
+   export SIGN_IDENTITY="Developer ID Application: Noema, Inc. (TEAMID)"
+   export NOTARY_KEYCHAIN_PROFILE="noema"
+   scripts/bundle-macos.sh --universal --dmg --zip dist
+   ```
+
+   This produces:
+
+   ```text
+   dist/Noema-Atlas-macos-universal.dmg
+   dist/Noema-Atlas-macos-universal.zip
+   ```
+
+   Atlas Studio:
+
+   ```sh
+   export APPLE_SIGNING_IDENTITY="Developer ID Application: Noema, Inc. (TEAMID)"
+   export APPLE_ID="you@example.com"
+   export APPLE_PASSWORD="app-specific-password"
+   export APPLE_TEAM_ID="TEAMID"
+   scripts/bundle-studio.sh
+   ```
+
+   Studio macOS bundles are written under:
+
+   ```text
+   crates/studio/target/release/bundle/
+   ```
+
+3. Push the release tag:
+
+   ```sh
+   git tag v1.2.3
+   git push origin v1.2.3
+   ```
+
+   The tag push starts both release workflows:
+
+   - `.github/workflows/release.yml` builds Atlas for Linux and Windows.
+   - `.github/workflows/release-studio.yml` builds Atlas Studio for Linux and Windows.
+
+4. Wait for both GitHub Actions workflows to finish.
+
+   The GitHub release is created or updated as individual jobs finish. This means the release page may temporarily show only some Linux/Windows assets while other jobs are still running.
+
+5. Upload the locally notarized macOS artifacts to the same tag release:
+
+   ```sh
+   gh release upload v1.2.3 \
+     dist/Noema-Atlas-macos-universal.dmg \
+     dist/Noema-Atlas-macos-universal.zip
+   ```
+
+   Upload the Atlas Studio macOS artifact from `crates/studio/target/release/bundle/` as well. Use the exact file path produced by Tauri, for example:
+
+   ```sh
+   gh release upload v1.2.3 crates/studio/target/release/bundle/dmg/*.dmg
+   ```
+
+## GitHub-built assets
+
+The `release.yml` workflow uploads these Atlas assets:
+
+| OS | Assets |
+| --- | --- |
+| Linux | `Noema-Atlas-x86_64.AppImage`, `noema-atlas-linux-x86_64.tar.gz` |
+| Windows | `Noema-Atlas-Setup.exe`, `Noema-Atlas-windows-x86_64.zip` |
+
+The `release-studio.yml` workflow uploads Atlas Studio Linux and Windows installer assets collected from Tauri's bundle output, such as `.AppImage`, `.deb`, `.msi`, or `.exe` files.
+
+macOS is intentionally not built by GitHub Actions. Keep Mac signing and notarization local so the final Mac binaries are produced under your Apple Developer credentials.
+
+## Manual workflow runs
+
+Both release workflows also support `workflow_dispatch`. Manual runs are useful for test packaging, but tag pushes are the normal release path because tag runs upload to the GitHub release automatically.
+
+On non-tag manual runs, artifacts are uploaded as workflow artifacts instead of release assets.

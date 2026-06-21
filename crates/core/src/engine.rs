@@ -219,6 +219,11 @@ pub struct LocalShareMeta {
     pub publish: bool,
 }
 
+/// Callback for local-import hashing progress: `(bytes_hashed, bytes_total)`.
+/// `Send + Sync` so it can be handed to the `spawn_blocking` that does the read;
+/// `Arc`-wrapped so the caller keeps a clone if it wants.
+pub type ImportProgress = std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>;
+
 impl LocalShareMeta {
     /// A bare import with no user metadata: auto-parse, still try HF, stay private.
     pub fn auto() -> Self {
@@ -2067,10 +2072,27 @@ impl Engine {
         path: &Path,
         meta: LocalShareMeta,
     ) -> Result<LocalImportOutcome> {
-        let owned = path.to_path_buf();
-        let (hashes, size) = tokio::task::spawn_blocking(move || crate::hash::hash_file(&owned))
+        self.import_local_file_with_meta_progress(path, meta, None)
             .await
-            .map_err(|e| Error::other(format!("hash task: {e}")))??;
+    }
+
+    /// [`import_local_file_with_meta`] with an optional hashing-progress callback.
+    /// The callback fires from the blocking hash thread with
+    /// `(bytes_hashed, bytes_total)`, letting a UI show a live percentage instead
+    /// of an indefinite spinner while a multi-gigabyte file is read.
+    pub async fn import_local_file_with_meta_progress(
+        &self,
+        path: &Path,
+        meta: LocalShareMeta,
+        on_hash: Option<ImportProgress>,
+    ) -> Result<LocalImportOutcome> {
+        let owned = path.to_path_buf();
+        let (hashes, size) = tokio::task::spawn_blocking(move || match on_hash {
+            Some(cb) => crate::hash::hash_file_with_progress(&owned, |done, total| cb(done, total)),
+            None => crate::hash::hash_file(&owned),
+        })
+        .await
+        .map_err(|e| Error::other(format!("hash task: {e}")))??;
         let filename = path
             .file_name()
             .and_then(|s| s.to_str())
