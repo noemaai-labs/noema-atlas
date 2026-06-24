@@ -13,9 +13,9 @@
     "@tauri-apps/plugin-dialog": "^2.7.1"
   },
   "devDependencies": {
-    "@sveltejs/vite-plugin-svelte": "^5",
+    "@sveltejs/vite-plugin-svelte": "^7",
     "svelte": "^5",
-    "vite": "^6",
+    "vite": "^8",
     "vite-plugin-singlefile": "^2.3.3"
   }
 }
