@@ -549,13 +549,29 @@ fn load_or_create_secret_key(store_dir: &Path) -> Result<SecretKey> {
     }
     let key = SecretKey::generate();
     let bytes = key.to_bytes();
-    std::fs::write(&path, bytes).map_err(|e| Error::fs(&path, e))?;
-    // The key is a credential; keep it owner-only where the OS supports it.
+    // The key is a credential. On unix, create it atomically owner-only (mode 0600
+    // via OpenOptions) so there's no world-readable window between write and chmod.
+    // Windows lacks unix mode bits; the file inherits the parent dir's ACL (the
+    // per-user app data dir), which is the platform's owner-private default.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| Error::fs(&path, e))?;
+        f.write_all(&bytes).map_err(|e| Error::fs(&path, e))?;
+        // `.mode(0o600)` only applies when the file is created; if we just overwrote
+        // a pre-existing corrupt/legacy key with looser permissions, re-tighten it.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| Error::fs(&path, e))?;
     }
+    #[cfg(not(unix))]
+    std::fs::write(&path, bytes).map_err(|e| Error::fs(&path, e))?;
     Ok(key)
 }
 
@@ -573,6 +589,37 @@ pub fn node_id_from_store(store_dir: &Path) -> Option<String> {
     let arr = <[u8; 32]>::try_from(bytes.as_slice()).ok()?;
     let key = SecretKey::from_bytes(&arr);
     Some(key.public().to_string())
+}
+
+/// Sign a tracker announce/withdraw payload with this device's node SECRET key,
+/// proving ownership of the claimed NodeId. Returns `(node_id, ts_ms, sig_b64)`
+/// for the client to attach to the request; the registry rebuilds the same
+/// canonical payload and verifies it against `node_id` (see
+/// [`crate::announce_auth`]). The signed payload also binds `ticket` (this node's
+/// current reachable ticket) and `audience` (the registry base URL being posted to),
+/// so a MITM can't rewrite the address and a captured request can't replay against a
+/// different registry. Loads the persisted key directly (no live endpoint needed),
+/// so the announce loop can sign without holding the node. `None` when no key exists
+/// yet (worldwide sharing has never run), or when an item id is not canonical 64-hex.
+pub fn sign_announce(
+    store_dir: &Path,
+    method: &str,
+    ticket: &str,
+    audience: &str,
+    item_ids: &[String],
+) -> Option<(String, i64, String)> {
+    use base64::Engine as _;
+    let path = store_dir.join("node.key");
+    let bytes = std::fs::read(&path).ok()?;
+    let arr = <[u8; 32]>::try_from(bytes.as_slice()).ok()?;
+    let key = SecretKey::from_bytes(&arr);
+    let node_id = key.public().to_string();
+    let ts = crate::util::now_unix_millis();
+    let payload =
+        crate::announce_auth::canonical_payload(method, &node_id, ts, ticket, audience, item_ids)?;
+    let sig = key.sign(&payload);
+    let sig_b64 = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
+    Some((node_id, ts, sig_b64))
 }
 
 /// A running iroh node: a QUIC endpoint, a disk-backed blob store, and a router
@@ -911,7 +958,10 @@ impl IrohNode {
         let total_pieces = stripe_pieces(size).len() as u64;
         // (start_chunk, end_chunk, attempts)
         let queue: Arc<StdMutex<VecDeque<(u64, u64, u32)>>> = Arc::new(StdMutex::new(
-            stripe_pieces(size).into_iter().map(|(s, e)| (s, e, 0)).collect(),
+            stripe_pieces(size)
+                .into_iter()
+                .map(|(s, e)| (s, e, 0))
+                .collect(),
         ));
         let pieces_left = Arc::new(AtomicU64::new(total_pieces));
         let bytes_done = Arc::new(AtomicU64::new(0));
@@ -934,7 +984,9 @@ impl IrohNode {
             let on_bytes = on_bytes.clone();
             workers.spawn(async move {
                 let stopped = |c: &Option<Arc<AtomicBool>>| {
-                    c.as_ref().map(|f| f.load(Ordering::SeqCst)).unwrap_or(false)
+                    c.as_ref()
+                        .map(|f| f.load(Ordering::SeqCst))
+                        .unwrap_or(false)
                 };
                 // One QUIC connection per peer, reused for every piece it serves.
                 let conn = match tokio::time::timeout(
@@ -1302,7 +1354,10 @@ mod tests {
             // Contiguous from 0 to total_chunks, every interior piece full-size.
             let mut expected_start = 0u64;
             for (i, &(s, e)) in pieces.iter().enumerate() {
-                assert_eq!(s, expected_start, "piece {i} must start where the last ended");
+                assert_eq!(
+                    s, expected_start,
+                    "piece {i} must start where the last ended"
+                );
                 assert!(e > s, "piece {i} must be non-empty");
                 if i + 1 < pieces.len() {
                     assert_eq!(e - s, piece_chunks, "interior piece {i} must be full-size");

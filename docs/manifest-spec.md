@@ -46,7 +46,7 @@ signed with Ed25519.
   "access": {
     "gated": false,
     "require_signed_manifest": true,
-    "allowed_source_classes": ["huggingface","https_mirror","ipfs","iroh","local_file"]
+    "allowed_source_classes": ["huggingface","https_mirror","iroh","local_file"]
   },
   "artifacts": [
     {
@@ -60,7 +60,6 @@ signed with Ed25519.
         { "type": "huggingface", "repo_id": "Qwen/Qwen3-8B-Instruct-GGUF",
           "revision": "0123456789abcdef", "path": "qwen3-8b-instruct-q4_k_m.gguf", "auth": "none" },
         { "type": "https_mirror", "url": "https://mirror.example/model.gguf", "auth": "none" },
-        { "type": "ipfs", "cid": "bafy...", "retrieval": ["gateway"], "auth": "none" },
         { "type": "iroh", "blob_hash": "6a4f...", "tickets": [], "auth": "none" },
         { "type": "local_file", "path": "/data/model.gguf" }
       ]
@@ -118,7 +117,6 @@ drive letter, or NUL. Validated on import and before any filesystem write.
 |--------|--------|
 | `huggingface` | `repo_id`, `revision`, `path`, `auth` |
 | `https_mirror` | `url`, `auth` |
-| `ipfs` | `cid`, `retrieval[]`, `auth` |
 | `iroh` | `blob_hash`, `tickets[]`, `auth` |
 | `bittorrent_v2` | `magnet_uri`, `file_merkle_root_sha256?`, `auth` — **retired**: still parses for back-compat, but the adapter was removed so this source is never fetched |
 | `lan_peer` | `url`, `auth` — **retired**: LAN peering was removed; still parses for back-compat but is never fetched (superseded by Iroh) |

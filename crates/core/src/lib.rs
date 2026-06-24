@@ -1,3 +1,4 @@
+pub mod announce_auth;
 pub mod cas;
 pub mod db;
 pub mod engine;
@@ -19,6 +20,7 @@ pub mod share;
 pub mod sign;
 #[cfg(feature = "http")]
 pub mod tracker;
+pub mod transfer;
 pub mod transport;
 pub mod util;
 pub mod verify;
@@ -40,11 +42,12 @@ pub use error::{Error, Result, TransportErrorKind};
 pub use hash::{ChunkTree, DualHasher, Hashes};
 pub use inspect::{parse_model, read_file_meta, FileMeta, ParsedModel};
 pub use manifest::{Artifact, Manifest, RedistributionClass, Source, SourceClass};
-pub use planner::{plan_artifact, Plan, ScoredSource};
+pub use planner::{plan_artifact, DownloadPreference, Plan, ScoredSource};
 pub use platform::{Platform, PlatformProfile};
 pub use policy::{PolicyConfig, PolicyDecision, PolicyEngine};
 pub use secret::{SecretStore, SERVICE_PREFIX};
 pub use share::{is_bundle_link, ShareBundle, ShareTarget};
 pub use sign::{verify_manifest, KeyPair, VerificationReport};
-pub use transport::{TransportAdapter, TransportConfig, Transports};
+pub use transfer::{TransferControl, TransferId, TransferManager, TransferState};
+pub use transport::{BtPeer, TransportAdapter, TransportConfig, Transports};
 pub use verify::{classify_file_safety, FileSafety, StreamingVerifier};

@@ -1,0 +1,5 @@
+# Atlas builds on Rust 1.88 (matches Studio; required by the librqbit BitTorrent
+# stack). Pinned so local and CI builds agree on the MSRV.
+[toolchain]
+channel = "1.88.0"
+components = ["clippy", "rustfmt"]

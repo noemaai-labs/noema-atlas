@@ -5,14 +5,13 @@ members = [
     "crates/cli",
     "crates/registry",
     "crates/desktop",
-    "crates/mobile-ffi",
 ]
 exclude = ["crates/studio"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.88"
 license = "Apache-2.0"
 authors = ["Noema Atlas contributors"]
 repository = "https://github.com/noemaai-labs/noema-atlas"
@@ -46,7 +45,7 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive", "env"] }
-time = { version = ">=0.3, <0.3.49", features = ["formatting", "parsing", "macros"] }
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 
 reflink-copy = "0.1"
 

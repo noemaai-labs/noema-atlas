@@ -106,9 +106,10 @@ async fn hard_disconnects_a_peer_mid_transfer() {
     let b3 = blake3.clone();
     let t = ticket.clone();
     let d = dest.clone();
-    let fetch = tokio::spawn(
-        async move { f.fetch_from_providers(&b3, &[t], &d, size, None, None).await },
-    );
+    let fetch = tokio::spawn(async move {
+        f.fetch_from_providers(&b3, &[t], &d, size, None, None)
+            .await
+    });
 
     let metrics = provider.metrics();
     // The provider registers a pull of *this exact blob*.

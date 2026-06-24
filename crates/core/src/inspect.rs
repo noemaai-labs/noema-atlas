@@ -55,7 +55,7 @@ impl ParsedModel {
         }
         if let Some(f) = &self.format {
             s.push_str(" · ");
-            s.push_str(&f.to_ascii_uppercase());
+            s.push_str(&pretty_format(f));
         }
         s
     }
@@ -102,18 +102,60 @@ fn meta_from_extension(path: &Path) -> FileMeta {
     }
 }
 
-/// Derive a coarse format tag from a filename's extension.
+/// Derive a coarse format tag from a filename. Extension-driven, with a name
+/// heuristic for MLX (which ships as safetensors/npz tuned for Apple Silicon).
+/// The tag is for display + cataloguing only — integrity is always the manifest
+/// hash, and `validate_format_header` only hard-checks the formats it has magic
+/// bytes for (gguf/safetensors), so a richer tag here never gates a download.
 pub fn format_from_name(filename: &str) -> Option<String> {
-    match filename
-        .rsplit('.')
-        .next()
-        .map(|e| e.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("gguf") => Some("gguf".into()),
-        Some("safetensors") => Some("safetensors".into()),
-        _ => None,
+    let lower = filename.to_ascii_lowercase();
+    // MLX has no unique extension (it is safetensors/npz under the hood); read it
+    // off the name so the badge says "MLX" rather than the container format.
+    if lower.contains(".mlx") || lower.contains("-mlx") || lower.contains("_mlx") {
+        return Some("mlx".into());
     }
+    let fmt = match lower.rsplit('.').next()? {
+        "gguf" => "gguf",
+        "safetensors" | "sft" => "safetensors",
+        "onnx" | "onnx_data" => "onnx",
+        "pt" | "pth" => "pytorch",
+        // Legacy GGML weights also used `.bin`; disambiguate by name, else the
+        // overwhelmingly common case in a model repo is a PyTorch state dict.
+        "bin" if lower.contains("ggml") => "ggml",
+        "bin" => "pytorch",
+        "ggml" => "ggml",
+        "mlmodel" | "mlpackage" => "coreml",
+        "tflite" => "tflite",
+        "h5" | "hdf5" | "keras" => "keras",
+        "npz" | "npy" => "numpy",
+        "msgpack" => "flax",
+        "pdparams" | "pdmodel" => "paddle",
+        "trt" | "engine" | "plan" => "tensorrt",
+        _ => return None,
+    };
+    Some(fmt.into())
+}
+
+/// Human-facing label for a format tag from [`format_from_name`] — nicer casing
+/// than a bare uppercase (e.g. `coreml` -> `Core ML`). Unknown tags uppercase.
+pub fn pretty_format(format: &str) -> String {
+    match format.to_ascii_lowercase().as_str() {
+        "gguf" => "GGUF",
+        "safetensors" => "Safetensors",
+        "onnx" => "ONNX",
+        "pytorch" => "PyTorch",
+        "ggml" => "GGML",
+        "mlx" => "MLX",
+        "coreml" => "Core ML",
+        "tflite" => "TensorFlow Lite",
+        "keras" => "Keras",
+        "numpy" => "NumPy",
+        "flax" => "Flax",
+        "paddle" => "PaddlePaddle",
+        "tensorrt" => "TensorRT",
+        other => return other.to_ascii_uppercase(),
+    }
+    .to_string()
 }
 // We only need the `general.*` strings + the file_type enum. Cap how far we'll
 // scan so a hostile/huge metadata block (e.g. a giant tokenizer token array)
@@ -607,5 +649,44 @@ mod tests {
         assert_eq!(m.format.as_deref(), Some("gguf"));
         assert_eq!(m.name.as_deref(), Some("Tiny Test Model"));
         assert_eq!(m.quantization.as_deref(), Some("Q4_K_M"));
+    }
+
+    #[test]
+    fn format_from_name_recognizes_common_formats() {
+        let cases = [
+            ("model.gguf", Some("gguf")),
+            ("model.safetensors", Some("safetensors")),
+            ("model.onnx", Some("onnx")),
+            ("model.onnx_data", Some("onnx")),
+            ("consolidated.00.pth", Some("pytorch")),
+            ("pytorch_model.bin", Some("pytorch")),
+            ("ggml-model-q4_0.bin", Some("ggml")),
+            ("Model.MLModel", Some("coreml")),
+            ("model.mlpackage", Some("coreml")),
+            ("model.tflite", Some("tflite")),
+            ("weights.npz", Some("numpy")),
+            ("model.trt", Some("tensorrt")),
+            // MLX has no unique extension — recognized by name.
+            ("Qwen2.5-7B-mlx.safetensors", Some("mlx")),
+            ("notes.txt", None),
+            ("README.md", None),
+        ];
+        for (name, want) in cases {
+            assert_eq!(
+                format_from_name(name).as_deref(),
+                want,
+                "format_from_name({name:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn pretty_format_labels() {
+        assert_eq!(pretty_format("safetensors"), "Safetensors");
+        assert_eq!(pretty_format("onnx"), "ONNX");
+        assert_eq!(pretty_format("coreml"), "Core ML");
+        assert_eq!(pretty_format("mlx"), "MLX");
+        // Unknown tags fall back to uppercase.
+        assert_eq!(pretty_format("xyz"), "XYZ");
     }
 }

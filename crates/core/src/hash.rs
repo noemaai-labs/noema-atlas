@@ -494,7 +494,8 @@ mod tests {
         ));
 
         cancel.store(false, std::sync::atomic::Ordering::SeqCst);
-        let tree = ChunkTree::from_file_cancellable(&path, DEFAULT_LEAF_SIZE, Some(&cancel)).unwrap();
+        let tree =
+            ChunkTree::from_file_cancellable(&path, DEFAULT_LEAF_SIZE, Some(&cancel)).unwrap();
         assert_eq!(tree.num_leaves(), 3);
     }
 }

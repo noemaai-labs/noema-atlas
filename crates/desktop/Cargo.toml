@@ -13,7 +13,7 @@ name = "noema-desktop"
 path = "src/main.rs"
 
 [dependencies]
-noema-core = { workspace = true, features = ["iroh"] }
+noema-core = { workspace = true, features = ["iroh", "bittorrent"] }
 tokio.workspace = true
 anyhow.workspace = true
 serde.workspace = true

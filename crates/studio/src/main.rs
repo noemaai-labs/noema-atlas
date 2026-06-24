@@ -26,11 +26,31 @@ pub struct AppState {
 fn build_engine(root: &std::path::Path, s: &StudioSettings) -> anyhow::Result<Engine> {
     let mut cfg = EngineConfig::new(root.to_path_buf());
     cfg.max_download_connections = s.download_connections.max(1) as usize;
+    // Max simultaneous active transfers. Bound at engine open (the download
+    // scheduler sizes its slots here), so it takes effect on next launch — the
+    // Settings field is labelled as much.
+    cfg.max_concurrent_downloads = s.bt_max_concurrent.max(1) as usize;
     cfg.rate_limit.set_bps(s.cap_bps());
     cfg.share_gated = s.share_gated;
     // Always wire the tracker (falls back to the hosted default) so Explore /
     // worldwide discovery works.
     cfg.tracker_url = Some(s.tracker());
+    // BitTorrent settings take effect on next launch (the session binds ports and
+    // opens the store at engine open) — the front-end says as much.
+    cfg.transport.bittorrent_enabled = s.bt_enabled;
+    cfg.transport.bittorrent_seed = s.bt_seed;
+    cfg.transport.bittorrent_listen_port_range = s.bt_listen_range();
+    cfg.transport.bittorrent_max_up_bps = s.bt_up_bps();
+    cfg.transport.bittorrent_max_down_bps = s.bt_down_bps();
+    // Stop-at-ratio: the seeding watch is armed at session open, so this takes
+    // effect on next launch (the Settings field says as much).
+    cfg.transport.bittorrent_max_ratio = s.bt_max_ratio.max(0.0);
+    // Public trackers (in addition to the DHT). Privacy-relevant — see the Settings
+    // disclosure. Takes effect on next launch (trackers are attached at add-time).
+    cfg.transport.bittorrent_use_public_trackers = s.bt_use_public_trackers;
+    // Download-routing preference: applied live by `set_download_preference`, but
+    // also seed the initial value so the first download honors it before any save.
+    cfg.download_preference = noema_core::DownloadPreference::from_u8(s.download_preference);
     if s.proxy_enabled {
         if let Some(p) = nonempty(&s.proxy_url) {
             cfg.transport.proxy = Some(p);
@@ -91,21 +111,24 @@ fn main() {
             commands::mesh_search,
             commands::add_by_link,
             commands::add_from_mesh,
+            commands::list_transfers,
+            commands::resumable_downloads,
+            commands::remove_transfer,
+            commands::discard_transfer,
             commands::list_library,
             commands::list_cache,
             commands::source_health,
             commands::set_share,
+            commands::share_needs_confirmation,
+            commands::confirm_gated_share,
             commands::install_model,
             commands::get_settings,
             commands::save_settings,
             commands::start_worldwide,
             commands::stop_worldwide,
             commands::worldwide_status,
-            commands::seeder_metrics,
             commands::uploads_list,
             commands::apply_identity,
-            commands::create_group,
-            commands::worldwide_peers,
             commands::set_token,
             commands::clear_token,
             commands::token_status,
@@ -115,6 +138,12 @@ fn main() {
             commands::edit_model,
             commands::delete_model,
             commands::copy_share_link,
+            commands::bt_magnet,
+            commands::is_iroh_seeding,
+            commands::bt_peers,
+            commands::bt_peers_for_blob,
+            commands::set_download_preference,
+            commands::pause_all,
             commands::clear_cache,
             commands::export_diagnostics,
             commands::reveal,
@@ -124,12 +153,9 @@ fn main() {
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     let state = handle.state::<AppState>();
-                    if let Err(e) = commands::start_worldwide_inner(
-                        state.engine.as_ref(),
-                        &state.root,
-                        &state.share,
-                    )
-                    .await
+                    if let Err(e) =
+                        commands::start_worldwide_inner(&state.engine, &state.root, &state.share)
+                            .await
                     {
                         eprintln!("noema-studio: worldwide share failed to start: {e}");
                     }
@@ -170,6 +196,11 @@ fn shutdown_cleanup(handle: &tauri::AppHandle) {
         return;
     }
     let state = handle.state::<AppState>();
+    // Pause every in-flight transfer before tearing anything down (parity with the
+    // desktop's on-exit handler). Each pause keeps the partial on disk and lets the
+    // BitTorrent session flush fastresume, so a relaunch resumes cleanly instead of
+    // losing progress when the process exits mid-download. Synchronous + immediate.
+    state.engine.request_pause();
     tauri::async_runtime::block_on(async {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), async {
             // Withdraw first (it reads our stable node id), then stop the seeder.

@@ -110,7 +110,7 @@ When more than one peer is seeding the same model, a download does not pick a si
 
 ## How it stays portable
 
-The engine is plain Rust and steers clear of anything that would pin it to one platform. TLS comes from rustls instead of a system OpenSSL, SQLite is compiled in from source so there is nothing to install alongside it, and secrets go into whatever native keystore the operating system offers, with a read-only fallback to the environment for headless boxes. When it installs a model it prefers a reflink where the filesystem can make one, and where it cannot it falls back to a hard link, and failing that to an ordinary copy. macOS, Windows, and Linux are supported now, and the same `noema-core` compiles into the static and dynamic libraries that the iOS and Android wrappers wrap.
+The engine is plain Rust and steers clear of anything that would pin it to one platform. TLS comes from rustls instead of a system OpenSSL, SQLite is compiled in from source so there is nothing to install alongside it, and secrets go into whatever native keystore the operating system offers, with a read-only fallback to the environment for headless boxes. When it installs a model it prefers a reflink where the filesystem can make one, and where it cannot it falls back to a hard link, and failing that to an ordinary copy. macOS, Windows, and Linux are supported.
 
 ## Repository layout
 

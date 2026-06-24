@@ -530,42 +530,6 @@ async fn local_import_with_wrong_hash_is_rejected() {
 }
 
 #[tokio::test]
-async fn ipfs_gateway_fetch_matches_manifest() {
-    let key = KeyPair::generate();
-    let server = TestServer::start().await;
-    let data = content(5, 120_000);
-    let cid = "bafyTESTcid";
-    server.put(&format!("/ipfs/{cid}"), data.clone(), Mode::Ok);
-
-    let dir = tempfile::tempdir().unwrap();
-    let mut cfg = engine_at(dir.path(), &[]);
-    cfg.transport.ipfs_gateways = vec![server.base()];
-    let engine = Engine::open(cfg).unwrap();
-
-    let m = manifest_bytes(
-        "mdl_ipfs",
-        "Ipfs",
-        "model.gguf",
-        &data,
-        vec![Source::Ipfs {
-            cid: cid.into(),
-            retrieval: vec!["gateway".into()],
-            auth: AuthPolicy::None,
-        }],
-        false,
-        true,
-        &key,
-    );
-    let r = engine.import_manifest(&m).unwrap();
-    let out = engine.download(&r.manifest_id, None).await.unwrap();
-    assert!(!out.artifacts[0].from_cache);
-    assert_eq!(
-        out.artifacts[0].source_id.as_deref(),
-        Some(&*format!("ipfs:{cid}"))
-    );
-}
-
-#[tokio::test]
 async fn gated_model_requires_trusted_signature() {
     let key = KeyPair::generate();
     let server = TestServer::start().await;
@@ -736,9 +700,9 @@ async fn search_aggregates_one_file_across_many_sources() {
         "Llama Q4 (mirror)",
         "model.gguf",
         &data,
-        vec![Source::Ipfs {
-            cid: "bafyLLAMA".into(),
-            retrieval: vec![],
+        vec![Source::Iroh {
+            blob_hash: "bafyLLAMA".into(),
+            tickets: vec![],
             auth: AuthPolicy::None,
         }],
         false,

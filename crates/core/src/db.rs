@@ -119,18 +119,61 @@ CREATE TABLE IF NOT EXISTS quarantine_records (
 -- explicit user choice to deviate: shared=0 stops sharing a model, shared=1
 -- shares one that's off by default (e.g. a gated/token-walled model).
 CREATE TABLE IF NOT EXISTS share_overrides (
+    blake3          TEXT PRIMARY KEY,
+    sha256          TEXT NOT NULL,
+    shared          INTEGER NOT NULL,
+    confirmed_gated INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL
+);
+
+-- BitTorrent magnet (info-hash) generated when a blob is seeded over BT, keyed
+-- by blake3 so it can be injected into outgoing share links and tracker
+-- announces (lets a receiver join the swarm straight from the link/catalog).
+CREATE TABLE IF NOT EXISTS bt_magnets (
     blake3        TEXT PRIMARY KEY,
-    sha256        TEXT NOT NULL,
-    shared        INTEGER NOT NULL,
+    magnet        TEXT NOT NULL,
     created_at    TEXT NOT NULL
 );
+
+-- Cumulative bytes uploaded while BitTorrent-seeding a blob, accumulated across
+-- runs (librqbit's per-session upload counter resets each launch). Keyed by
+-- blake3 so the stop-at-ratio cap is a *lifetime* ratio, not a per-session one.
+CREATE TABLE IF NOT EXISTS bt_uploaded (
+    blake3         TEXT PRIMARY KEY,
+    uploaded_bytes INTEGER NOT NULL,
+    updated_at     TEXT NOT NULL
+);
 "#;
+
+/// Additive column migrations for indexes created before the column existed.
+/// Each `ADD COLUMN` is guarded — a fresh DB already has it from `SCHEMA`, so the
+/// duplicate-column error is expected and ignored.
+fn migrate(conn: &Connection) {
+    let _ = conn.execute(
+        "ALTER TABLE share_overrides ADD COLUMN confirmed_gated INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+}
 
 pub struct Db {
     conn: Mutex<Connection>,
     /// Live opt-in for gated/token-walled/restrictively-licensed auto-share.
     /// Per-model overrides still win. Atomic so Settings applies without restart.
     share_gated: AtomicBool,
+}
+
+/// Lets the BitTorrent transport persist each blob's lifetime upload through the
+/// DB (so the stop-at-ratio cap is a lifetime ratio). Errors are swallowed — a
+/// missed read/write only degrades the ratio accounting, never the transfer.
+impl crate::transport::BtUploadStore for Db {
+    fn load_uploaded(&self, blake3: &str) -> u64 {
+        self.bt_uploaded(blake3).unwrap_or(0)
+    }
+    fn store_uploaded(&self, blake3: &str, uploaded_bytes: u64) {
+        if let Err(e) = self.set_bt_uploaded(blake3, uploaded_bytes) {
+            tracing::warn!(error = %e, "bittorrent: failed to persist lifetime upload");
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -202,6 +245,7 @@ impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn);
         Ok(Db {
             conn: Mutex::new(conn),
             share_gated: AtomicBool::new(false),
@@ -370,11 +414,47 @@ impl Db {
     /// licenses, so the operator decides what to share (including gated/
     /// restrictive content they explicitly opt in). A blob of unknown provenance
     pub fn is_blob_shareable(&self, blake3: &str) -> Result<bool> {
+        // Gated/restrictive content needs an explicit confirm-before-share, not
+        // just a `shared=1` override: such a blob is seedable only once the user
+        // has confirmed it (`confirmed_gated`). An explicit stop still wins.
+        if self.blob_is_gated_or_restrictive(blake3)? {
+            if self.share_override(blake3)? == Some(false) {
+                return Ok(false);
+            }
+            return self.is_gated_share_confirmed(blake3);
+        }
         if let Some(forced) = self.share_override(blake3)? {
             return Ok(forced);
         }
         let (_has_manifest, _gated, shareable) = self.blob_provenance(blake3)?;
         Ok(shareable)
+    }
+
+    /// Whether any manifest containing this blob is gated/token-walled or
+    /// restrictively licensed (the classes that need confirm-before-share).
+    fn blob_is_gated_or_restrictive(&self, blake3: &str) -> Result<bool> {
+        let conn = self.lock();
+        let sha256: String = conn
+            .query_row(
+                "SELECT sha256 FROM cache_blobs WHERE blake3 = ?1",
+                params![blake3],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or_default();
+        let mut stmt = conn.prepare(
+            "SELECT m.json
+             FROM artifacts a JOIN manifests m ON a.manifest_id = m.manifest_id
+             WHERE a.blake3 = ?1 OR (?2 <> '' AND a.sha256 = ?2)",
+        )?;
+        let jsons: Vec<String> = stmt
+            .query_map(params![blake3, sha256], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(jsons.iter().any(|j| {
+            Manifest::from_json(j.as_bytes())
+                .map(|m| m.is_gated() || m.is_restrictive())
+                .unwrap_or(false)
+        }))
     }
 
     /// `(has_manifest, gated, shareable_by_default)` for a cached blob, derived
@@ -483,15 +563,126 @@ impl Db {
             .optional()?)
     }
 
-    /// Record an explicit per-model share choice (overrides the default).
+    /// Record an explicit per-model share choice (overrides the default). Leaves
+    /// any existing `confirmed_gated` flag intact.
     pub fn set_share_override(&self, blake3: &str, sha256: &str, shared: bool) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "INSERT OR REPLACE INTO share_overrides (blake3, sha256, shared, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO share_overrides (blake3, sha256, shared, created_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(blake3) DO UPDATE SET sha256 = excluded.sha256, shared = excluded.shared",
             params![blake3, sha256, shared as i64, crate::util::now_rfc3339()],
         )?;
         Ok(())
+    }
+
+    /// Record the user's explicit confirmation to share a gated/restrictive blob:
+    /// sets both `shared` and `confirmed_gated`. Required before such content is
+    /// seeded (openly-licensed content auto-shares without this).
+    pub fn confirm_gated_share(&self, blake3: &str, sha256: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO share_overrides (blake3, sha256, shared, confirmed_gated, created_at)
+             VALUES (?1, ?2, 1, 1, ?3)
+             ON CONFLICT(blake3) DO UPDATE SET sha256 = excluded.sha256, shared = 1, confirmed_gated = 1",
+            params![blake3, sha256, crate::util::now_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Revoke every confirmed gated/restrictive share at once (the global
+    /// "stop sharing gated models" action): clears `confirmed_gated` and `shared`
+    /// for all such overrides so `is_blob_shareable` flips them to false. Returns
+    /// the `(blake3, sha256)` of each cleared blob so callers can unseed it.
+    pub fn clear_all_gated_confirmations(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT o.blake3, COALESCE(b.sha256, o.sha256)
+             FROM share_overrides o
+             LEFT JOIN cache_blobs b ON b.blake3 = o.blake3
+             WHERE o.confirmed_gated = 1",
+        )?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        conn.execute(
+            "UPDATE share_overrides SET shared = 0, confirmed_gated = 0 WHERE confirmed_gated = 1",
+            [],
+        )?;
+        Ok(rows)
+    }
+
+    /// Whether the user has confirmed sharing this gated/restrictive blob.
+    pub fn is_gated_share_confirmed(&self, blake3: &str) -> Result<bool> {
+        let conn = self.lock();
+        Ok(conn
+            .query_row(
+                "SELECT confirmed_gated FROM share_overrides WHERE blake3 = ?1",
+                params![blake3],
+                |r| {
+                    let v: i64 = r.get(0)?;
+                    Ok(v != 0)
+                },
+            )
+            .optional()?
+            .unwrap_or(false))
+    }
+
+    /// Record the BitTorrent magnet generated for a seeded blob.
+    pub fn set_bt_magnet(&self, blake3: &str, magnet: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT OR REPLACE INTO bt_magnets (blake3, magnet, created_at)
+             VALUES (?1, ?2, ?3)",
+            params![blake3, magnet, crate::util::now_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Forget the persisted BitTorrent magnet for a blob — called when the blob
+    /// stops being BT-seeded (share-off / evict) so it no longer rides out in
+    /// share links and tracker announces. No-op if no magnet was recorded.
+    pub fn clear_bt_magnet(&self, blake3: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute("DELETE FROM bt_magnets WHERE blake3 = ?1", params![blake3])?;
+        Ok(())
+    }
+
+    /// The BitTorrent magnet for a blob, if one was generated when it was seeded.
+    pub fn bt_magnet(&self, blake3: &str) -> Result<Option<String>> {
+        let conn = self.lock();
+        Ok(conn
+            .query_row(
+                "SELECT magnet FROM bt_magnets WHERE blake3 = ?1",
+                params![blake3],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Persist the lifetime cumulative bytes uploaded while seeding a blob over
+    /// BitTorrent (across runs), so the stop-at-ratio cap is a lifetime ratio.
+    pub fn set_bt_uploaded(&self, blake3: &str, uploaded_bytes: u64) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT OR REPLACE INTO bt_uploaded (blake3, uploaded_bytes, updated_at)
+             VALUES (?1, ?2, ?3)",
+            params![blake3, uploaded_bytes as i64, crate::util::now_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// The lifetime cumulative BitTorrent upload for a blob (0 if never seeded).
+    pub fn bt_uploaded(&self, blake3: &str) -> Result<u64> {
+        let conn = self.lock();
+        let v: Option<i64> = conn
+            .query_row(
+                "SELECT uploaded_bytes FROM bt_uploaded WHERE blake3 = ?1",
+                params![blake3],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v.unwrap_or(0).max(0) as u64)
     }
 
     pub fn upsert_cache_blob(&self, meta: &BlobMeta, state: &str) -> Result<()> {
@@ -896,8 +1087,9 @@ mod tests {
         assert!(db.is_blob_shareable(&open_b3).unwrap());
 
         // A gated (access.gated) HF model is NOT auto-shared by default — only
-        // openly-licensed public models are. The operator can opt gated content
-        // in globally (`set_share_gated`) or per-model (override).
+        // openly-licensed public models are. Gated/restrictive content needs an
+        // explicit confirm-before-share: neither the global "also share gated"
+        // opt-in nor a plain `shared=1` override is enough on its own.
         let mut gated = sample_manifest();
         gated.manifest_id = "mdl_gated".into();
         gated.access.gated = true;
@@ -909,17 +1101,22 @@ mod tests {
         db.insert_manifest(&gated, &crate::sign::verify_manifest(&gated).unwrap())
             .unwrap();
         assert!(!db.is_blob_shareable(&gated_b3).unwrap());
-        // Global "also share gated/licensed" opt-in makes it auto-share…
+        // Global "also share gated/licensed" opt-in alone does NOT auto-share it.
         db.set_share_gated(true);
-        assert!(db.is_blob_shareable(&gated_b3).unwrap());
-        db.set_share_gated(false);
         assert!(!db.is_blob_shareable(&gated_b3).unwrap());
-        // …or a per-model override force-shares it regardless of the global flag.
+        db.set_share_gated(false);
+        // A plain `shared=1` override is also not enough without confirmation.
         db.set_share_override(&gated_b3, &gated_sha, true).unwrap();
+        assert!(!db.is_blob_shareable(&gated_b3).unwrap());
+        // Explicit confirm-before-share makes it shareable.
+        db.confirm_gated_share(&gated_b3, &gated_sha).unwrap();
         assert!(db.is_blob_shareable(&gated_b3).unwrap());
+        // An explicit stop still wins over a prior confirmation.
+        db.set_share_override(&gated_b3, &gated_sha, false).unwrap();
+        assert!(!db.is_blob_shareable(&gated_b3).unwrap());
 
         // A token-walled HF source is also off by default (publicly sourced but
-        // gated), and follows the same global opt-in.
+        // gated), and likewise needs explicit confirmation.
         let mut tok = sample_manifest();
         tok.manifest_id = "mdl_token".into();
         tok.artifacts[0].path = "tok.gguf".into();
@@ -931,13 +1128,16 @@ mod tests {
             auth: AuthPolicy::Token,
         }];
         let tok_b3 = tok.artifacts[0].hashes.blake3.clone();
+        let tok_sha = tok.artifacts[0].hashes.sha256.clone();
         kp.sign_manifest(&mut tok).unwrap();
         db.insert_manifest(&tok, &crate::sign::verify_manifest(&tok).unwrap())
             .unwrap();
         assert!(!db.is_blob_shareable(&tok_b3).unwrap());
         db.set_share_gated(true);
-        assert!(db.is_blob_shareable(&tok_b3).unwrap());
+        assert!(!db.is_blob_shareable(&tok_b3).unwrap());
         db.set_share_gated(false);
+        db.confirm_gated_share(&tok_b3, &tok_sha).unwrap();
+        assert!(db.is_blob_shareable(&tok_b3).unwrap());
 
         // Unknown blob (no containing manifest) => not shared.
         assert!(!db.is_blob_shareable(&"ee".repeat(32)).unwrap());
@@ -986,6 +1186,71 @@ mod tests {
         // Deleting the blob clears the override (no stale re-share on re-download).
         db.delete_cache_blob(&local_b3).unwrap();
         assert!(db.share_override(&local_b3).unwrap().is_none());
+    }
+
+    #[test]
+    fn clear_all_gated_confirmations_revokes_sharing() {
+        let db = Db::open_in_memory().unwrap();
+        let kp = KeyPair::generate();
+
+        // A confirmed gated model: shareable until the global revoke runs.
+        let mut gated = sample_manifest();
+        gated.manifest_id = "mdl_gated_revoke".into();
+        gated.access.gated = true;
+        gated.artifacts[0].path = "gated.gguf".into();
+        gated.artifacts[0].hashes.blake3 = "ab".repeat(32);
+        let gated_b3 = gated.artifacts[0].hashes.blake3.clone();
+        let gated_sha = gated.artifacts[0].hashes.sha256.clone();
+        kp.sign_manifest(&mut gated).unwrap();
+        db.insert_manifest(&gated, &crate::sign::verify_manifest(&gated).unwrap())
+            .unwrap();
+        db.upsert_cache_blob(
+            &BlobMeta {
+                blake3: gated_b3.clone(),
+                sha256: gated_sha.clone(),
+                size_bytes: 1,
+                committed_at: crate::util::now_rfc3339(),
+            },
+            "ready",
+        )
+        .unwrap();
+        db.confirm_gated_share(&gated_b3, &gated_sha).unwrap();
+        assert!(db.is_blob_shareable(&gated_b3).unwrap());
+
+        // The global revoke returns the confirmed-gated blob with its sha256 and
+        // flips it from shareable to not-shareable.
+        let cleared = db.clear_all_gated_confirmations().unwrap();
+        assert_eq!(cleared, vec![(gated_b3.clone(), gated_sha.clone())]);
+        assert!(!db.is_blob_shareable(&gated_b3).unwrap());
+        // Idempotent: a second revoke clears nothing.
+        assert!(db.clear_all_gated_confirmations().unwrap().is_empty());
+    }
+
+    #[test]
+    fn bt_magnet_round_trip() {
+        let db = Db::open_in_memory().unwrap();
+        let b3 = "aa".repeat(32);
+        assert!(db.bt_magnet(&b3).unwrap().is_none());
+        let magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
+        db.set_bt_magnet(&b3, magnet).unwrap();
+        assert_eq!(db.bt_magnet(&b3).unwrap().as_deref(), Some(magnet));
+        // INSERT OR REPLACE overwrites the prior magnet for the same blake3.
+        let magnet2 = "magnet:?xt=urn:btih:89abcdef0123456789abcdef0123456789abcdef";
+        db.set_bt_magnet(&b3, magnet2).unwrap();
+        assert_eq!(db.bt_magnet(&b3).unwrap().as_deref(), Some(magnet2));
+    }
+
+    #[test]
+    fn bt_uploaded_round_trip() {
+        let db = Db::open_in_memory().unwrap();
+        let b3 = "cc".repeat(32);
+        // Unseen blob reads as zero lifetime upload.
+        assert_eq!(db.bt_uploaded(&b3).unwrap(), 0);
+        db.set_bt_uploaded(&b3, 4_000).unwrap();
+        assert_eq!(db.bt_uploaded(&b3).unwrap(), 4_000);
+        // Monotonic overwrite (the watcher persists the running lifetime total).
+        db.set_bt_uploaded(&b3, 9_500).unwrap();
+        assert_eq!(db.bt_uploaded(&b3).unwrap(), 9_500);
     }
 
     #[test]

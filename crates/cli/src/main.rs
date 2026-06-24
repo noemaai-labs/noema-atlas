@@ -59,8 +59,6 @@ struct Cli {
 #[derive(Copy, Clone, ValueEnum)]
 enum PlatformArg {
     Desktop,
-    Ios,
-    Android,
 }
 
 #[derive(Subcommand)]
@@ -309,8 +307,6 @@ fn build_engine(g: &Globals) -> Result<Engine> {
     let mut cfg = EngineConfig::new(root);
     cfg.platform = match g.platform {
         Some(PlatformArg::Desktop) => PlatformProfile::desktop(),
-        Some(PlatformArg::Ios) => PlatformProfile::ios(),
-        Some(PlatformArg::Android) => PlatformProfile::android(),
         None => PlatformProfile::detect(),
     };
     cfg.policy = PolicyConfig {
@@ -708,13 +704,16 @@ async fn run(cli: Cli) -> Result<()> {
                 quant: quant.unwrap_or_default(),
                 desc: description.unwrap_or_default(),
                 origin: origin.unwrap_or_default(),
+                magnet: engine.bt_magnet(&out.blake3),
             };
             println!("  share link: {}", link.encode());
             Ok(())
         }
         Cmd::Share { ref model } | Cmd::Unshare { ref model } => {
             let on = matches!(cmd, Cmd::Share { .. });
-            let engine = build_engine(&g)?;
+            // Arc so `set_model_shared` (which seeds over BT on the live runtime)
+            // can take `self: &Arc<Self>`.
+            let engine = std::sync::Arc::new(build_engine(&g)?);
             let m = find_installed(&engine, model)?;
             engine.set_model_shared(&m.blake3, &m.sha256, on)?;
             println!(
@@ -738,6 +737,7 @@ async fn run(cli: Cli) -> Result<()> {
                 quant: m.quant.clone().unwrap_or_default(),
                 desc: m.description.clone().unwrap_or_default(),
                 origin: m.origin.clone().unwrap_or_default(),
+                magnet: engine.bt_magnet(&m.blake3),
             };
             println!("{}", link.encode());
             Ok(())
@@ -1033,12 +1033,13 @@ async fn run(cli: Cli) -> Result<()> {
                 .tracker
                 .clone()
                 .context("--tracker <url> is required for worldwide sharing")?;
-            let engine = build_engine(&g)?;
+            // `start_worldwide_share` takes `Arc<Self>` so its background task can
+            // re-seed the shareable library over BitTorrent on launch.
+            let engine = std::sync::Arc::new(build_engine(&g)?);
             let n = engine.share_announce_items()?.len();
             println!("sharing {n} model file(s) worldwide via the tracker at {tracker}…");
             let identity = noema_core::tracker::Identity {
                 device: noema_core::identity::default_device_name(),
-                group: None,
             };
             let share = engine.start_worldwide_share(tracker, identity).await?;
             println!("this node: {}", share.node_ticket());

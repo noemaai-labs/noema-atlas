@@ -5,25 +5,12 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum Platform {
     Desktop,
-    Ios,
-    Android,
 }
 
 impl Platform {
-    /// Best-effort detection from the compile target.
+    /// Best-effort detection from the compile target. Atlas is desktop-only.
     pub fn detect() -> Self {
-        #[cfg(target_os = "ios")]
-        {
-            Platform::Ios
-        }
-        #[cfg(target_os = "android")]
-        {
-            Platform::Android
-        }
-        #[cfg(not(any(target_os = "ios", target_os = "android")))]
-        {
-            Platform::Desktop
-        }
+        Platform::Desktop
     }
 }
 
@@ -132,10 +119,8 @@ fn total_physical_memory_bytes() -> Option<u64> {
 #[derive(Debug, Clone)]
 pub struct PlatformProfile {
     pub platform: Platform,
-    /// Whether public peer seeding/advertising is permitted (default: desktop only).
+    /// Whether public peer seeding/advertising is permitted.
     pub allow_public_seeding: bool,
-    /// Whether long-lived background peer transfers are permitted.
-    pub background_p2p: bool,
     /// Whether Hugging Face may be used as a byte-download transport.
     ///
     /// Catalog search stays separate; this only gates fetching model bytes from
@@ -152,29 +137,6 @@ impl PlatformProfile {
         PlatformProfile {
             platform: Platform::Desktop,
             allow_public_seeding: true,
-            background_p2p: true,
-            huggingface_download: false,
-            metered: false,
-            battery_saver: false,
-        }
-    }
-
-    pub fn ios() -> Self {
-        PlatformProfile {
-            platform: Platform::Ios,
-            allow_public_seeding: false,
-            background_p2p: false,
-            huggingface_download: false,
-            metered: false,
-            battery_saver: false,
-        }
-    }
-
-    pub fn android() -> Self {
-        PlatformProfile {
-            platform: Platform::Android,
-            allow_public_seeding: false,
-            background_p2p: false,
             huggingface_download: false,
             metered: false,
             battery_saver: false,
@@ -184,29 +146,26 @@ impl PlatformProfile {
     pub fn detect() -> Self {
         match Platform::detect() {
             Platform::Desktop => Self::desktop(),
-            Platform::Ios => Self::ios(),
-            Platform::Android => Self::android(),
         }
     }
 
-    /// Whether a source class is permitted to *fetch* from on this platform.
+    /// Whether a source class is permitted to *fetch* from.
     pub fn fetch_enabled(&self, class: SourceClass) -> bool {
-        match (self.platform, class) {
-            (_, SourceClass::Huggingface) => self.huggingface_download,
+        match class {
+            SourceClass::Huggingface => self.huggingface_download,
             // LAN peering was removed — Atlas is a worldwide service. The variant
             // is retained only so older persisted manifests still deserialize; it
             // is never fetched.
-            (_, SourceClass::LanPeer) => false,
-            // Local + HTTP-family work everywhere.
-            (_, SourceClass::LocalFile)
-            | (_, SourceClass::HttpsMirror)
-            | (_, SourceClass::Ipfs) => true,
-            // Iroh: desktop always; mobile only in foreground (modeled as enabled
-            // but lower priority — the wrapper decides foreground gating).
-            (_, SourceClass::Iroh) => true,
-            // BitTorrent has been retired; the variant is retained only so older
-            // persisted manifests still deserialize. Never fetched.
-            (_, SourceClass::BittorrentV2) => false,
+            SourceClass::LanPeer => false,
+            // Local + HTTP-family + Iroh peers work everywhere.
+            SourceClass::LocalFile | SourceClass::HttpsMirror | SourceClass::Iroh => true,
+            // BitTorrent fetches from swarms when the adapter is compiled in.
+            // Without the feature the variant is never fetched (kept only for
+            // back-compat deser).
+            #[cfg(feature = "bittorrent")]
+            SourceClass::BittorrentV2 => true,
+            #[cfg(not(feature = "bittorrent"))]
+            SourceClass::BittorrentV2 => false,
         }
     }
 
@@ -214,34 +173,13 @@ impl PlatformProfile {
     /// per-platform recommended transport order. Local cache hits are handled
     /// before the planner runs, so `LocalFile` import sources rank highest here.
     pub fn class_priority(&self, class: SourceClass) -> f64 {
-        match self.platform {
-            Platform::Desktop => match class {
-                SourceClass::LocalFile => 120.0,
-                SourceClass::LanPeer => 100.0,
-                SourceClass::Iroh => 90.0,
-                SourceClass::BittorrentV2 => 80.0,
-                SourceClass::Ipfs => 70.0,
-                SourceClass::HttpsMirror => 55.0,
-                SourceClass::Huggingface => 45.0,
-            },
-            Platform::Ios => match class {
-                SourceClass::LocalFile => 120.0,
-                SourceClass::HttpsMirror => 95.0,
-                SourceClass::Ipfs => 70.0,
-                SourceClass::LanPeer => 60.0,
-                SourceClass::Iroh => 50.0,
-                SourceClass::Huggingface => 40.0,
-                SourceClass::BittorrentV2 => 0.0,
-            },
-            Platform::Android => match class {
-                SourceClass::LocalFile => 120.0,
-                SourceClass::HttpsMirror => 95.0,
-                SourceClass::LanPeer => 80.0,
-                SourceClass::Iroh => 70.0,
-                SourceClass::Ipfs => 65.0,
-                SourceClass::Huggingface => 40.0,
-                SourceClass::BittorrentV2 => 30.0,
-            },
+        match class {
+            SourceClass::LocalFile => 120.0,
+            SourceClass::LanPeer => 100.0,
+            SourceClass::Iroh => 90.0,
+            SourceClass::BittorrentV2 => 80.0,
+            SourceClass::HttpsMirror => 55.0,
+            SourceClass::Huggingface => 45.0,
         }
     }
 }
@@ -276,10 +214,6 @@ mod tests {
         );
         assert!(
             profile.class_priority(SourceClass::Iroh)
-                > profile.class_priority(SourceClass::Huggingface)
-        );
-        assert!(
-            profile.class_priority(SourceClass::Ipfs)
                 > profile.class_priority(SourceClass::Huggingface)
         );
         assert!(

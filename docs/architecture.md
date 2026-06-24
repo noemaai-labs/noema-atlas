@@ -2,7 +2,7 @@
 
 Noema Atlas separates five concerns that other tools tend to conflate:
 **identity, policy, caching, discovery, and transport.** No single protocol
-(Hugging Face, IPFS, Iroh, HTTPS) is a complete answer for
+(Hugging Face, Iroh, HTTPS, BitTorrent) is a complete answer for
 distributing local LLM weights, so none of them is made the namespace. Instead:
 
 * **Identity** = the artifact's content digest (BLAKE3 primary, SHA-256 for
@@ -21,7 +21,7 @@ distributing local LLM weights, so none of them is made the namespace. Instead:
           ├─────────────────────────────────────────────┤
           │              cache (CAS + SQLite)            │  durable, deduplicated
           ├─────────────────────────────────────────────┤
-   local │ https │ huggingface │ ipfs │ iroh             │  transport adapters
+   local │ https │ huggingface │ iroh │ bittorrent       │  transport adapters
           ├─────────────────────────────────────────────┤
           │              planner / engine                │  orchestration + public API
           └─────────────────────────────────────────────┘
@@ -40,9 +40,9 @@ distributing local LLM weights, so none of them is made the namespace. Instead:
 | `secret`      | OS keystore abstraction + read-only env fallback. |
 | `verify`      | Streaming verifier, file-safety classification, GGUF/Safetensors headers. |
 | `policy`      | License/gated policy classes, redistribution + unsafe-type rules. |
-| `platform`    | Per-platform transport enablement + priority (desktop/iOS/Android). |
+| `platform`    | Transport enablement + priority for desktop. |
 | `planner`     | Source eligibility + scoring + ordering. |
-| `transport`   | The `TransportAdapter` trait + local/https/hf/ipfs/iroh adapters. |
+| `transport`   | The `TransportAdapter` trait + local/https/hf/iroh/bittorrent adapters. |
 | `engine`      | The public API; the end-to-end download flow. |
 
 ## The download flow
@@ -113,8 +113,8 @@ Key properties:
 
 * **BLAKE3** is the primary identity: fast, and natively content-addressed by the
   same kind of root hash Iroh uses for blobs.
-* **SHA-256** is carried alongside for interop — IPFS defaults to SHA-256, and
-  the community publishes `sha256sums`.
+* **SHA-256** is carried alongside for interop — the community publishes
+  `sha256sums` and BitTorrent v2 keys pieces on SHA-256.
 * An **explicit application-level Merkle tree** over fixed 1 MiB leaves is
   designed to give range/streaming verification independent of BLAKE3's internal
   chunking. The signed manifest commits only to the small Merkle *root*; the
@@ -130,8 +130,7 @@ Key properties:
 Identity priority is constant (manifest digest wins; CAS hit short-circuits).
 *Transport* priority is computed per source as a blend of:
 
-* platform/class base priority (desktop favors Iroh peers; mobile favors
-  authorized HTTP/HF),
+* class base priority (Iroh peers are favored over HTTP/HF),
 * observed success ratio (neutral prior when unseen),
 * latency bonus, native content-addressing bonus,
 * integrity penalty (a source that ever served corrupt bytes is **banned**),

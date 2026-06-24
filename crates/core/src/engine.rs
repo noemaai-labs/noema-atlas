@@ -3,7 +3,7 @@ use crate::db::{CacheBlobRow, Db, InstallRow, ManifestSummary, SourceHealth};
 use crate::error::{Error, Result, TransportErrorKind};
 use crate::hash::{ChunkTree, Hashes};
 use crate::manifest::{Artifact, Manifest, Source, SourceClass};
-use crate::planner::{plan_artifact, Plan};
+use crate::planner::{plan_artifact_with, Plan};
 use crate::platform::PlatformProfile;
 use crate::policy::{PolicyConfig, PolicyDecision, PolicyEngine};
 use crate::secret::{self, SecretStore};
@@ -85,6 +85,12 @@ pub struct EngineConfig {
     /// Opt-in to also auto-share gated/token-walled/restrictively-licensed models.
     /// A per-model override still wins.
     pub share_gated: bool,
+    /// Maximum number of transfers downloading at once; further runs queue behind
+    /// a semaphore until a slot frees.
+    pub max_concurrent_downloads: usize,
+    /// How the user wants downloads routed across transports (P2P / BitTorrent /
+    /// save-data). Initial value; adjust live via [`Engine::set_download_preference`].
+    pub download_preference: crate::planner::DownloadPreference,
 }
 
 impl EngineConfig {
@@ -92,6 +98,8 @@ impl EngineConfig {
         let root = root.into();
         let transport = TransportConfig {
             iroh_store_dir: root.join("iroh-store"),
+            bittorrent_store_dir: root.join("bittorrent-store"),
+            bittorrent_cas_dir: root.join("cas").join("blake3"),
             ..TransportConfig::default()
         };
         EngineConfig {
@@ -104,6 +112,8 @@ impl EngineConfig {
             tracker_url: None,
             max_download_connections: 4,
             share_gated: false,
+            max_concurrent_downloads: 4,
+            download_preference: crate::planner::DownloadPreference::Auto,
         }
     }
 }
@@ -123,6 +133,11 @@ pub struct DownloadProgress {
     /// The verified byte offset this source attempt effectively started from.
     /// `Some(n > 0)` means a resumed partial was reused.
     pub effective_start: Option<u64>,
+    /// Connected peer count (BitTorrent swarm; `0` for other transports).
+    pub peers: u32,
+    /// Cumulative bytes uploaded to peers (BitTorrent seeding) — lets the UI show
+    /// a seed ratio. `0` for non-swarm transports.
+    pub uploaded_bytes: u64,
 }
 
 /// A callback the engine invokes as a download progresses.
@@ -279,8 +294,8 @@ pub struct ReconcileReport {
 #[cfg(feature = "http")]
 pub type ShareItem = (PathBuf, crate::tracker::AnnounceItem);
 
-/// Shared announce identity (device name + group). Held behind a mutex so the UI
-/// can update it live without tearing down and rebuilding the Iroh node.
+/// Shared announce identity (device name). Held behind a mutex so the UI can
+/// update it live without tearing down and rebuilding the Iroh node.
 #[cfg(feature = "iroh")]
 type SharedIdentity = Arc<std::sync::Mutex<crate::tracker::Identity>>;
 
@@ -295,6 +310,12 @@ pub struct WorldwideShare {
     identity: SharedIdentity,
     /// App proxy ("VPN tunnel") for tracker traffic, if configured.
     proxy: Option<String>,
+    /// Iroh share-store dir (holds `node.key`) so out-of-band re-announces from a
+    /// [`SeederHandle`] can sign with the node secret key.
+    store_dir: PathBuf,
+    /// Shared with the engine: the set of blake3s currently seeded over Iroh, so
+    /// [`Engine::is_iroh_seeding`] reads a live signal. Cleared on [`stop`](Self::stop).
+    seeded: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     announce_task: tokio::task::JoinHandle<()>,
 }
 
@@ -320,7 +341,7 @@ impl WorldwideShare {
     pub fn active_uploads_for(&self, blake3: &str) -> u64 {
         self.metrics.active_uploads_for_hex(blake3)
     }
-    /// Update the announce identity (device name / group) live — no node restart.
+    /// Update the announce identity (device name) live — no node restart.
     /// Takes effect on the next (re-)announce.
     pub fn set_identity(&self, id: crate::tracker::Identity) {
         if let Ok(mut g) = self.identity.lock() {
@@ -349,6 +370,7 @@ impl WorldwideShare {
             node_id: self.node_id.clone(),
             identity: self.identity.clone(),
             proxy: self.proxy.clone(),
+            store_dir: self.store_dir.clone(),
         }
     }
     /// Stop announcing **and** hard-disconnect: abort the re-announce loop, shut
@@ -358,6 +380,11 @@ impl WorldwideShare {
     /// the catalog right away.
     pub async fn stop(self) {
         self.announce_task.abort();
+        // No longer seeding anything over Iroh — clear the live signal so
+        // `Engine::is_iroh_seeding` reverts to false immediately.
+        if let Ok(mut s) = self.seeded.lock() {
+            s.clear();
+        }
         self._node.shutdown_handle().await;
     }
 }
@@ -373,12 +400,34 @@ pub struct SeederHandle {
     identity: SharedIdentity,
     /// App proxy ("VPN tunnel") for tracker traffic, if configured.
     proxy: Option<String>,
+    /// Iroh share-store dir (holds `node.key`) so announces can be signed with the
+    /// node secret key as an ownership proof (see [`crate::announce_auth`]).
+    store_dir: PathBuf,
 }
 
 #[cfg(feature = "iroh")]
 impl SeederHandle {
     fn identity(&self) -> crate::tracker::Identity {
         self.identity.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+    /// Sign an announce over `items`' blake3s with this device's node secret key,
+    /// proving ownership of `node_id` to the registry. Binds this node's `ticket`
+    /// and the target registry (`tracker_url`) as the audience, so the proof can't
+    /// be MITM-rewritten or replayed cross-registry.
+    fn sign_announce(
+        &self,
+        items: &[crate::tracker::AnnounceItem],
+        tracker_url: &str,
+    ) -> Option<crate::tracker::AnnounceAuth> {
+        let ids: Vec<String> = items.iter().map(|i| i.blake3.clone()).collect();
+        crate::iroh_node::sign_announce(
+            &self.store_dir,
+            "announce",
+            &self.ticket,
+            tracker_url,
+            &ids,
+        )
+        .map(|(_, ts, sig)| (ts, sig))
     }
     /// Stop serving a blob over Iroh (see [`WorldwideShare::unseed`]). Cloneable +
     /// `Send`, so the UI can fire it off-thread when a share is turned off.
@@ -402,6 +451,7 @@ impl SeederHandle {
             }
         }
         if !ann.is_empty() {
+            let auth = self.sign_announce(&ann, tracker_url);
             let _ = crate::tracker::announce(
                 tracker_url,
                 self.proxy.as_deref(),
@@ -409,14 +459,16 @@ impl SeederHandle {
                 &self.node_id,
                 &self.identity(),
                 &ann,
+                auth.as_ref(),
             )
             .await;
         }
     }
     /// Re-announce already-seeded content with the current identity, without
-    /// re-hashing. Use after a device-name / group change.
+    /// re-hashing. Use after a device-name change.
     pub async fn reannounce(&self, items: &[crate::tracker::AnnounceItem], tracker_url: &str) {
         if !items.is_empty() {
+            let auth = self.sign_announce(items, tracker_url);
             let _ = crate::tracker::announce(
                 tracker_url,
                 self.proxy.as_deref(),
@@ -424,6 +476,7 @@ impl SeederHandle {
                 &self.node_id,
                 &self.identity(),
                 items,
+                auth.as_ref(),
             )
             .await;
         }
@@ -458,6 +511,10 @@ pub struct InstalledModel {
     /// default for sharing; the user can opt it in deliberately.
     pub gated: bool,
     pub install_path: Option<String>,
+    /// Recognized weight format tag (`gguf`, `safetensors`, `onnx`, `mlx`, …) from
+    /// the manifest artifact; `None` if unknown. Surfaced as a Library/Transfers
+    /// badge via the UI's format-label map.
+    pub format: Option<String>,
 }
 
 /// A model discovered on the worldwide network catalog (browsable on the
@@ -470,11 +527,15 @@ pub struct NetworkModel {
     pub size: u64,
     pub quant: String,
     pub license: String,
+    /// BitTorrent magnet (info-hash) advertised for this file by a seeding peer,
+    /// if any. Carried into the fetch's `ShareTarget` so the BT transport can join
+    /// the swarm. Empty when no peer announced one.
+    pub magnet: String,
     /// Live worldwide peers currently sharing this file.
     pub peers: usize,
     /// Human device names sharing it (for "from your devices").
     pub devices: Vec<String>,
-    /// True when this belongs to the querier's own device group.
+    /// True when one of the querier's own devices is seeding this.
     pub mine: bool,
     /// True when this exact file is already in the local Library.
     pub in_library: bool,
@@ -587,19 +648,13 @@ pub struct Engine {
     /// Our own worldwide-seeder NodeId once sharing is running, so peer lookups
     /// can exclude ourselves (don't count or fetch from our own node).
     self_node_id: Arc<std::sync::Mutex<Option<String>>>,
-    /// Cooperative cancel flag for the in-flight download. Set by
-    /// [`Engine::request_pause`] / [`Engine::request_stop`], checked in the
-    /// streaming loop so a user can interrupt a running (multi-GB) transfer. One
-    /// flag because the engine runs at most one `download` at a time (the desktop
-    /// guards on `busy`).
-    cancel: Arc<std::sync::atomic::AtomicBool>,
-    /// Distinguishes the two ways a transfer is interrupted: `false` (the default)
-    /// is a Pause — the partial temp is kept and the row marked `paused` so a later
-    /// `download` resumes; `true` is a Stop — the partial temp and the download row
-    /// are discarded so the next attempt restarts clean. Read after the streaming
-    /// loop unwinds. A Stop sets this *before* `cancel` so a loop that observes the
-    /// cancel also sees the discard intent.
-    discard_partial: Arc<std::sync::atomic::AtomicBool>,
+    /// Registry of live transfers, keyed by id. Each carries its own cooperative
+    /// cancel/discard flags so concurrent downloads interrupt independently. The
+    /// running transfer's control is also stashed in the `CURRENT_TRANSFER`
+    /// task-local so the streaming/verify code can read it without an extra arg.
+    transfers: Arc<crate::transfer::TransferManager>,
+    /// Caps how many transfers download at once; further runs queue on it.
+    download_slots: Arc<tokio::sync::Semaphore>,
     /// Live override of `cfg.platform.huggingface_download` so the desktop's
     /// rebuilding the engine (i.e. without an app restart). Initialized from the
     /// platform profile; read into a per-plan profile copy in [`Engine::live_platform`].
@@ -608,12 +663,21 @@ pub struct Engine {
     /// Mirrors `cfg.max_download_connections` but adjustable at runtime; read per
     /// download in [`Engine::try_source`]. `1` disables segmentation.
     max_conns: Arc<AtomicUsize>,
-    /// The manifest id of the in-flight download, set at the top of [`Engine::download`]
-    /// and stamped onto every progress event. Single-flight (see `cancel`), so one
-    /// slot is enough. Lets the UI tie a live transfer back to its manifest — needed
-    /// to resume a content/link download, whose id is synthesized at import time and
-    /// is otherwise never seen on the wire.
-    current_manifest_id: Arc<std::sync::Mutex<String>>,
+    /// Live download-routing preference (P2P / BitTorrent / save-data), read into
+    /// each plan. Stored as a `u8` code so the UI can flip it without a restart
+    /// (mirrors `hf_download`); initialized from `cfg.download_preference`.
+    download_pref: Arc<std::sync::atomic::AtomicU8>,
+    /// blake3s this node is currently seeding over Iroh (worldwide share). The
+    /// announce loop in [`Engine::start_worldwide_share`] writes it as it seeds each
+    /// blob; [`Engine::is_iroh_seeding`] reads it. Empty (false) when worldwide
+    /// sharing isn't running — the running share clears + repopulates it, and
+    /// [`WorldwideShare::stop`] clears it again. Symmetric with the BitTorrent
+    /// `is_bt_seeding` signal.
+    iroh_seeded: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// One-shot guard so the launch-time BitTorrent re-seed sweep runs at most once
+    /// per engine lifetime (on the first transfer), independent of whether the user
+    /// ever turns on worldwide Iroh sharing.
+    bt_launch_reseeded: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Engine {
@@ -622,13 +686,22 @@ impl Engine {
         let cas = Cas::open(&cfg.root)?;
         let db = Arc::new(Db::open(&cas.db_path())?);
         db.set_share_gated(cfg.share_gated);
-        let transports = Transports::new(&cfg.transport)?;
+        // The DB doubles as the BitTorrent lifetime-upload store, so the
+        // stop-at-ratio cap is a lifetime (cross-restart) ratio.
+        let bt_upload_store: Arc<dyn crate::transport::BtUploadStore> = db.clone();
+        let transports = Transports::new(&cfg.transport, Some(bt_upload_store))?;
         let policy = PolicyEngine::new(cfg.policy.clone());
         let secret = secret::default_store();
         let hf_download = Arc::new(std::sync::atomic::AtomicBool::new(
             cfg.platform.huggingface_download,
         ));
         let max_conns = Arc::new(AtomicUsize::new(cfg.max_download_connections.max(1)));
+        let download_pref = Arc::new(std::sync::atomic::AtomicU8::new(
+            cfg.download_preference.as_u8(),
+        ));
+        let download_slots = Arc::new(tokio::sync::Semaphore::new(
+            cfg.max_concurrent_downloads.max(1),
+        ));
         Ok(Engine {
             cas,
             db,
@@ -637,11 +710,13 @@ impl Engine {
             secret,
             cfg,
             self_node_id: Arc::new(std::sync::Mutex::new(None)),
-            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            discard_partial: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            transfers: Arc::new(crate::transfer::TransferManager::default()),
+            download_slots,
             hf_download,
             max_conns,
-            current_manifest_id: Arc::new(std::sync::Mutex::new(String::new())),
+            download_pref,
+            iroh_seeded: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            bt_launch_reseeded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -693,39 +768,143 @@ impl Engine {
         self.db.share_gated()
     }
 
-    /// Pause the in-flight download. The streaming loop notices promptly and
-    /// returns [`Error::Cancelled`]; already-downloaded bytes are kept on disk and
-    /// the row marked `paused`, so a later `download` of the same artifact resumes.
-    /// No-op if nothing is downloading.
+    /// Set the download-routing preference at runtime (no restart). Takes effect on
+    /// the next download's plan: it re-biases source scoring toward P2P, BitTorrent,
+    /// or a single mirror (save-data). Mirrors [`Engine::set_share_gated_enabled`].
+    pub fn set_download_preference(&self, pref: crate::planner::DownloadPreference) {
+        self.download_pref
+            .store(pref.as_u8(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The current download-routing preference (live value).
+    pub fn download_preference(&self) -> crate::planner::DownloadPreference {
+        crate::planner::DownloadPreference::from_u8(
+            self.download_pref
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Set the BitTorrent stop-at-ratio cap at runtime (`0.0` = unlimited; no
+    /// restart). Lowering or clearing it resumes seeds the ratio watcher had paused
+    /// (on its next tick); raising it lets newly-over-cap seeds pause. No-op when the
+    /// BitTorrent adapter isn't built in.
+    pub fn set_bittorrent_max_ratio(&self, max_ratio: f64) {
+        self.transports.set_bittorrent_max_ratio(max_ratio);
+    }
+
+    /// Pause every active transfer (back-compat single-flight API). The streaming
+    /// loop notices promptly and returns [`Error::Cancelled`]; already-downloaded
+    /// bytes are kept on disk and the row marked `paused`, so a later `download`
+    /// resumes. Prefer [`Engine::pause`] with a specific id when concurrent.
     pub fn request_pause(&self) {
-        self.discard_partial
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-        self.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        for ctl in self.transfers.all() {
+            ctl.request_pause();
+        }
     }
 
-    /// Stop the in-flight download and discard its progress. The streaming loop
-    /// notices promptly and the engine returns [`Error::Stopped`] after deleting
-    /// the partial temp file and the download row, so the next attempt starts
-    /// clean. No-op if nothing is downloading.
+    /// Stop every active transfer and discard its progress (back-compat
+    /// single-flight API). Prefer [`Engine::stop`] with a specific id.
     pub fn request_stop(&self) {
-        // Order matters: set the discard intent before the cancel flag so a
-        // streaming loop that observes `cancel` also sees `discard_partial`
-        // (SeqCst stores pair the two for the reader).
-        self.discard_partial
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        self.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        for ctl in self.transfers.all() {
+            ctl.request_stop();
+        }
     }
 
-    /// Whether a pause/stop has been requested for the current download.
+    /// Pause one transfer by id (keeps its partial for resume).
+    pub fn pause(&self, id: &crate::transfer::TransferId) {
+        if let Some(ctl) = self.transfers.get(id) {
+            ctl.request_pause();
+        }
+    }
+
+    /// Stop one transfer by id (discards its partial).
+    pub fn stop(&self, id: &crate::transfer::TransferId) {
+        if let Some(ctl) = self.transfers.get(id) {
+            ctl.request_stop();
+        }
+    }
+
+    /// Register a transfer for a manifest up front (so the UI has its id before the
+    /// download starts, to wire pause/stop) without launching it. Returns the
+    /// existing id if the manifest already has a live transfer. Drive it with
+    /// [`Engine::run_download`].
+    pub fn register_transfer(&self, manifest_id: &str) -> crate::transfer::TransferId {
+        self.transfers.register(manifest_id).id.clone()
+    }
+
+    /// Snapshot of every live transfer's id and state, for the UI's list / restart
+    /// reconciliation.
+    pub fn list_transfers(
+        &self,
+    ) -> Vec<(crate::transfer::TransferId, crate::transfer::TransferState)> {
+        self.transfers
+            .all()
+            .into_iter()
+            .map(|c| (c.id.clone(), c.state()))
+            .collect()
+    }
+
+    /// Forget a finished/stopped transfer, freeing its registry slot.
+    pub fn remove_transfer(&self, id: &crate::transfer::TransferId) {
+        self.transfers.remove(id);
+    }
+
+    /// Fully discard a paused/waiting transfer the user removed: delete each
+    /// artifact's leftover `.part` temp(s) and its download row (the partial bytes
+    /// plus the resumable DB row that would otherwise leak), then free the registry
+    /// slot. Mirrors a Stop's discard path, but for a transfer that isn't live, so
+    /// there's no streaming loop to interrupt and we clean up the on-disk state
+    /// directly. A missing manifest just means there's nothing left to discard.
+    pub fn discard_transfer(&self, id: &crate::transfer::TransferId) -> Result<()> {
+        // If a task is still driving this transfer, don't yank its `.part` out from
+        // under the live write — ask it to Stop (which discards on its own) and let
+        // its finish_cancelled path clean up. Only delete on-disk state directly for a
+        // transfer with no live/executing control.
+        if let Some(ctl) = self.transfers.get(id) {
+            if ctl.is_executing() {
+                ctl.request_stop();
+                return Ok(());
+            }
+        }
+        if let Some(manifest) = self.db.get_manifest(&id.0)? {
+            for art in &manifest.artifacts {
+                let download_id = artifact_download_id(&manifest.manifest_id, &art.path);
+                self.cas.remove_download_temps(&download_id);
+                self.db.delete_download(&download_id)?;
+            }
+        }
+        self.transfers.remove(id);
+        Ok(())
+    }
+
+    /// Whether a pause/stop was requested for the *current* transfer — read from
+    /// the `CURRENT_TRANSFER` task-local set by [`Engine::run_transfer`].
     fn is_cancelled(&self) -> bool {
-        self.cancel.load(std::sync::atomic::Ordering::SeqCst)
+        crate::transfer::current()
+            .map(|c| c.is_cancelled())
+            .unwrap_or(false)
     }
 
-    /// Whether the active interruption is a Stop (discard the partial) rather than
-    /// a Pause (keep it for resume).
+    /// Whether the active interruption is a Stop (discard) vs a Pause (keep).
     fn discard_partial(&self) -> bool {
-        self.discard_partial
-            .load(std::sync::atomic::Ordering::SeqCst)
+        crate::transfer::current()
+            .map(|c| c.discard_requested())
+            .unwrap_or(false)
+    }
+
+    /// Advance the current transfer's lifecycle state (no-op outside a transfer,
+    /// e.g. a direct streaming call from a test). Never clobbers a terminal
+    /// Paused/Stopped: a Pause/Stop set on the control mid-stream must not be
+    /// overwritten by a later Downloading/Verifying from the loop that hasn't
+    /// noticed the cancel yet — the run-loop assigns the final terminal state.
+    fn set_transfer_state(&self, s: crate::transfer::TransferState) {
+        use crate::transfer::TransferState;
+        if let Some(ctl) = crate::transfer::current() {
+            if matches!(ctl.state(), TransferState::Paused | TransferState::Stopped) {
+                return;
+            }
+            ctl.set_state(s);
+        }
     }
 
     /// Finalize a user-interrupted artifact and return the error to propagate.
@@ -995,8 +1174,10 @@ impl Engine {
         let db = self.db.clone();
         let platform = self.live_platform();
         let mut out = Vec::new();
+        let pref = self.download_preference();
         for art in &m.artifacts {
-            let plan = plan_artifact(&m, art, &platform, &self.policy, |sid| {
+            // Preview plan: no live peer count is known here (no discovery yet).
+            let plan = plan_artifact_with(&m, art, &platform, &self.policy, pref, None, |sid| {
                 db.get_source_health(sid).unwrap_or_else(|_| SourceHealth {
                     source_id: sid.to_string(),
                     ..Default::default()
@@ -1007,22 +1188,110 @@ impl Engine {
         Ok(out)
     }
 
-    /// Download (and verify) every artifact of a manifest into the CAS.
+    /// Download (and verify) every artifact of a manifest into the CAS. Registers
+    /// (or reuses) a transfer and runs it under the concurrency limiter. Kept as
+    /// the simple one-call API for the CLI and tests.
     pub async fn download(
         &self,
         manifest_id: &str,
         progress: Option<Progress>,
     ) -> Result<DownloadOutcome> {
-        // Fresh start: clear any pause/stop flags left set by a previous run.
-        self.cancel
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-        self.discard_partial
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-        // Stamp this download's id onto every progress event (see emit_raw) so the
-        if let Ok(mut g) = self.current_manifest_id.lock() {
-            g.clear();
-            g.push_str(manifest_id);
+        let id = crate::transfer::TransferId(manifest_id.to_string());
+        let ctl = self
+            .transfers
+            .get(&id)
+            .unwrap_or_else(|| self.transfers.register(manifest_id));
+        self.run_transfer(ctl, progress).await
+    }
+
+    /// Run a previously [`Engine::register_transfer`]ed transfer by id. Used by the
+    /// UIs, which need the id before the download begins to wire pause/stop.
+    pub async fn run_download(
+        &self,
+        id: &crate::transfer::TransferId,
+        progress: Option<Progress>,
+    ) -> Result<DownloadOutcome> {
+        let ctl = self
+            .transfers
+            .get(id)
+            .ok_or_else(|| Error::other(format!("unknown transfer: {}", id.as_str())))?;
+        self.run_transfer(ctl, progress).await
+    }
+
+    /// Acquire a concurrency slot (queuing if all are busy), set the per-transfer
+    /// control as the task-local for the streaming/verify code, run the download,
+    /// and record the terminal state.
+    async fn run_transfer(
+        &self,
+        ctl: Arc<crate::transfer::TransferControl>,
+        progress: Option<Progress>,
+    ) -> Result<DownloadOutcome> {
+        use crate::transfer::TransferState;
+        // Reject a second concurrent run of the same transfer (e.g. resuming a
+        // still-queued card) — two run_transfer tasks would race the same partial.
+        // try_begin atomically clears any stale pause/stop flags when it admits the
+        // run, so a Stop issued the instant we become executing can't be lost to a
+        // separate reset.
+        if !ctl.try_begin() {
+            return Err(Error::other("transfer is already running"));
         }
+        struct ExecGuard(Arc<crate::transfer::TransferControl>);
+        impl Drop for ExecGuard {
+            fn drop(&mut self) {
+                self.0.end();
+            }
+        }
+        let _exec = ExecGuard(ctl.clone());
+        // First transfer of this engine's lifetime also restores the shareable
+        // library's BitTorrent swarms — so re-seeding no longer depends on the user
+        // turning on worldwide Iroh sharing. One-shot + idempotent (skips anything
+        // already seeding). Each `seed_blob` now returns immediately — the cold
+        // librqbit session init (DHT/listener/UPnP) and the heavy piece-hashing both
+        // run on a detached task — so this no longer stalls the transfer on a fresh
+        // launch the way an inline session bind would.
+        self.ensure_launch_bt_reseed_once().await;
+        // Report Queued while parked on the concurrency limit, so a resumed-but-
+        // slot-starved transfer shows as "queued" in the UI rather than a stuck
+        // Paused/0B card. Flips to Connecting once a slot frees.
+        ctl.set_state(TransferState::Queued);
+        let _permit = self
+            .download_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::other("download scheduler closed"))?;
+        ctl.set_state(TransferState::Connecting);
+        let manifest_id = ctl.manifest_id.clone();
+        let result = crate::transfer::CURRENT_TRANSFER
+            .scope(ctl.clone(), self.download_inner(&manifest_id, progress))
+            .await;
+        match &result {
+            Ok(_) => ctl.set_state(TransferState::Complete),
+            Err(Error::Cancelled) => ctl.set_state(TransferState::Paused),
+            Err(Error::Stopped) => {
+                ctl.set_state(TransferState::Stopped);
+                self.transfers.remove(&ctl.id);
+            }
+            Err(_) => ctl.set_state(TransferState::Failed),
+        }
+        // If a Stop/discard was latched (e.g. `discard_transfer` on a live transfer)
+        // but the task ended via Complete/Paused/Failed rather than the Stopped path,
+        // honor it now so the partial/row/slot don't leak. Drop the exec guard first
+        // so discard_transfer takes its non-executing cleanup branch.
+        let discard = ctl.discard_requested();
+        drop(_exec);
+        if discard && !matches!(result, Err(Error::Stopped)) {
+            let _ = self.discard_transfer(&ctl.id);
+        }
+        result
+    }
+
+    /// The per-manifest download body, run inside the `CURRENT_TRANSFER` task-local.
+    async fn download_inner(
+        &self,
+        manifest_id: &str,
+        progress: Option<Progress>,
+    ) -> Result<DownloadOutcome> {
         let manifest = self.require_manifest(manifest_id)?;
         let report = verify_manifest(&manifest)?;
         let decision = self.policy.evaluate_download(&manifest, &report);
@@ -1091,6 +1360,13 @@ impl Engine {
 
         // 1b. Worldwide discovery: ask the tracker who has this file anywhere,
         let mut artifact = artifact.clone();
+        // Live Iroh-provider count for this file, when discovery surfaces one —
+        // folded into the plan's scoring as a small bonus favoring a better-seeded
+        // Iroh source. This is the tracker's Iroh node count specifically, so the
+        // planner credits it only to the Iroh class (not BitTorrent, whose swarm
+        // health is unknown here). Stays `None` with no discovery (neutral).
+        #[cfg_attr(not(feature = "http"), allow(unused_mut))]
+        let mut known_peers: Option<usize> = None;
         #[cfg(feature = "http")]
         if let Some(tracker) = self.cfg.tracker_url.clone() {
             let key = if artifact.hashes.has_sha256() {
@@ -1127,6 +1403,10 @@ impl Engine {
                             peers = set.nodes.len(),
                             "tracker found worldwide P2P providers"
                         );
+                        // Capture the live provider count before the tickets move
+                        // into the Iroh source, so the plan can favor a well-seeded
+                        // file (more reachable peers ⇒ a small scoring bonus).
+                        known_peers = Some(set.nodes.len());
                         // Refresh the Iroh source with the tracker's *current* view
                         // rather than keeping whatever tickets were planned before.
                         // A peer's relay/direct addresses drift, so a resume that
@@ -1169,12 +1449,21 @@ impl Engine {
         }
         let db = self.db.clone();
         let platform = self.live_platform();
-        let plan = plan_artifact(manifest, artifact, &platform, &self.policy, |sid| {
-            db.get_source_health(sid).unwrap_or_else(|_| SourceHealth {
-                source_id: sid.to_string(),
-                ..Default::default()
-            })
-        });
+        let pref = self.download_preference();
+        let plan = plan_artifact_with(
+            manifest,
+            artifact,
+            &platform,
+            &self.policy,
+            pref,
+            known_peers,
+            |sid| {
+                db.get_source_health(sid).unwrap_or_else(|_| SourceHealth {
+                    source_id: sid.to_string(),
+                    ..Default::default()
+                })
+            },
+        );
         if plan.is_empty() {
             let reason = plan
                 .excluded
@@ -1245,6 +1534,7 @@ impl Engine {
                 Ok(meta) => {
                     self.db.set_download_state(&download_id, "complete")?;
                     self.finalize_blob(artifact, &meta).await?;
+                    self.maybe_seed_bittorrent(manifest, artifact, &meta).await;
                     let warnings = artifact_warnings(decision, &artifact.path);
                     return Ok(ArtifactOutcome {
                         artifact_path: artifact.path.clone(),
@@ -1323,6 +1613,40 @@ impl Engine {
                     phase: "downloading",
                     failover_reason: None,
                     effective_start: None,
+                    peers: 0,
+                    uploaded_bytes: 0,
+                });
+            }))
+        });
+        // Rich swarm stats (peers, upload) for BitTorrent — byte-only transports
+        // leave this `None` and report via `on_bytes` above.
+        let on_stats = progress.as_ref().map(|cb| {
+            let cb = cb.clone();
+            let artifact_path = artifact.path.clone();
+            let source_id = source.source_id();
+            let manifest_id = self.current_manifest_id();
+            // Flip the transfer out of WaitingForPeers once the swarm actually
+            // moves (a peer connected or bytes arrived). The closure is `'static`,
+            // so capture the live control instead of `self`.
+            let ctl = crate::transfer::current();
+            crate::transport::StatsSink(Arc::new(move |s: crate::transport::LiveStats| {
+                if (s.peers > 0 || s.bytes_done > 0) && ctl.is_some() {
+                    let c = ctl.as_ref().unwrap();
+                    if matches!(c.state(), crate::transfer::TransferState::WaitingForPeers) {
+                        c.set_state(crate::transfer::TransferState::Downloading);
+                    }
+                }
+                cb(DownloadProgress {
+                    manifest_id: manifest_id.clone(),
+                    artifact_path: artifact_path.clone(),
+                    source_id: Some(source_id.clone()),
+                    bytes_done: s.bytes_done,
+                    bytes_total: s.bytes_total,
+                    phase: "downloading",
+                    failover_reason: None,
+                    effective_start: None,
+                    peers: s.peers,
+                    uploaded_bytes: s.uploaded_bytes,
                 });
             }))
         });
@@ -1333,9 +1657,10 @@ impl Engine {
             // tell them whether a Stop should discard their own partial (Iroh keeps
             // an incomplete blob in its store that the engine's `.part` cleanup
             // can't reach).
-            cancel: Some(self.cancel.clone()),
-            discard_partial: Some(self.discard_partial.clone()),
+            cancel: crate::transfer::current().map(|c| c.cancel.clone()),
+            discard_partial: crate::transfer::current().map(|c| c.discard_partial.clone()),
             on_bytes,
+            on_stats,
         };
         if let AuthRequirement::Token { service } = adapter.auth_requirements(source) {
             let token = secret::resolve_token(self.secret.as_ref(), &service, "default")?;
@@ -1384,6 +1709,14 @@ impl Engine {
                     let _ = truncate_to(temp, 0).await;
                 }
             }
+        }
+
+        // BitTorrent resolves metadata + finds peers inside `open()` (which blocks
+        // for the whole fetch), so surface that wait as WaitingForPeers; the
+        // `on_stats` sink above flips it to Downloading once a peer connects or
+        // bytes arrive. Other transports skip straight to Connecting/Downloading.
+        if matches!(source.class(), SourceClass::BittorrentV2) {
+            self.set_transfer_state(crate::transfer::TransferState::WaitingForPeers);
         }
 
         let mut attempts = 0;
@@ -1569,6 +1902,14 @@ impl Engine {
         let mut last_emit = 0u64;
         let mut win_start = Instant::now();
         let mut win_bytes = 0u64;
+        // Lifecycle: bytes are about to flow. A prefetched transport (Iroh/BT)
+        // already fetched the blob and this loop only re-reads it to verify, so
+        // surface that as Verifying rather than a second Downloading.
+        self.set_transfer_state(if prefetched {
+            crate::transfer::TransferState::Verifying
+        } else {
+            crate::transfer::TransferState::Downloading
+        });
         while let Some(chunk) = stream.next().await {
             // Cooperative cancel: stop promptly but keep the partial on disk so a
             // later attempt resumes instead of restarting from zero.
@@ -1631,6 +1972,10 @@ impl Engine {
                 )),
             ));
         }
+        // All bytes in; finalize the rolling hash + commit. For a streamed
+        // (non-prefetched) download this is the verify phase (prefetched already
+        // reads as Verifying above).
+        self.set_transfer_state(crate::transfer::TransferState::Verifying);
         let hashes = verifier.finish()?;
         let latency_ms = started.elapsed().as_millis() as i64;
         // When the size was unknown up front (`total == 0`, e.g. a bare
@@ -1818,9 +2163,26 @@ impl Engine {
 
         // Run all segments concurrently (in-flight on one task — no spawn — so
         // they can borrow the adapter/ctx). The first error aborts the rest.
-        futures_util::future::try_join_all(futs).await?;
+        //
+        // A user Pause/Stop must NOT keep the pre-sized-but-sparse temp: it's
+        // `total` bytes long with holes where segments hadn't filled yet, so a
+        // resume's `stream_once` either re-reads zeros as a trusted prefix or
+        // (since `temp_len == total`) truncates to 0 anyway — either way the
+        // download row's `bytes_done` is a lie. Truncate the temp to 0 and reset
+        // the row so resume restarts cleanly and honestly (no false "resumed
+        // from N"). A Stop's `finish_cancelled` then deletes the empty temp; a
+        // Pause keeps it at 0 length.
+        if let Err(e) = futures_util::future::try_join_all(futs).await {
+            if matches!(e, Error::Cancelled) {
+                self.reset_segmented_partial(temp, download_id, source)
+                    .await;
+            }
+            return Err(e);
+        }
 
         if self.is_cancelled() {
+            self.reset_segmented_partial(temp, download_id, source)
+                .await;
             return Err(Error::Cancelled);
         }
 
@@ -1850,16 +2212,30 @@ impl Engine {
         Ok(meta)
     }
 
+    /// Discard a segmented download's partial on a user interrupt: truncate the
+    /// pre-sized sparse temp to 0 and zero the download row's `bytes_done`, so a
+    /// resume restarts from a clean slate (the single-stream path can't resume a
+    /// sparse multi-segment temp). Best-effort; the next attempt re-creates both.
+    async fn reset_segmented_partial(&self, temp: &Path, download_id: &str, source: &Source) {
+        let _ = truncate_to(temp, 0).await;
+        let _ = self
+            .db
+            .update_download_progress(download_id, 0, Some(&source.source_id()));
+    }
+
     /// Read the entire temp file and verify it against the artifact's digests +
     /// size, returning the computed hashes. Unlike [`Engine::prepare_resume`]
     /// this **errors** (rather than silently resetting) on any mismatch — it's
     /// the final gate before committing a segmented download.
     async fn verify_temp_full(&self, temp: &Path, artifact: &Artifact) -> Result<Hashes> {
+        self.set_transfer_state(crate::transfer::TransferState::Verifying);
         let expected = artifact.hashes.clone();
         let size = artifact.size_bytes;
         let what = artifact.path.clone();
         let temp_buf = temp.to_path_buf();
-        let cancel = self.cancel.clone();
+        let cancel = crate::transfer::current()
+            .map(|c| c.cancel.clone())
+            .unwrap_or_default();
         tokio::task::spawn_blocking(move || {
             use std::io::Read;
             let mut v = StreamingVerifier::new(expected, size, None, what);
@@ -1910,7 +2286,9 @@ impl Engine {
         let ct = chunk_tree.clone();
         let what = artifact.path.clone();
         let temp_buf = temp.to_path_buf();
-        let cancel = self.cancel.clone();
+        let cancel = crate::transfer::current()
+            .map(|c| c.cancel.clone())
+            .unwrap_or_default();
         // Ok(Some) = validated prefix, Ok(None) = discard & restart, Err = cancelled.
         let validated: std::result::Result<Option<StreamingVerifier>, ()> =
             tokio::task::spawn_blocking(move || {
@@ -1951,6 +2329,206 @@ impl Engine {
         }
     }
 
+    /// After a successful download, seed the verified blob over BitTorrent when
+    /// enabled and the model's license permits public redistribution. Fire-and-
+    /// forget: the transport spawns the heavy piece-hashing in the background, so
+    /// this never blocks the download's completion. A no-op build-wise when the
+    /// `bittorrent` feature is off (the transport call compiles to nothing).
+    async fn maybe_seed_bittorrent(
+        &self,
+        _manifest: &Manifest,
+        artifact: &Artifact,
+        meta: &BlobMeta,
+    ) {
+        let name = artifact
+            .path
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(&artifact.path)
+            .to_string();
+        self.ensure_bt_seeded(&meta.blake3, Some(&name)).await;
+    }
+
+    /// Start BitTorrent-seeding a verified CAS blob if it's shareable and not
+    /// already seeding — the single reusable entry point for every "publish over
+    /// BT" trigger (download completion, a later set-shared / gated-confirm toggle,
+    /// a local import, and the launch-time library sweep). Idempotent: a no-op when
+    /// BitTorrent is disabled, seeding is off, the platform forbids public seeding,
+    /// the blob isn't shareable, or it's already being seeded.
+    ///
+    /// `name` is the file name to seed under (the torrent's display name, cosmetic
+    /// since the engine re-verifies by hash). When `None` — e.g. the launch sweep,
+    /// which only has a blake3 — it's recovered from an install/manifest record,
+    /// falling back to `<blake3>.bin`.
+    pub async fn ensure_bt_seeded(&self, blake3: &str, name: Option<&str>) {
+        if !(self.cfg.transport.bittorrent_enabled && self.cfg.transport.bittorrent_seed) {
+            return;
+        }
+        if !self.live_platform().allow_public_seeding {
+            return;
+        }
+        // Already seeding in the live session — nothing to do (avoids spawning a
+        // redundant promotion on every re-share toggle).
+        if self.transports.is_seeding_blob(blake3) {
+            return;
+        }
+        // Gate on EXACTLY the same decision as the Iroh/tracker share path
+        // (`is_blob_shareable`): it folds in the user's share override AND the
+        // gated/restrictive confirm-before-share gate — so an unconfirmed gated or
+        // token-walled model is withheld, but one the user has CONFIRMED for sharing
+        // seeds over BT too (parity with Iroh). It also enforces the license class.
+        if !self.db.is_blob_shareable(blake3).unwrap_or(false) {
+            return;
+        }
+        let Ok(cas_blob) = self.cas.blob_path(blake3) else {
+            return;
+        };
+        if !cas_blob.exists() {
+            return;
+        }
+        let name = match name {
+            Some(n) if !n.trim().is_empty() => n.to_string(),
+            _ => self
+                .blob_seed_name(blake3)
+                .unwrap_or_else(|| format!("{}.bin", short(blake3))),
+        };
+        // Persist the generated magnet so it can ride out in share links and
+        // tracker announces (the blake3 the engine knows pairs with the magnet
+        // the transport computes).
+        let db = self.db.clone();
+        let key = blake3.to_string();
+        let on_magnet: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |magnet: String| {
+            if let Err(e) = db.set_bt_magnet(&key, &magnet) {
+                tracing::warn!(error = %e, "bittorrent: failed to persist magnet");
+            }
+        });
+        if let Err(e) = self
+            .transports
+            .seed_blob(cas_blob, name, blake3.to_string(), Some(on_magnet))
+            .await
+        {
+            tracing::warn!(error = %e, "bittorrent: failed to start seeding");
+        }
+    }
+
+    /// Re-seed the entire shareable library over BitTorrent on launch, on a
+    /// background task so the caller never blocks on piece-hashing. Each blob goes
+    /// through [`Engine::ensure_bt_seeded`], which skips anything already seeding,
+    /// not shareable, or when BT/seeding is disabled. Restores this node's swarm
+    /// contribution that would otherwise only resume on the next download.
+    ///
+    /// The sweep runs at most once per engine lifetime (one-shot guard), so calling
+    /// it from both the worldwide-share start AND the first transfer is safe.
+    pub fn spawn_launch_bt_reseed(self: &Arc<Self>) {
+        if !(self.cfg.transport.bittorrent_enabled && self.cfg.transport.bittorrent_seed) {
+            return;
+        }
+        // Claim the one-shot: only the first caller spawns; later ones are no-ops.
+        if self
+            .bt_launch_reseeded
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            // Couldn't run it; release the claim so a later attempt can retry.
+            self.bt_launch_reseeded
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            return;
+        };
+        let engine = self.clone();
+        handle.spawn(async move {
+            engine.run_launch_bt_reseed().await;
+        });
+    }
+
+    /// The body of the launch re-seed sweep (used by both the spawned and the
+    /// first-transfer paths). Drives each shareable cached blob through
+    /// [`Engine::ensure_bt_seeded`] (which returns quickly — heavy piece-hashing is
+    /// backgrounded inside the transport — and skips anything already seeding).
+    async fn run_launch_bt_reseed(&self) {
+        let blobs = match self.db.list_cache_blobs() {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, "bittorrent: launch reseed skipped (list failed)");
+                return;
+            }
+        };
+        for blob in blobs {
+            if !self.db.is_blob_shareable(&blob.blake3).unwrap_or(false) {
+                continue;
+            }
+            self.ensure_bt_seeded(&blob.blake3, None).await;
+        }
+    }
+
+    /// Fire the launch-time BitTorrent re-seed sweep once, from the first transfer —
+    /// so the shareable library re-joins its swarms even if the user never turns on
+    /// worldwide Iroh sharing. Honors the same one-shot guard as
+    /// [`Engine::spawn_launch_bt_reseed`], so the two never double-run. Takes `&self`
+    /// (no `Arc` needed) and runs inline; `ensure_bt_seeded` returns quickly per blob.
+    async fn ensure_launch_bt_reseed_once(&self) {
+        if !(self.cfg.transport.bittorrent_enabled && self.cfg.transport.bittorrent_seed) {
+            return;
+        }
+        if self
+            .bt_launch_reseeded
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        self.run_launch_bt_reseed().await;
+    }
+
+    /// Fire-and-forget [`Engine::ensure_bt_seeded`] for sync callers (the UI's
+    /// share toggles run on a sync command path). Spawns onto the current Tokio
+    /// runtime; a no-op if there isn't one (e.g. a sync unit test). The engine is
+    /// `Arc`-shared by the UIs, so cloning it into the task is cheap and keeps it
+    /// alive for the spawn.
+    pub fn ensure_bt_seeded_detached(self: &Arc<Self>, blake3: &str, name: Option<&str>) {
+        if !(self.cfg.transport.bittorrent_enabled && self.cfg.transport.bittorrent_seed) {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let engine = self.clone();
+        let blake3 = blake3.to_string();
+        let name = name.map(|n| n.to_string());
+        handle.spawn(async move {
+            engine.ensure_bt_seeded(&blake3, name.as_deref()).await;
+        });
+    }
+
+    /// Best-effort display name for a CAS blob (for the seed torrent): an
+    /// install-view file name first (cheap, direct blob→name), else an artifact
+    /// path from any manifest carrying this blob. `None` when nothing maps to it.
+    fn blob_seed_name(&self, blake3: &str) -> Option<String> {
+        if let Ok(installs) = self.db.list_installs() {
+            if let Some(row) = installs.iter().find(|r| r.blake3 == blake3) {
+                let n = sanitize_local_name(&row.artifact_path);
+                if !n.trim().is_empty() {
+                    return Some(n);
+                }
+            }
+        }
+        let manifests = self.db.list_manifests().ok()?;
+        for summary in manifests {
+            let Ok(Some(m)) = self.db.get_manifest(&summary.manifest_id) else {
+                continue;
+            };
+            for art in &m.artifacts {
+                if art.hashes.blake3 == blake3 {
+                    let n = sanitize_local_name(&art.path);
+                    if !n.trim().is_empty() {
+                        return Some(n);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// After a successful commit: index the blob and build/store a chunk tree
     /// for future streaming verification and LAN serving. The whole-blob read is
     /// offloaded to a blocking thread.
@@ -1970,7 +2548,9 @@ impl Engine {
             if let Ok(blob_path) = self.cas.blob_path(&meta.blake3) {
                 let cas = self.cas.clone();
                 let blake3 = meta.blake3.clone();
-                let cancel = self.cancel.clone();
+                let cancel = crate::transfer::current()
+                    .map(|c| c.cancel.clone())
+                    .unwrap_or_default();
                 let _ = tokio::task::spawn_blocking(move || {
                     if let Ok(tree) =
                         ChunkTree::from_file_cancellable(&blob_path, leaf_size, Some(&cancel))
@@ -2179,6 +2759,15 @@ impl Engine {
             let _ = self
                 .db
                 .set_share_override(&cas_meta.blake3, &hashes.sha256, true);
+            // Start seeding the freshly-published blob over BT now, so a local
+            // import contributes to the swarm immediately (and its share link
+            // carries a magnet) rather than only after a future re-download.
+            let name = manifest
+                .artifacts
+                .first()
+                .map(|a| sanitize_local_name(&a.path));
+            self.ensure_bt_seeded(&cas_meta.blake3, name.as_deref())
+                .await;
         }
 
         Ok(LocalImportOutcome {
@@ -2278,6 +2867,26 @@ impl Engine {
 
     /// Prune the index so it reflects what's actually on disk: drop cache blobs
     /// whose files are gone and install views whose destinations were deleted
+    /// Downloads a restart can pick up where it left off: non-complete rows whose
+    /// `.part` temp **and** manifest both still exist (so resume can re-read the
+    /// partial and re-validate it against the signed hashes). Returns
+    /// `(manifest_id, artifact_path, bytes_done, bytes_total)` per row, newest
+    /// first. A UI calls this on launch to re-offer interrupted downloads.
+    pub fn resumable_downloads(&self) -> Result<Vec<(String, String, u64, u64)>> {
+        let mut out = Vec::new();
+        for d in self.db.list_downloads()? {
+            if d.state == "complete" {
+                continue;
+            }
+            let resumable = self.cas.download_temp_exists(&d.download_id)
+                && self.db.get_manifest(&d.manifest_id)?.is_some();
+            if resumable {
+                out.push((d.manifest_id, d.artifact_path, d.bytes_done, d.bytes_total));
+            }
+        }
+        Ok(out)
+    }
+
     pub fn reconcile(&self) -> Result<ReconcileReport> {
         let mut report = ReconcileReport::default();
         for b in self.db.list_cache_blobs()? {
@@ -2300,8 +2909,19 @@ impl Engine {
         // against the manifest's hashes). If either is gone the row is dead weight,
         // so drop it and any leftover temp. A still-resumable paused download is
         // left untouched.
+        // Ids with a LIVE in-process transfer must never be touched here: reconcile
+        // runs on every UI refresh (not just startup), and a live download's row is
+        // `running` with its `.part` not yet created during the connect/metadata
+        // window — reaping or re-`paused`ing it would corrupt an active transfer.
+        let live: std::collections::HashSet<String> = self
+            .transfers
+            .all()
+            .into_iter()
+            .filter(|c| c.is_executing())
+            .map(|c| c.manifest_id.clone())
+            .collect();
         for d in self.db.list_downloads()? {
-            if d.state == "complete" {
+            if d.state == "complete" || live.contains(&d.manifest_id) {
                 continue;
             }
             let resumable = self.cas.download_temp_exists(&d.download_id)
@@ -2310,6 +2930,10 @@ impl Engine {
                 self.cas.remove_download_temps(&d.download_id);
                 self.db.delete_download(&d.download_id)?;
                 report.removed_downloads += 1;
+            } else if d.state == "running" {
+                // A `running` row with NO live task (e.g. after a restart) is really
+                // paused — normalize it so the UI shows it as resumable.
+                self.db.set_download_state(&d.download_id, "paused")?;
             }
         }
         Ok(report)
@@ -2323,26 +2947,14 @@ impl Engine {
     }
 
     /// Browse the worldwide network catalog of shared models. `q` filters by
-    /// name; the device-group id (if set) also surfaces your own devices' private
-    /// shares. Rows are flagged `in_library` if already cached locally.
+    /// name. Rows are flagged `in_library` if already cached locally.
     #[cfg(feature = "http")]
-    pub async fn network_catalog(
-        &self,
-        q: &str,
-        group: Option<String>,
-    ) -> Result<Vec<NetworkModel>> {
+    pub async fn network_catalog(&self, q: &str) -> Result<Vec<NetworkModel>> {
         let Some(tracker) = self.cfg.tracker_url.clone() else {
             return Ok(Vec::new());
         };
         let self_id = self.self_node_id();
-        let rows = crate::tracker::catalog(
-            &tracker,
-            self.proxy(),
-            q,
-            group.as_deref(),
-            self_id.as_deref(),
-        )
-        .await?;
+        let rows = crate::tracker::catalog(&tracker, self.proxy(), q, self_id.as_deref()).await?;
         let installed: std::collections::HashSet<String> = self
             .installed_models()?
             .into_iter()
@@ -2367,6 +2979,7 @@ impl Engine {
                 size: r.size,
                 quant: r.quant,
                 license: r.license,
+                magnet: r.magnet,
                 peers: r.peers,
                 devices: r.devices,
                 mine: r.mine,
@@ -2385,7 +2998,23 @@ impl Engine {
         else {
             return;
         };
-        let _ = crate::tracker::withdraw(&tracker, self.proxy(), &node_id, blake3s).await;
+        // Sign the withdraw with this device's node secret key so the registry can
+        // confirm we own `node_id` (without it, anyone could withdraw our records).
+        // Withdraw carries no node ticket, so bind an empty ticket; the audience is
+        // the registry being posted to (cross-registry replay protection).
+        #[cfg(feature = "iroh")]
+        let auth = crate::iroh_node::sign_announce(
+            &self.cfg.root.join("iroh-share-store"),
+            "withdraw",
+            "",
+            &tracker,
+            blake3s,
+        )
+        .map(|(_, ts, sig)| (ts, sig));
+        #[cfg(not(feature = "iroh"))]
+        let auth: Option<crate::tracker::AnnounceAuth> = None;
+        let _ = crate::tracker::withdraw(&tracker, self.proxy(), &node_id, blake3s, auth.as_ref())
+            .await;
     }
 
     /// Live count of worldwide peers currently sharing a given content hash
@@ -2409,14 +3038,121 @@ impl Engine {
         }
     }
 
-    /// Per-model share override: stop sharing one of your models, or opt a
-    /// gated/off-by-default one in. Most models are shared publicly by default;
-    /// the running worldwide session picks the change up on its next refresh.
-    pub fn set_model_shared(&self, blake3: &str, sha256: &str, on: bool) -> Result<()> {
-        // The operator's explicit choice is honored for any content — Atlas
-        // verifies bytes, not licenses. (Gated/restrictive content is not
-        // auto-shared by default, but the user can opt it in here.)
-        self.db.set_share_override(blake3, sha256, on)
+    /// The BitTorrent magnet generated for a seeded blob, if any. Used to fill in
+    /// `ShareTarget.magnet` when building an outgoing share link so a receiver can
+    /// join the swarm straight from the link (empty string when not seeded over BT).
+    pub fn bt_magnet(&self, blake3: &str) -> String {
+        self.db.bt_magnet(blake3).ok().flatten().unwrap_or_default()
+    }
+
+    /// Whether this blob is being *actively* seeded over BitTorrent in the *live*
+    /// session right now — a seed torrent or in-flight promotion exists AND it is not
+    /// paused by the stop-at-ratio watcher. Lets a UI show a truthful "seeding over
+    /// BitTorrent" state (a ratio-paused seed reports false). Always false when the
+    /// BitTorrent adapter isn't built in.
+    pub fn is_bt_seeding(&self, blake3: &str) -> bool {
+        self.transports.is_actively_seeding_blob(blake3)
+    }
+
+    /// Whether this blob is currently being seeded over **Iroh** in the live
+    /// worldwide share. Symmetric with [`Engine::is_bt_seeding`], so a UI can show a
+    /// truthful per-transport seeding state. Returns false when worldwide sharing
+    /// isn't running (the set is empty until [`Engine::start_worldwide_share`]
+    /// populates it, and is cleared again on [`WorldwideShare::stop`]).
+    pub fn is_iroh_seeding(&self, blake3: &str) -> bool {
+        self.iroh_seeded
+            .lock()
+            .map(|s| s.contains(blake3))
+            .unwrap_or(false)
+    }
+
+    /// Live BitTorrent peers for this blob's managed torrent (its seed and/or
+    /// in-flight leech). Empty when BitTorrent is disabled or not built in, the
+    /// session isn't up, or the blob isn't a live torrent here.
+    pub fn bt_peers(&self, blake3: &str) -> Vec<crate::transport::BtPeer> {
+        self.transports.bt_peers(blake3)
+    }
+
+    /// Stop BitTorrent-seeding a blob: tear down the seed torrent + its reflinked
+    /// file in the transport and drop the persisted magnet (so it no longer rides
+    /// out in share links / tracker announces). The Iroh unseed is a separate path
+    /// (held by the running [`WorldwideShare`]); a UI stopping a share calls both.
+    pub async fn unseed_bittorrent(&self, blake3: &str) -> Result<()> {
+        self.transports.unseed_blob(blake3).await?;
+        self.db.clear_bt_magnet(blake3)?;
+        Ok(())
+    }
+
+    /// Per-model share override: stop sharing one of your models, or opt an
+    /// openly-licensed off-by-default one in. Most models are shared publicly by
+    /// default; the running worldwide session picks the change up on its next
+    /// refresh. Gated/restrictive content is NOT shared by this path even with
+    /// `on = true` — it needs [`confirm_gated_share`](Self::confirm_gated_share).
+    pub fn set_model_shared(self: &Arc<Self>, blake3: &str, sha256: &str, on: bool) -> Result<()> {
+        self.db.set_share_override(blake3, sha256, on)?;
+        if on {
+            // Turning sharing ON must START seeding now (the old code only ever
+            // seeded at download-completion, so a model made shareable later never
+            // joined the swarm and its link carried no magnet).
+            self.ensure_bt_seeded_detached(blake3, None);
+        } else {
+            // "Stop sharing" must also stop BT-seeding this blob and drop its
+            // magnet, mirroring the Iroh unseed the UI does on the same toggle.
+            // No-op if it wasn't being seeded.
+            self.transports.unseed_blob_detached(blake3);
+            let _ = self.db.clear_bt_magnet(blake3);
+        }
+        Ok(())
+    }
+
+    /// Confirm sharing a gated/restrictive model: records the explicit
+    /// confirm-before-share (sets `shared` and `confirmed_gated`), without which
+    /// such content is never seeded. The UI calls this after the user accepts the
+    /// confirmation prompt surfaced by [`needs_share_confirmation`].
+    pub fn confirm_gated_share(self: &Arc<Self>, blake3: &str, sha256: &str) -> Result<()> {
+        self.db.confirm_gated_share(blake3, sha256)?;
+        // Confirming a gated/restrictive model for sharing flips `is_blob_shareable`
+        // to true — so it must START seeding over BT now (parity with the Iroh share
+        // the UI performs on the same confirmation), not only on a future download.
+        self.ensure_bt_seeded_detached(blake3, None);
+        Ok(())
+    }
+
+    /// Stop sharing ALL confirmed gated/restrictive models at once — the real
+    /// effect behind turning the global "share gated models" toggle off. Clears
+    /// every `confirmed_gated` override (flipping `is_blob_shareable` to false)
+    /// and tears down BT seeding (unseed + drop magnet) for each. Returns the
+    /// `(blake3, sha256)` of every cleared blob so the UI can also Iroh-unseed it
+    /// (held by the running [`WorldwideShare`]) and withdraw it from the tracker.
+    pub async fn revoke_gated_shares(&self) -> Result<Vec<(String, String)>> {
+        let cleared = self.db.clear_all_gated_confirmations()?;
+        for (blake3, _) in &cleared {
+            self.transports.unseed_blob_detached(blake3);
+            let _ = self.db.clear_bt_magnet(blake3);
+        }
+        Ok(cleared)
+    }
+
+    /// Whether sharing this manifest's content requires an explicit user
+    /// confirmation first: true when it's gated or restrictively licensed and the
+    /// user hasn't already confirmed (or explicitly toggled) sharing it. Openly-
+    /// licensed content auto-shares and never needs confirmation.
+    pub fn needs_share_confirmation(&self, manifest: &Manifest) -> bool {
+        if !(manifest.is_gated() || manifest.is_restrictive()) {
+            return false;
+        }
+        let blake3 = manifest
+            .artifacts
+            .iter()
+            .map(|a| a.hashes.blake3.as_str())
+            .find(|b| !b.is_empty());
+        match blake3 {
+            Some(b3) => {
+                self.db.share_override(b3).ok().flatten().is_none()
+                    && !self.db.is_gated_share_confirmed(b3).unwrap_or(false)
+            }
+            None => true,
+        }
     }
 
     /// Add a model by its content id / share link: synthesize a verifiable,
@@ -2463,10 +3199,17 @@ impl Engine {
     /// and announce them to the tracker, re-announcing as new models arrive.
     #[cfg(feature = "iroh")]
     pub async fn start_worldwide_share(
-        &self,
+        self: &Arc<Self>,
         tracker_url: String,
         identity: crate::tracker::Identity,
     ) -> Result<WorldwideShare> {
+        // Restore the swarm contribution on launch: re-seed every shareable cached
+        // blob over BitTorrent (the old code only seeded at download-completion, so
+        // a relaunch dropped out of all swarms until the next download). Spawned so
+        // this call stays fast; `ensure_bt_seeded` skips anything already seeding or
+        // not shareable, and no-ops entirely when BT/seeding is off.
+        self.spawn_launch_bt_reseed();
+
         let store_dir = self.cfg.root.join("iroh-share-store");
         let node = Arc::new(crate::iroh_node::IrohNode::spawn(&store_dir).await?);
         let metrics = node.metrics();
@@ -2480,8 +3223,8 @@ impl Engine {
         // never blocks hashing multi-GB weights. Runs an immediate pass, then
         // refreshes every 5 minutes (tracker TTL is 15), picking up newly-shared
         // models and refreshing the announcement well before it expires.
-        // Identity lives behind a mutex so a device-name/group edit is picked up
-        // here without restarting the node.
+        // Identity lives behind a mutex so a device-name edit is picked up here
+        // without restarting the node.
         let identity: SharedIdentity = Arc::new(std::sync::Mutex::new(identity));
         let proxy = self.cfg.transport.proxy.clone();
         let db = self.db.clone();
@@ -2491,6 +3234,15 @@ impl Engine {
         let node_id_bg = node_id.clone();
         let id_bg = identity.clone();
         let proxy_bg = proxy.clone();
+        let store_dir_bg = store_dir.clone();
+        // Live "seeded over Iroh" signal, shared with `Engine::is_iroh_seeding`.
+        // Clear it on (re)start so a prior session's set never lingers, then let the
+        // announce loop repopulate it as it seeds each blob.
+        let seeded = self.iroh_seeded.clone();
+        if let Ok(mut s) = seeded.lock() {
+            s.clear();
+        }
+        let seeded_bg = seeded.clone();
         let announce_task = tokio::spawn(async move {
             // Purge anything this device left on the tracker in a *previous* session
             // before announcing fresh. The loop below only ever withdraws what this
@@ -2500,9 +3252,17 @@ impl Engine {
             // the stale-persistence the user hit. Keyed on our stable NodeId, so it
             // only clears our own records; the re-announce republishes only what we
             // still hold.
-            let _ =
-                crate::tracker::withdraw(&tracker_url, proxy_bg.as_deref(), &node_id_bg, &[]).await;
-            let mut seeded = std::collections::HashSet::new();
+            let purge_auth =
+                crate::iroh_node::sign_announce(&store_dir_bg, "withdraw", "", &tracker_url, &[])
+                    .map(|(_, ts, sig)| (ts, sig));
+            let _ = crate::tracker::withdraw(
+                &tracker_url,
+                proxy_bg.as_deref(),
+                &node_id_bg,
+                &[],
+                purge_auth.as_ref(),
+            )
+            .await;
             let mut announced = std::collections::HashSet::new();
             let mut first = true;
             loop {
@@ -2514,26 +3274,54 @@ impl Engine {
                 let mut current = std::collections::HashSet::new();
                 let mut ann: Vec<crate::tracker::AnnounceItem> = Vec::new();
                 for (path, it) in &items {
-                    let already_seeded = seeded.contains(&it.blake3);
+                    // Already-seeded in the live Iroh store ⇒ a cheap no-op re-seed.
+                    let already_seeded = seeded_bg
+                        .lock()
+                        .map(|s| s.contains(&it.blake3))
+                        .unwrap_or(false);
                     let seeded_now = already_seeded || node_bg.seed_file(path).await.is_ok();
                     if seeded_now {
-                        seeded.insert(it.blake3.clone());
                         current.insert(it.blake3.clone());
                         ann.push(it.clone());
                     }
                 }
+                // Reconcile the shared "seeding over Iroh" signal to exactly this
+                // pass's live set, so `is_iroh_seeding` reflects what we actually
+                // (re)seed + announce — a model dropped from the share this pass
+                // falls out of the signal too.
+                if let Ok(mut s) = seeded_bg.lock() {
+                    *s = current.clone();
+                }
                 let stale: Vec<String> = announced.difference(&current).cloned().collect();
                 if !stale.is_empty() {
+                    let auth = crate::iroh_node::sign_announce(
+                        &store_dir_bg,
+                        "withdraw",
+                        "",
+                        &tracker_url,
+                        &stale,
+                    )
+                    .map(|(_, ts, sig)| (ts, sig));
                     let _ = crate::tracker::withdraw(
                         &tracker_url,
                         proxy_bg.as_deref(),
                         &node_id_bg,
                         &stale,
+                        auth.as_ref(),
                     )
                     .await;
                 }
                 if !ann.is_empty() {
                     let id = id_bg.lock().map(|g| g.clone()).unwrap_or_default();
+                    let ids: Vec<String> = ann.iter().map(|i| i.blake3.clone()).collect();
+                    let auth = crate::iroh_node::sign_announce(
+                        &store_dir_bg,
+                        "announce",
+                        &ticket_bg,
+                        &tracker_url,
+                        &ids,
+                    )
+                    .map(|(_, ts, sig)| (ts, sig));
                     let _ = crate::tracker::announce(
                         &tracker_url,
                         proxy_bg.as_deref(),
@@ -2541,6 +3329,7 @@ impl Engine {
                         &node_id_bg,
                         &id,
                         &ann,
+                        auth.as_ref(),
                     )
                     .await;
                 }
@@ -2555,6 +3344,8 @@ impl Engine {
             node_id,
             identity,
             proxy,
+            store_dir,
+            seeded,
             announce_task,
         })
     }
@@ -2631,6 +3422,7 @@ impl Engine {
                 shareable,
                 gated,
                 install_path,
+                format: art.format.clone(),
             };
             // Dedup distinct manifests of the same file; prefer the HF-matched one.
             by_sha
@@ -2744,6 +3536,11 @@ impl Engine {
             }
             self.cas.remove_blob(&blake3)?;
             self.db.delete_cache_blob(&blake3)?;
+            // A deleted blob must stop seeding: tear down its BT seed torrent +
+            // reflinked file and drop the persisted magnet. (Iroh unseed is the
+            // UI-held WorldwideShare's job.)
+            self.transports.unseed_blob_detached(&blake3);
+            let _ = self.db.clear_bt_magnet(&blake3);
             report.removed.push(blake3);
         }
         Ok(report)
@@ -2830,15 +3627,17 @@ impl Engine {
                 phase,
                 failover_reason,
                 effective_start,
+                peers: 0,
+                uploaded_bytes: 0,
             });
         }
     }
 
-    /// The manifest id of the in-flight download, stamped onto progress events.
+    /// The manifest id of the in-flight transfer (from the `CURRENT_TRANSFER`
+    /// task-local), stamped onto progress events.
     fn current_manifest_id(&self) -> String {
-        self.current_manifest_id
-            .lock()
-            .map(|g| g.clone())
+        crate::transfer::current()
+            .map(|c| c.manifest_id.clone())
             .unwrap_or_default()
     }
 }
@@ -2926,6 +3725,7 @@ fn build_share_items(db: &Db, cas: &Cas) -> Vec<ShareItem> {
             .ok()
             .flatten()
             .unwrap_or_default();
+        let magnet = db.bt_magnet(&b.blake3).ok().flatten().unwrap_or_default();
         out.push((
             path,
             crate::tracker::AnnounceItem {
@@ -2935,6 +3735,7 @@ fn build_share_items(db: &Db, cas: &Cas) -> Vec<ShareItem> {
                 size: b.size_bytes,
                 quant,
                 license,
+                magnet,
                 // Everything we share is public by default — the point is that
                 // anyone can find it in Explore. It already passed the
                 // is_blob_shareable gate (non-gated or opted in).
@@ -3005,7 +3806,6 @@ fn titled_manifest(
             // Open on every P2P transport so failover can use whatever's up.
             allowed_source_classes: vec![
                 SourceClass::Iroh,
-                SourceClass::Ipfs,
                 SourceClass::HttpsMirror,
                 SourceClass::LocalFile,
             ],
@@ -3056,6 +3856,18 @@ fn content_manifest(target: &crate::share::ShareTarget) -> Manifest {
         let t = s.trim();
         (!t.is_empty()).then(|| t.to_string())
     };
+    // If the link carries a BitTorrent magnet (the sender is seeding it over BT),
+    // include a BitTorrent source so the receiver can join the swarm directly. The
+    // engine still re-verifies every byte against the hashes, so the magnet is just
+    // another (untrusted) route.
+    let mut sources = Vec::new();
+    if !target.magnet.trim().is_empty() {
+        sources.push(Source::BittorrentV2 {
+            magnet_uri: target.magnet.trim().to_string(),
+            file_merkle_root_sha256: None,
+            auth: AuthPolicy::None,
+        });
+    }
     Manifest {
         schema_version: SCHEMA_VERSION.to_string(),
         manifest_id,
@@ -3092,8 +3904,8 @@ fn content_manifest(target: &crate::share::ShareTarget) -> Manifest {
             // Open on every P2P transport so failover can use whatever's up.
             allowed_source_classes: vec![
                 SourceClass::Iroh,
-                SourceClass::Ipfs,
                 SourceClass::HttpsMirror,
+                SourceClass::BittorrentV2,
             ],
         },
         artifacts: vec![Artifact {
@@ -3103,7 +3915,7 @@ fn content_manifest(target: &crate::share::ShareTarget) -> Manifest {
             hashes: crate::hash::Hashes::new(target.blake3.clone(), target.sha256.clone()),
             chunking: None,
             format,
-            sources: vec![],
+            sources,
         }],
         provenance: Some(Provenance {
             origin: Some("p2p-content-id".to_string()),

@@ -1,7 +1,7 @@
 <script>
   import { onMount, onDestroy } from "svelte";
   import { api } from "../api.js";
-  import { fmtSize } from "../format.js";
+  import { fmtSize, rowFormat } from "../format.js";
   export let startLink = () => {};
   export let startMesh = () => {};
   export let goTransfers = () => {};
@@ -33,13 +33,23 @@
   function add() {
     const l = link.trim();
     if (!l) return;
-    startLink(l);
+    // Clear the "Fetching…" ack once the link transfer settles (any terminal state),
+    // so a failed / stopped paste doesn't leave a stuck banner.
+    startLink(l, () => {
+      linkStarted = false;
+    });
     linkStarted = true;
   }
 
   function get(m) {
-    startMesh(m);
-    started.add(m.blake3);
+    const key = m.blake3;
+    // Clear the inline "Downloading…" ack once this transfer settles (success OR
+    // failure / stop / waiting), so the Get button never stays stuck.
+    startMesh(m, () => {
+      started.delete(key);
+      started = started;
+    });
+    started.add(key);
     started = started;
   }
 
@@ -94,7 +104,10 @@
       <div class="card">
         <div class="card-head" style="cursor:default">
           <div class="grow">
-            <div class="title">{m.name}</div>
+            <div class="title">
+              {m.name}
+              {#if rowFormat(null, m.name)}<span class="pill">{rowFormat(null, m.name)}</span>{/if}
+            </div>
             <div class="muted">{fmtSize(m.size)}{m.quant ? " · " + m.quant : ""}{m.devices && m.devices.length ? " · " + m.devices.join(", ") : ""}</div>
           </div>
           {#if m.in_library}
@@ -119,7 +132,10 @@
       <div class="card">
         <div class="card-head" style="cursor:default">
           <div class="grow">
-            <div class="title">{m.name}</div>
+            <div class="title">
+              {m.name}
+              {#if rowFormat(null, m.name)}<span class="pill">{rowFormat(null, m.name)}</span>{/if}
+            </div>
             <div class="muted">{fmtSize(m.size)}{m.quant ? " · " + m.quant : ""}{m.license ? " · " + m.license : ""} · {m.peers} {m.peers === 1 ? "peer" : "peers"}</div>
           </div>
           {#if m.in_library}

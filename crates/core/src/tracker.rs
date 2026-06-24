@@ -32,18 +32,26 @@ pub struct AnnounceItem {
     pub size: u64,
     pub quant: String,
     pub license: String,
+    /// BitTorrent magnet (info-hash) when this file is seeded over BT, so the
+    /// public catalog can advertise it for swarm joining. Empty otherwise.
+    pub magnet: String,
     /// Whether this file may appear in the *public* catalog (the operator opted
     /// it into worldwide sharing).
     pub listable: bool,
 }
 
-/// The announcer's identity for the catalog: a human device name and an optional
-/// device-group capability id (private shares are scoped to it).
+/// The announcer's identity for the catalog: a human device name.
 #[derive(Debug, Clone, Default)]
 pub struct Identity {
     pub device: String,
-    pub group: Option<String>,
 }
+
+/// Ownership proof for an announce/withdraw: the request timestamp (ms) and a
+/// base64 Ed25519 signature over the canonical payload (see
+/// [`crate::announce_auth`]), produced from this device's node secret key. The
+/// registry verifies it against the claimed `node_id`. `None` sends an unsigned
+/// request (e.g. an iroh-less build); a registry that requires auth rejects it.
+pub type AnnounceAuth = (i64, String);
 
 /// Announce that this node is sharing the given items (with browse metadata).
 /// Re-announce periodically; the tracker expires stale entries.
@@ -53,6 +61,10 @@ pub struct Identity {
 /// the old record instead of accumulating a second one (which would otherwise
 /// count one device as several peers). `node_ticket` still carries the current
 /// reachable address used to actually fetch from this peer.
+///
+/// `auth` is the signed ownership proof (timestamp + signature) so the registry
+/// can confirm the announcer actually controls `node_id` instead of trusting the
+/// claim — see [`crate::announce_auth`].
 pub async fn announce(
     registry: &str,
     proxy: Option<&str>,
@@ -60,6 +72,7 @@ pub async fn announce(
     node_id: &str,
     identity: &Identity,
     items: &[AnnounceItem],
+    auth: Option<&AnnounceAuth>,
 ) -> Result<usize> {
     let url = format!("{}/announce", registry.trim_end_matches('/'));
     let items_json: Vec<_> = items
@@ -72,6 +85,7 @@ pub async fn announce(
                 "size": i.size,
                 "quant": i.quant,
                 "license": i.license,
+                "magnet": i.magnet,
                 "listable": i.listable,
             })
         })
@@ -80,13 +94,12 @@ pub async fn announce(
     if !node_id.is_empty() {
         body["node_id"] = serde_json::json!(node_id);
     }
+    if let Some((ts, sig)) = auth {
+        body["ts"] = serde_json::json!(ts);
+        body["sig"] = serde_json::json!(sig);
+    }
     if !identity.device.is_empty() {
         body["device"] = serde_json::json!(identity.device);
-    }
-    if let Some(g) = &identity.group {
-        if !g.is_empty() {
-            body["group"] = serde_json::json!(g);
-        }
     }
     let resp = client(proxy)?
         .post(&url)
@@ -96,7 +109,16 @@ pub async fn announce(
         .await
         .map_err(|e| Error::other(format!("announce request: {e}")))?;
     if !resp.status().is_success() {
-        return Err(Error::other(format!("announce returned {}", resp.status())));
+        let status = resp.status();
+        // Callers fire-and-forget this; log so a silently-rejected announce (the
+        // common cause is a 401 from the registry's --public-url not matching this
+        // client's tracker URL, or a fast local clock) is diagnosable.
+        tracing::warn!(
+            %status,
+            items = items.len(),
+            "tracker announce rejected — shared models may not be visible to others"
+        );
+        return Err(Error::other(format!("announce returned {status}")));
     }
     Ok(items.len())
 }
@@ -117,11 +139,13 @@ pub struct CatalogRow {
     #[serde(default)]
     pub license: String,
     #[serde(default)]
+    pub magnet: String,
+    #[serde(default)]
     pub peers: usize,
     #[serde(default)]
     pub devices: Vec<String>,
-    /// True when this row is the querier's own share — either it's one of your
-    /// devices seeding it (matched on your NodeId) or it's in your device group.
+    /// True when this row is the querier's own share — one of your devices is
+    /// seeding it (matched on your NodeId).
     #[serde(default)]
     pub mine: bool,
 }
@@ -132,8 +156,7 @@ struct CatalogResp {
     models: Vec<CatalogRow>,
 }
 
-/// Browse the worldwide catalog of shared models. `q` filters by name; passing
-/// the device-group id also returns that group's private (non-public) shares.
+/// Browse the worldwide catalog of shared models. `q` filters by name.
 /// `self_id` is this node's own NodeId — it's excluded from each row's peer count
 /// and flags your own shares as `mine`, so your device never reads as a "peer
 /// seeding your files".
@@ -141,18 +164,12 @@ pub async fn catalog(
     registry: &str,
     proxy: Option<&str>,
     q: &str,
-    group: Option<&str>,
     self_id: Option<&str>,
 ) -> Result<Vec<CatalogRow>> {
     let base = registry.trim_end_matches('/');
     let mut url = format!("{base}/catalog?limit=200");
     if !q.is_empty() {
         url.push_str(&format!("&q={}", urlencode(q)));
-    }
-    if let Some(g) = group {
-        if !g.is_empty() {
-            url.push_str(&format!("&group={}", urlencode(g)));
-        }
     }
     if let Some(id) = self_id.filter(|s| !s.is_empty()) {
         url.push_str(&format!("&self={}", urlencode(id)));
@@ -253,12 +270,17 @@ pub async fn withdraw(
     proxy: Option<&str>,
     node_id: &str,
     blake3s: &[String],
+    auth: Option<&AnnounceAuth>,
 ) -> Result<()> {
     if node_id.is_empty() {
         return Ok(());
     }
     let url = format!("{}/withdraw", registry.trim_end_matches('/'));
-    let body = serde_json::json!({ "node_id": node_id, "items": blake3s });
+    let mut body = serde_json::json!({ "node_id": node_id, "items": blake3s });
+    if let Some((ts, sig)) = auth {
+        body["ts"] = serde_json::json!(ts);
+        body["sig"] = serde_json::json!(sig);
+    }
     let resp = client(proxy)?
         .post(&url)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -267,7 +289,9 @@ pub async fn withdraw(
         .await
         .map_err(|e| Error::other(format!("withdraw request: {e}")))?;
     if !resp.status().is_success() {
-        return Err(Error::other(format!("withdraw returned {}", resp.status())));
+        let status = resp.status();
+        tracing::warn!(%status, "tracker withdraw rejected");
+        return Err(Error::other(format!("withdraw returned {status}")));
     }
     Ok(())
 }

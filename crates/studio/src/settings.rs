@@ -32,12 +32,32 @@ pub struct StudioSettings {
     pub device_id: String,
     /// Friendly device name shown to peers (auto-filled on first launch).
     pub device_name: String,
-    /// Shared "My Devices" pairing code; the raw code never leaves the device
-    pub group_code: String,
-    /// Skip the download-confirmation modal.
-    pub skip_download_confirm: bool,
     /// Whether the first-run intro / sharing-consent card has been dismissed.
     pub seen_intro: bool,
+    /// Master switch for the BitTorrent transport (download + seed). On by default.
+    pub bt_enabled: bool,
+    /// Add the public, well-known BitTorrent trackers (in addition to the DHT) so
+    /// transfers find more peers. PRIVACY: this announces your IP and the model's
+    /// info-hash to third-party trackers. On by default, matching the engine.
+    pub bt_use_public_trackers: bool,
+    /// Seed completed, publicly-redistributable blobs back over BitTorrent.
+    pub bt_seed: bool,
+    /// Preferred inbound listen port; the range `[port, port+10)` is tried.
+    /// `0` keeps the default range.
+    pub bt_port: u16,
+    /// Per-direction BitTorrent rate caps in Mbps (`0` = unlimited).
+    pub bt_up_cap_mbps: u32,
+    pub bt_down_cap_mbps: u32,
+    /// Max simultaneous active transfers (download + seed) the UI runs at once.
+    pub bt_max_concurrent: u32,
+    /// Stop seeding a blob over BitTorrent once its upload/size ratio reaches this
+    /// value. `0` = unlimited (never stop on ratio). Applies on next launch.
+    pub bt_max_ratio: f64,
+    /// Download-routing preference, encoded as [`noema_core::DownloadPreference`]'s
+    /// stable `u8` (0 = Auto, 1 = Prefer P2P, 2 = Prefer BitTorrent, 3 = Save data).
+    /// Applied live via `set_download_preference`; the initial value is also fed
+    /// into `EngineConfig` at launch.
+    pub download_preference: u8,
 }
 
 /// `~/Noema Models` (or the platform home equivalent) — identical to the egui
@@ -73,9 +93,16 @@ impl Default for StudioSettings {
             theme: "system".to_string(),
             device_id: String::new(),
             device_name: String::new(),
-            group_code: String::new(),
-            skip_download_confirm: false,
             seen_intro: false,
+            bt_enabled: true,
+            bt_use_public_trackers: true,
+            bt_seed: true,
+            bt_port: 6881,
+            bt_up_cap_mbps: 0,
+            bt_down_cap_mbps: 0,
+            bt_max_concurrent: 3,
+            bt_max_ratio: 0.0,
+            download_preference: 0,
         }
     }
 }
@@ -104,6 +131,26 @@ impl StudioSettings {
         (self.download_cap_mbps as u64) * 125_000
     }
 
+    /// BitTorrent upload cap in bytes/sec; `0` = unlimited.
+    pub fn bt_up_bps(&self) -> u64 {
+        (self.bt_up_cap_mbps as u64) * 125_000
+    }
+
+    /// BitTorrent download cap in bytes/sec; `0` = unlimited.
+    pub fn bt_down_bps(&self) -> u64 {
+        (self.bt_down_cap_mbps as u64) * 125_000
+    }
+
+    /// Inbound listen-port range derived from the preferred port (`[port, port+10)`).
+    /// `0` falls back to the engine default range.
+    pub fn bt_listen_range(&self) -> Option<std::ops::Range<u16>> {
+        if self.bt_port == 0 {
+            None
+        } else {
+            Some(self.bt_port..self.bt_port.saturating_add(10))
+        }
+    }
+
     /// The worldwide tracker URL, falling back to the hosted default.
     pub fn tracker(&self) -> String {
         if self.tracker_url.trim().is_empty() {
@@ -113,16 +160,13 @@ impl StudioSettings {
         }
     }
 
-    /// The tracker identity (friendly name + derived group id) for announces.
+    /// The tracker identity (friendly device name) for announces.
     pub fn identity(&self) -> noema_core::tracker::Identity {
         let device = if self.device_name.trim().is_empty() {
             noema_core::identity::default_device_name()
         } else {
             self.device_name.trim().to_string()
         };
-        noema_core::tracker::Identity {
-            device,
-            group: noema_core::identity::group_id(&self.group_code),
-        }
+        noema_core::tracker::Identity { device }
     }
 }

@@ -172,11 +172,14 @@ impl PolicyEngine {
         class_of_source: SourceClass,
         profile: &PlatformProfile,
     ) -> (bool, String) {
-        let is_public = matches!(class_of_source, SourceClass::Ipfs | SourceClass::Iroh);
+        let is_public = matches!(
+            class_of_source,
+            SourceClass::Iroh | SourceClass::BittorrentV2
+        );
         if !is_public {
             return (true, "not a public-distribution channel".into());
         }
-        if manifest.access.gated {
+        if manifest.is_gated() {
             return (false, "gated model: no public redistribution".into());
         }
         if !manifest
@@ -304,12 +307,12 @@ mod tests {
         // sample allows only Huggingface + HttpsMirror.
         let engine = PolicyEngine::new(PolicyConfig::default());
         let profile = PlatformProfile::desktop();
-        let ipfs = Source::Ipfs {
-            cid: "bafy".into(),
-            retrieval: vec![],
+        let iroh = Source::Iroh {
+            blob_hash: "abc".into(),
+            tickets: vec![],
             auth: crate::manifest::AuthPolicy::None,
         };
-        let (ok, _) = engine.source_fetch_allowed(&m, &ipfs, &profile);
+        let (ok, _) = engine.source_fetch_allowed(&m, &iroh, &profile);
         assert!(!ok);
     }
 
