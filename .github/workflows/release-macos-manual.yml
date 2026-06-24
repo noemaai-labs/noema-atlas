@@ -7,6 +7,15 @@ on:
         description: Existing public release tag to build and upload
         required: true
         type: string
+      target:
+        description: macOS product to build
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - atlas
+          - studio
 
 permissions:
   contents: write
@@ -18,6 +27,7 @@ concurrency:
 jobs:
   atlas:
     name: Atlas macOS universal
+    if: inputs.target == 'all' || inputs.target == 'atlas'
     runs-on: macos-14
     timeout-minutes: 120
     steps:
@@ -76,8 +86,10 @@ jobs:
           xcrun stapler staple "$APP"
           xcrun stapler validate "$APP"
 
-          ZIP="dist/Noema-Atlas-macos-universal.zip"
-          ditto -c -k --keepParent "$APP" "$ZIP"
+          # Universal Rust builds consume most of the hosted runner's disk.
+          # The signed app is self-contained now, so free intermediates before
+          # duplicating it into a DMG and ZIP.
+          rm -rf target
 
           STAGING="$RUNNER_TEMP/atlas-dmg"
           mkdir -p "$STAGING"
@@ -95,6 +107,9 @@ jobs:
           xcrun stapler staple "$DMG"
           xcrun stapler validate "$DMG"
           spctl -a -vv --type open --context context:primary-signature "$DMG"
+
+          ZIP="dist/Noema-Atlas-macos-universal.zip"
+          ditto -c -k --keepParent "$APP" "$ZIP"
           file "$APP/Contents/MacOS/noema-desktop"
 
       - name: Upload Atlas macOS assets
@@ -108,6 +123,7 @@ jobs:
 
   studio:
     name: Studio macOS universal
+    if: inputs.target == 'all' || inputs.target == 'studio'
     runs-on: macos-14
     timeout-minutes: 120
     steps:
@@ -166,9 +182,12 @@ jobs:
               --target universal-apple-darwin \
               --bundles app
 
-          APP="$(find crates/studio/target/universal-apple-darwin/release/bundle \
+          BUILT_APP="$(find crates/studio/target/universal-apple-darwin/release/bundle \
             -maxdepth 3 -name '*.app' -print -quit)"
-          test -n "$APP"
+          test -n "$BUILT_APP"
+          APP="$RUNNER_TEMP/Noema Atlas Studio.app"
+          ditto "$BUILT_APP" "$APP"
+          rm -rf crates/studio/target
           codesign --verify --deep --strict --verbose=2 "$APP"
 
           APP_SUBMISSION="$RUNNER_TEMP/Noema-Atlas-Studio-app.zip"
