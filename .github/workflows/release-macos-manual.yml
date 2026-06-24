@@ -15,7 +15,12 @@ on:
         options:
           - all
           - atlas
+          - atlas-package
           - studio
+      artifact_run_id:
+        description: Prior workflow run containing noema-atlas-macos-stapled
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -171,6 +176,89 @@ jobs:
           gh release upload "${{ inputs.release_tag }}" \
             dist/Noema-Atlas-macos-universal.dmg \
             dist/Noema-Atlas-macos-universal.zip \
+            --repo noemaai-labs/noema-atlas \
+            --clobber
+
+  atlas-package-only:
+    name: Atlas macOS package-only recovery
+    if: inputs.target == 'atlas-package'
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - name: Download stapled Atlas app from prior run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_RUN_ID: ${{ inputs.artifact_run_id }}
+        run: |
+          test -n "$ARTIFACT_RUN_ID"
+          mkdir -p dist
+          gh run download "$ARTIFACT_RUN_ID" \
+            --repo noemaai-labs/noema-atlas \
+            --name noema-atlas-macos-stapled \
+            --dir dist
+
+      - name: Import Developer ID certificate
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          test -n "$MACOS_CERT_P12"
+          KEYCHAIN="$RUNNER_TEMP/noema-build.keychain-db"
+          security create-keychain -p actions "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p actions "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN"
+          echo "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/noema-cert.p12"
+          security import "$RUNNER_TEMP/noema-cert.p12" -k "$KEYCHAIN" \
+            -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k actions "$KEYCHAIN"
+          rm -f "$RUNNER_TEMP/noema-cert.p12"
+
+      - name: Build and notarize Atlas DMG
+        env:
+          SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+          NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
+          NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+        run: |
+          test -n "$SIGN_IDENTITY"
+          test -n "$NOTARY_APPLE_ID"
+          test -n "$NOTARY_PASSWORD"
+          test -n "$NOTARY_TEAM_ID"
+
+          EXTRACTED="$RUNNER_TEMP/atlas-app"
+          mkdir -p "$EXTRACTED"
+          ditto -x -k dist/Noema-Atlas-macos-universal.zip "$EXTRACTED"
+          APP="$EXTRACTED/Noema Atlas.app"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          xcrun stapler validate "$APP"
+
+          STAGING="$RUNNER_TEMP/atlas-dmg"
+          mkdir -p "$STAGING"
+          ditto "$APP" "$STAGING/Noema Atlas.app"
+          ln -s /Applications "$STAGING/Applications"
+          DMG="dist/Noema-Atlas-macos-universal.dmg"
+          hdiutil create -volname "Noema Atlas" -srcfolder "$STAGING" \
+            -ov -format UDZO "$DMG"
+          codesign --force --sign "$SIGN_IDENTITY" "$DMG"
+          xcrun notarytool submit "$DMG" \
+            --apple-id "$NOTARY_APPLE_ID" \
+            --password "$NOTARY_PASSWORD" \
+            --team-id "$NOTARY_TEAM_ID" \
+            --wait
+          xcrun stapler staple "$DMG"
+          xcrun stapler validate "$DMG"
+          spctl -a -vv --type open --context context:primary-signature "$DMG"
+
+      - name: Upload Atlas macOS assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ inputs.release_tag }}" \
+            dist/Noema-Atlas-macos-universal.dmg \
+            dist/Noema-Atlas-macos-universal.zip \
+            --repo noemaai-labs/noema-atlas \
             --clobber
 
   studio:
