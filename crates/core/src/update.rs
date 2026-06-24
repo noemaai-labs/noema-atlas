@@ -485,17 +485,17 @@ mod tests {
 
     #[test]
     fn prerelease_version_ordering() {
-        // Atlas/Studio ship prerelease versions (e.g. 2.0.0-alpha.2). Confirm semver
+        // Atlas/Studio ship prerelease versions (e.g. 0.2.0-alpha.2). Confirm semver
         // ordering does the right thing for the auto-update gate:
         // a later prerelease updates an earlier one, a final release updates a
         // prerelease, and a prerelease does NOT "update" its own final release.
-        assert!(version_gt("2.0.0-alpha.3", "2.0.0-alpha.2"));
-        assert!(version_gt("2.0.0-alpha.10", "2.0.0-alpha.2")); // numeric, not lexical
-        assert!(version_gt("2.0.0", "2.0.0-alpha.2")); // release > prerelease
-        assert!(version_gt("2.0.0-alpha.2", "0.1.0")); // newer major beats old release
-        assert!(!version_gt("2.0.0-alpha.2", "2.0.0-alpha.2")); // equal is not newer
-        assert!(!version_gt("2.0.0-alpha.1", "2.0.0-alpha.2")); // older prerelease
-        assert!(!version_gt("2.0.0-alpha.2", "2.0.0")); // prerelease < its release
+        assert!(version_gt("0.2.0-alpha.3", "0.2.0-alpha.2"));
+        assert!(version_gt("0.2.0-alpha.10", "0.2.0-alpha.2")); // numeric, not lexical
+        assert!(version_gt("0.2.0", "0.2.0-alpha.2")); // release > prerelease
+        assert!(version_gt("0.2.0-alpha.2", "0.1.0")); // newer minor beats old release
+        assert!(!version_gt("0.2.0-alpha.2", "0.2.0-alpha.2")); // equal is not newer
+        assert!(!version_gt("0.2.0-alpha.1", "0.2.0-alpha.2")); // older prerelease
+        assert!(!version_gt("0.2.0-alpha.2", "0.2.0")); // prerelease < its release
     }
 
     #[test]

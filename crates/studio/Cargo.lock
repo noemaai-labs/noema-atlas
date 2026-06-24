@@ -4544,7 +4544,7 @@ checksum = "43794a0ace135be66a25d3ae77d41b91615fb68ae937f904090203e81f755b65"
 
 [[package]]
 name = "noema-core"
-version = "2.0.0-alpha.2"
+version = "0.2.0-alpha.2"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -4581,7 +4581,7 @@ dependencies = [
 
 [[package]]
 name = "noema-studio"
-version = "2.0.0-alpha.2"
+version = "0.2.0-alpha.2"
 dependencies = [
  "anyhow",
  "noema-core",
