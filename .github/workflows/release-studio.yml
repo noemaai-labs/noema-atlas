@@ -78,15 +78,25 @@ jobs:
       # macOS builds are produced and notarized locally, not in CI.
       - name: build Studio (Linux / Windows)
         working-directory: crates/studio
+        env:
+          # Signs the updater artifacts (.sig files + the platform bundles). Without
+          # these the bundler emits no signatures and Studio auto-update is inert.
+          # `createUpdaterArtifacts: true` in tauri.conf.json triggers the artifacts.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: cargo tauri build --features custom-protocol
 
       - name: collect installers
         shell: bash
         run: |
           mkdir -p out
+          # Also gather the auto-updater artifacts: the detached `*.sig` signatures
+          # and (on macOS, built locally) the `*.app.tar.gz` the Tauri updater
+          # consumes. Without the .sig files the updater rejects every update.
           find crates/studio/target -path '*/release/bundle/*' \
             \( -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' \
-               -o -name '*.msi' -o -name '*.exe' \) \
+               -o -name '*.msi' -o -name '*.exe' \
+               -o -name '*.sig' -o -name '*.app.tar.gz' \) \
             -exec sh -c 'cp "$1" "out/$(basename "$1")"' _ {} \;
           echo "Collected:" && ls -la out
 

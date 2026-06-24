@@ -1,7 +1,7 @@
 <script>
   import { onMount, onDestroy } from "svelte";
   import { api } from "../api.js";
-  import { fmtSize, fmtRatio, rowFormat } from "../format.js";
+  import { fmtSize, fmtRate, fmtRatio, rowFormat, formatId } from "../format.js";
   export let transfers = {};
   export let pause = () => {};
   export let stop = () => {};
@@ -24,6 +24,34 @@
   let expanded = {};
   let peers = {};
   let peerTimers = {};
+
+  // Ordered queue of waiting transfers (front = next). Drives the ▲/▼ reorder
+  // controls; refreshed on the same cadence as sharing.
+  let queueOrder = [];
+  $: queuePos = (() => {
+    const m = {};
+    queueOrder.forEach((id, i) => (m[id] = i));
+    return m;
+  })();
+  async function loadQueue() {
+    try {
+      queueOrder = await api.downloadQueueOrder();
+    } catch (e) {}
+  }
+  async function reorder(id, dir) {
+    try {
+      await api.queueReorder(id, dir);
+      await loadQueue();
+    } catch (e) {}
+  }
+  async function recheck(id) {
+    try {
+      await api.btForceRecheck(id);
+      flash("Rechecking pieces…");
+    } catch (e) {
+      flash("Recheck failed");
+    }
+  }
 
   async function loadPeers(id) {
     try {
@@ -131,7 +159,11 @@
     } catch (e) {}
     loadHealth();
     loadSharing();
-    timer = setInterval(loadSharing, 3000);
+    loadQueue();
+    timer = setInterval(() => {
+      loadSharing();
+      loadQueue();
+    }, 3000);
   });
   onDestroy(() => {
     if (timer) clearInterval(timer);
@@ -175,7 +207,7 @@
         <div class="grow">
           <div class="title">
             {t.artifact}
-            {#if rowFormat(null, t.artifact)}<span class="pill">{rowFormat(null, t.artifact)}</span>{/if}
+            {#if rowFormat(null, t.artifact)}<span class="pill fmt f-{formatId(null, t.artifact)}">{rowFormat(null, t.artifact)}</span>{/if}
           </div>
           <div class="muted">
             {phaseLabel(t.phase)}{t.source ? " · " + t.source : ""}{t.peers
@@ -183,6 +215,11 @@
               : ""}
           </div>
         </div>
+        {#if queuePos[t.id] != null}
+          <span class="muted qpos" title="Position in the download queue">#{queuePos[t.id] + 1}</span>
+          <button class="btn xs" title="Move up" disabled={queuePos[t.id] === 0} on:click={() => reorder(t.id, "up")}>▲</button>
+          <button class="btn xs" title="Move down" disabled={queuePos[t.id] === queueOrder.length - 1} on:click={() => reorder(t.id, "down")}>▼</button>
+        {/if}
         {#if isActive(t.phase)}
           <button class="btn sm" on:click={() => pause(t.id)}>Pause</button>
           <button class="btn sm danger" on:click={() => stop(t.id)}>Stop</button>
@@ -229,15 +266,16 @@
           {#if peers[t.id] && peers[t.id].length}
             <table class="peers">
               <thead>
-                <tr><th>Peer</th><th>Conn</th><th>Down</th><th>Up</th></tr>
+                <tr><th>Peer</th><th>Client</th><th>Conn</th><th>Down</th><th>Up</th></tr>
               </thead>
               <tbody>
                 {#each peers[t.id] as p (p.addr)}
                   <tr>
                     <td class="mono">{p.addr}</td>
+                    <td>{p.client || "unknown"}</td>
                     <td>{p.conn_kind}</td>
-                    <td>{fmtSize(p.downloaded)}</td>
-                    <td>{fmtSize(p.uploaded)}</td>
+                    <td>{fmtSize(p.downloaded)}<span class="muted"> · {fmtRate(p.down_bps)}</span></td>
+                    <td>{fmtSize(p.uploaded)}<span class="muted"> · {fmtRate(p.up_bps)}</span></td>
                   </tr>
                 {/each}
               </tbody>

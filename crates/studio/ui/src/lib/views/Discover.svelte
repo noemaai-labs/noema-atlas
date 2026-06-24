@@ -1,7 +1,7 @@
 <script>
   import { onMount } from "svelte";
   import { api, copyText } from "../api.js";
-  import { fmtSize, prettyFormat } from "../format.js";
+  import { fmtSize, prettyFormat, formatId } from "../format.js";
   export let startDownload;
   export let goTransfers = () => {};
   export let focus = 0;
@@ -33,6 +33,28 @@
   let detailLoading = false;
   let isHome = true;
 
+  // Live Atlas availability, indexed by a variant's sha256 content id: how many
+  // peers are seeding each quant over Iroh vs BitTorrent right now. This is what
+  // makes Discover more than a Hugging Face mirror — it overlays the real mesh.
+  let meshBySha = {};
+  async function loadMesh() {
+    try {
+      const rows = await api.mesh("");
+      const m = {};
+      for (const r of rows) {
+        if (r.sha256) m[r.sha256] = { iroh: r.peers, bt: r.bt_seeders };
+      }
+      meshBySha = m;
+    } catch (e) {
+      // Non-fatal: Discover still works without the availability overlay.
+    }
+  }
+  // Availability for a variant, or null when it isn't seeded on the mesh (or has no
+  // single-file content id to match — sharded/bundle variants).
+  function avail(v) {
+    return v && v.content_id ? meshBySha[v.content_id] || null : null;
+  }
+
   async function loadHome() {
     loading = true;
     error = "";
@@ -47,7 +69,10 @@
       loading = false;
     }
   }
-  onMount(loadHome);
+  onMount(() => {
+    loadHome();
+    loadMesh();
+  });
 
   async function search() {
     if (!query.trim()) {
@@ -128,7 +153,14 @@
           </div>
         </div>
         {#if m.gated}<span class="pill warn">gated</span>{/if}
-        {#if m.has_gguf}<span class="pill">gguf</span>{/if}
+        {#each m.formats || [] as f}
+          <span
+            class="pill fmt f-{f}"
+            title="This repo publishes weights in {prettyFormat(f)} format"
+          >
+            {prettyFormat(f)}
+          </span>
+        {/each}
       </div>
 
       {#if openId === m.id}
@@ -140,10 +172,15 @@
                 <div>
                   <span class="vlabel">{v.label}</span>
                   {#if v.recommended}<span class="pill ok">Recommended</span>{/if}
-                  {#if prettyFormat(v.format)}<span class="pill">{prettyFormat(v.format)}</span>{/if}
+                  {#if v.format}<span class="pill fmt f-{formatId(v.format)}">{prettyFormat(v.format)}</span>{/if}
                   <span class="muted">
                     {fmtSize(v.size)}{v.shards > 1 ? ` · ${v.shards} shards` : ""}
                   </span>
+                  {#if avail(v)}
+                    <span class="pill ok" title="Peers seeding this quant on the Atlas network right now">
+                      ● Iroh {avail(v).iroh} · BitTorrent {avail(v).bt}
+                    </span>
+                  {/if}
                   {#if v.recommended && v.fit_reason}
                     <div class="muted">Recommended for this machine · {v.fit_reason}</div>
                   {/if}

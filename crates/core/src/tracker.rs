@@ -140,8 +140,12 @@ pub struct CatalogRow {
     pub license: String,
     #[serde(default)]
     pub magnet: String,
+    /// Distinct peers seeding this over Iroh (excludes you).
     #[serde(default)]
     pub peers: usize,
+    /// Distinct peers seeding this over BitTorrent (excludes you).
+    #[serde(default)]
+    pub bt_seeders: usize,
     #[serde(default)]
     pub devices: Vec<String>,
     /// True when this row is the querier's own share — one of your devices is

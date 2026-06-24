@@ -18,7 +18,15 @@ tokio.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tracing.workspace = true
 tracing-subscriber.workspace = true
+# Auto-update: fetch the signed manifest + the platform asset (proxy-aware, rustls),
+# hash-verify it, and self-replace the running binary/bundle.
+reqwest.workspace = true
+futures-util.workspace = true
+sha2.workspace = true
+hex.workspace = true
+self-replace = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 rfd = { version = "0.14", default-features = false, features = ["gtk3"] }
 

@@ -39,8 +39,33 @@ npm --prefix ui ci 2>/dev/null || npm --prefix ui install
 echo "==> ensuring tauri-cli (v2)"
 $CARGO tauri --version >/dev/null 2>&1 || $CARGO install tauri-cli --version "^2" --locked
 
+# Auto-update signing. With `bundle.createUpdaterArtifacts: true` set in
+# tauri.conf.json, Tauri only emits the detached `.sig` files (and the macOS
+# `.app.tar.gz` that the updater consumes instead of the .dmg) when a signing key is
+# present. Provide it via the standard Tauri env var, or point STUDIO_UPDATER_KEY at
+# the private key file (default: ~/noema-studio-updater.key). The matching PUBLIC key
+# is pinned in tauri.conf.json `plugins.updater.pubkey`.
+if [[ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]]; then
+  KEY_FILE="${STUDIO_UPDATER_KEY:-$HOME/noema-studio-updater.key}"
+  if [[ -f "$KEY_FILE" ]]; then
+    export TAURI_SIGNING_PRIVATE_KEY="$(cat "$KEY_FILE")"
+    export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}"
+    echo "==> updater signing: using key file $KEY_FILE"
+  else
+    echo "WARNING: no updater signing key found (set TAURI_SIGNING_PRIVATE_KEY or place" >&2
+    echo "         the key at $KEY_FILE). Bundles will build but WITHOUT the .sig files" >&2
+    echo "         the auto-updater requires — Studio auto-update would be inert." >&2
+  fi
+else
+  echo "==> updater signing: using TAURI_SIGNING_PRIVATE_KEY from the environment"
+fi
+
 echo "==> building Studio bundles (vite build + Tauri bundler)"
 $CARGO tauri build "$@"
 
 echo "==> done. bundles under:"
 ls -1d target/release/bundle/*/ 2>/dev/null || true
+
+echo "==> updater artifacts (.sig signatures + macOS .app.tar.gz):"
+find target/release/bundle -type f \( -name '*.sig' -o -name '*.app.tar.gz' \) -print 2>/dev/null \
+  || echo "   (none — was a signing key set?)"

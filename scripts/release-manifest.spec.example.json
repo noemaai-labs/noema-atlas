@@ -1,0 +1,29 @@
+{
+  "_comment": "Input spec for `noema update sign`. It lists every release asset WITHOUT hashes — the signer reads each file from --assets-dir, computes its SHA-256 + size, and (for Studio) inlines the matching <name>.sig. Atlas (Linux/Windows) asset names are version-less and stable; Studio names are version-stamped and may differ per build, so copy the EXACT file names from the GitHub release. Set --base-url to the release's download URL, or give an explicit `url` per asset.",
+  "channel": "stable",
+  "apps": [
+    {
+      "app": "atlas",
+      "version": "0.2.0",
+      "min_supported": "0.1.0",
+      "notes_url": "https://github.com/noemaai-labs/noema-atlas/releases/tag/v0.2.0",
+      "assets": [
+        { "os": "macos", "arch": "universal", "name": "Noema-Atlas-macos-universal.zip" },
+        { "os": "windows", "arch": "x86_64", "flavor": "installer", "name": "Noema-Atlas-Setup.exe" },
+        { "os": "windows", "arch": "x86_64", "flavor": "portable", "name": "Noema-Atlas-windows-x86_64.zip" },
+        { "os": "linux", "arch": "x86_64", "flavor": "appimage", "name": "Noema-Atlas-x86_64.AppImage" },
+        { "os": "linux", "arch": "x86_64", "flavor": "tarball", "name": "noema-atlas-linux-x86_64.tar.gz" }
+      ]
+    },
+    {
+      "app": "studio",
+      "version": "0.2.0",
+      "notes_url": "https://github.com/noemaai-labs/noema-atlas/releases/tag/v0.2.0",
+      "assets": [
+        { "os": "macos", "arch": "universal", "flavor": "app_tar_gz", "name": "Noema Atlas Studio.app.tar.gz" },
+        { "os": "windows", "arch": "x86_64", "flavor": "nsis", "name": "Noema Atlas Studio_0.2.0_x64-setup.exe" },
+        { "os": "linux", "arch": "x86_64", "flavor": "appimage", "name": "Noema Atlas Studio_0.2.0_amd64.AppImage" }
+      ]
+    }
+  ]
+}

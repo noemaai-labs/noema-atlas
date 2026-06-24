@@ -1,0 +1,129 @@
+[package]
+name = "librqbit"
+version.workspace = true
+authors = ["Igor Katson <igor.katson@gmail.com>"]
+edition = "2024"
+description = "The main library used by rqbit torrent client. The binary is just a small wrapper on top of it."
+license = "Apache-2.0"
+documentation = "https://docs.rs/librqbit"
+repository = "https://github.com/ikatson/rqbit"
+readme = "README.md"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[features]
+default = ["default-tls", "http-api-client"]
+
+tokio-console = ["console-subscriber", "tokio/tracing"]
+http-api = ["axum", "tower-http"]
+http-api-client = []
+upnp-serve-adapter = ["upnp-serve"]
+webui = []
+timed_existence = []
+default-tls = [
+    "reqwest/default-tls",
+    "sha1w/sha1-crypto-hash",
+    "librqbit-core/sha1-crypto-hash",
+]
+miri = []
+prometheus = ["metrics-exporter-prometheus"]
+rust-tls = ["reqwest/rustls-tls", "sha1w/sha1-ring", "librqbit-core/sha1-ring"]
+storage_middleware = ["lru"]
+storage_examples = []
+tracing-subscriber-utils = ["tracing-subscriber"]
+postgres = ["sqlx", "home"]
+async-bt = ["async-backtrace"]
+watch = ["notify"]
+disable-upload = []
+
+# These are absolutely useless for people, just for debugging / testing / benchmarking
+_disable_disk_write_net_benchmark = []
+_disable_reconnect_test = []
+
+[dependencies]
+# sqlx and home are pinned so that we can compile on older Rusts
+sqlx = { workspace = true, features = ["runtime-tokio", "macros", "postgres"], optional = true }
+home = { workspace = true, optional = true }
+
+bencode.workspace = true
+tracker_comms.workspace = true
+buffers.workspace = true
+librqbit-core.workspace = true
+librqbit-lsd.workspace = true
+clone_to_owned.workspace = true
+peer_binary_protocol.workspace = true
+sha1w.workspace = true
+dht.workspace = true
+librqbit-upnp.workspace = true
+upnp-serve = { workspace = true, optional = true }
+
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs", "io-util"] }
+governor.workspace = true
+console-subscriber = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+tower-http = { workspace = true, features = ["cors", "trace"], optional = true }
+tokio-stream.workspace = true
+serde = { workspace = true, features = ["rc"] }
+serde_derive.workspace = true
+serde_json.workspace = true
+serde_urlencoded.workspace = true
+anyhow.workspace = true
+itertools.workspace = true
+http.workspace = true
+regex.workspace = true
+reqwest = { workspace = true, features = ["json", "socks", "stream"] }
+urlencoding.workspace = true
+byteorder.workspace = true
+bincode.workspace = true
+bitvec.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+size_format.workspace = true
+rand.workspace = true
+tracing-subscriber = { workspace = true, features = ["json", "fmt", "env-filter"], optional = true }
+uuid = { workspace = true, features = ["v4"] }
+futures.workspace = true
+url = { workspace = true, features = ["serde"] }
+hex.workspace = true
+backon.workspace = true
+dashmap.workspace = true
+base64.workspace = true
+serde_with.workspace = true
+tokio-util = { workspace = true, features = ["io"] }
+metrics-exporter-prometheus = { workspace = true, optional = true }
+bytes.workspace = true
+rlimit.workspace = true
+async-stream.workspace = true
+memmap2.workspace = true
+lru = { workspace = true, optional = true }
+mime_guess.workspace = true
+tokio-socks.workspace = true
+async-trait.workspace = true
+async-backtrace = { workspace = true, optional = true }
+notify = { workspace = true, optional = true }
+walkdir.workspace = true
+arc-swap.workspace = true
+intervaltree.workspace = true
+async-compression = { workspace = true, features = ["tokio", "gzip"] }
+librqbit-utp = { workspace = true, features = ["export-metrics"] }
+axum-extra = { workspace = true, features = ["query"] }
+librqbit-dualstack-sockets = { workspace = true, features = ["axum"] }
+socket2.workspace = true
+nix = { workspace = true, features = ["uio"] }
+thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32", "Win32_System", "Win32_System_IO", "Win32_System_Ioctl"] }
+
+[build-dependencies]
+anyhow.workspace = true
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true, features = ["fmt", "std"] }
+tokio-test.workspace = true
+tempfile.workspace = true
+pollster.workspace = true
+
+[[example]]
+name = "simulate_traffic"
+required-features = ["http-api", "webui", "tracing-subscriber-utils", "prometheus"]

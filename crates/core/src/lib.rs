@@ -22,6 +22,7 @@ pub mod sign;
 pub mod tracker;
 pub mod transfer;
 pub mod transport;
+pub mod update;
 pub mod util;
 pub mod verify;
 
@@ -32,9 +33,10 @@ pub const DEFAULT_TRACKER: &str = "https://atlas.noemaai.com";
 pub use cas::{BlobMeta, Cas, LinkKind};
 pub use db::Db;
 pub use engine::{
-    aggregate_results, ArtifactOutcome, DownloadOutcome, DownloadProgress, Engine, EngineConfig,
-    EvictPolicy, FileResult, ImportResult, InstallView, InstalledModel, LocalImportOutcome,
-    LocalShareMeta, NetworkModel, Progress, RateLimit, ReconcileReport, SourceLocation,
+    aggregate_results, ArtifactOutcome, BandwidthSchedule, DownloadOutcome, DownloadProgress,
+    Engine, EngineConfig, EvictPolicy, FileResult, ImportResult, InstallView, InstalledModel,
+    LocalImportOutcome, LocalShareMeta, NetworkModel, Progress, QueueMove, RateLimit,
+    ReconcileReport, SourceLocation,
 };
 #[cfg(feature = "iroh")]
 pub use engine::{SeederHandle, WorldwideShare};
@@ -50,4 +52,7 @@ pub use share::{is_bundle_link, ShareBundle, ShareTarget};
 pub use sign::{verify_manifest, KeyPair, VerificationReport};
 pub use transfer::{TransferControl, TransferId, TransferManager, TransferState};
 pub use transport::{BtPeer, TransportAdapter, TransportConfig, Transports};
+pub use update::{
+    AppRelease, PlatformAsset, ReleaseManifest, UpdateSignature, UPDATE_RELEASE_PUBKEYS,
+};
 pub use verify::{classify_file_safety, FileSafety, StreamingVerifier};

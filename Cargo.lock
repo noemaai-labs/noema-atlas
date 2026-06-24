@@ -3924,8 +3924,6 @@ dependencies = [
 [[package]]
 name = "librqbit"
 version = "9.0.0-rc.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9451def41c18d1b8e7b68c097bcb0c9a0579cdc9b779803368a65b86cae03d2"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -4722,7 +4720,7 @@ checksum = "43794a0ace135be66a25d3ae77d41b91615fb68ae937f904090203e81f755b65"
 
 [[package]]
 name = "noema-cli"
-version = "0.1.0"
+version = "2.0.0-alpha.2"
 dependencies = [
  "anyhow",
  "axum 0.7.9",
@@ -4733,6 +4731,7 @@ dependencies = [
  "noema-core",
  "serde",
  "serde_json",
+ "sha2",
  "time",
  "tokio",
  "tokio-util",
@@ -4742,7 +4741,7 @@ dependencies = [
 
 [[package]]
 name = "noema-core"
-version = "0.1.0"
+version = "2.0.0-alpha.2"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -4752,6 +4751,7 @@ dependencies = [
  "base64",
  "blake3",
  "bytes",
+ "chrono",
  "ciborium",
  "ed25519-dalek",
  "futures-util",
@@ -4765,6 +4765,7 @@ dependencies = [
  "reflink-copy",
  "reqwest",
  "rusqlite",
+ "semver",
  "serde",
  "serde_json",
  "sha1",
@@ -4779,29 +4780,37 @@ dependencies = [
 
 [[package]]
 name = "noema-desktop"
-version = "0.1.0"
+version = "2.0.0-alpha.2"
 dependencies = [
  "anyhow",
  "eframe",
+ "futures-util",
+ "hex",
  "image",
  "noema-core",
+ "reqwest",
  "rfd",
+ "self-replace",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 
 [[package]]
 name = "noema-registry"
-version = "0.1.0"
+version = "2.0.0-alpha.2"
 dependencies = [
  "anyhow",
  "axum 0.7.9",
  "clap",
+ "hex",
  "noema-core",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -6658,6 +6667,17 @@ checksum = "6ce2691df843ecc5d231c0b14ece2acc3efb62c0a398c7e1d875f3983ce020e3"
 dependencies = [
  "core-foundation-sys",
  "libc",
+]
+
+[[package]]
+name = "self-replace"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03ec815b5eab420ab893f63393878d89c90fdd94c0bcc44c07abb8ad95552fb7"
+dependencies = [
+ "fastrand",
+ "tempfile",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

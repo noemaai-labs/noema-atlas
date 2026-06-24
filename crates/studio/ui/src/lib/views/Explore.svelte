@@ -1,7 +1,7 @@
 <script>
   import { onMount, onDestroy } from "svelte";
   import { api } from "../api.js";
-  import { fmtSize, rowFormat } from "../format.js";
+  import { fmtSize, rowFormat, formatId } from "../format.js";
   export let startLink = () => {};
   export let startMesh = () => {};
   export let goTransfers = () => {};
@@ -106,7 +106,7 @@
           <div class="grow">
             <div class="title">
               {m.name}
-              {#if rowFormat(null, m.name)}<span class="pill">{rowFormat(null, m.name)}</span>{/if}
+              {#if rowFormat(null, m.name)}<span class="pill fmt f-{formatId(null, m.name)}">{rowFormat(null, m.name)}</span>{/if}
             </div>
             <div class="muted">{fmtSize(m.size)}{m.quant ? " · " + m.quant : ""}{m.devices && m.devices.length ? " · " + m.devices.join(", ") : ""}</div>
           </div>
@@ -134,9 +134,9 @@
           <div class="grow">
             <div class="title">
               {m.name}
-              {#if rowFormat(null, m.name)}<span class="pill">{rowFormat(null, m.name)}</span>{/if}
+              {#if rowFormat(null, m.name)}<span class="pill fmt f-{formatId(null, m.name)}">{rowFormat(null, m.name)}</span>{/if}
             </div>
-            <div class="muted">{fmtSize(m.size)}{m.quant ? " · " + m.quant : ""}{m.license ? " · " + m.license : ""} · {m.peers} {m.peers === 1 ? "peer" : "peers"}</div>
+            <div class="muted">{fmtSize(m.size)}{m.quant ? " · " + m.quant : ""}{m.license ? " · " + m.license : ""} · Iroh {m.peers} · BitTorrent {m.bt_seeders}</div>
           </div>
           {#if m.in_library}
             <span class="pill">in library</span>

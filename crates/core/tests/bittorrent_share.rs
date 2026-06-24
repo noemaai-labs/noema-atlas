@@ -20,7 +20,9 @@ fn sample(seed: u8, len: usize) -> Vec<u8> {
 /// A leeching adapter: outbound + DHT only, no inbound listener. Uncapped (0,0).
 /// Public trackers off (this is a private two-node swarm), ratio unlimited.
 fn leecher(store_dir: std::path::PathBuf) -> BittorrentAdapter {
-    BittorrentAdapter::new(store_dir, None, false, None, false, 0, 0, false, 0.0, None)
+    BittorrentAdapter::new(
+        store_dir, None, false, None, false, 0, 0, false, 0.0, false, None,
+    )
 }
 
 /// A seeding adapter: binds an inbound listener so peers can pull from it. Returned
@@ -28,7 +30,7 @@ fn leecher(store_dir: std::path::PathBuf) -> BittorrentAdapter {
 /// work, including the cold session init, onto a spawned task).
 fn seeder(store_dir: std::path::PathBuf) -> Arc<BittorrentAdapter> {
     Arc::new(BittorrentAdapter::new(
-        store_dir, None, true, None, false, 0, 0, false, 0.0, None,
+        store_dir, None, true, None, false, 0, 0, false, 0.0, false, None,
     ))
 }
 

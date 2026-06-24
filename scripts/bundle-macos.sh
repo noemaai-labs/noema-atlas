@@ -127,6 +127,36 @@ fi
 
 echo "==> done: $APP"
 
+# Notarize the .app bundle ITSELF and staple its ticket — before any packaging.
+# Notarization tickets travel with the file they're stapled to, so stapling only the
+# .dmg/.zip container (as we also do below) leaves a bundle the in-app updater extracts
+# from the zip with no independent ticket: on an offline machine, Gatekeeper then has
+# nothing to validate and may block the relaunched app. Stapling the .app here fixes
+# that. notarytool needs a container to submit, so we zip the app to a temp first.
+notarize_app() {
+  if ! command -v xcrun >/dev/null; then return 0; fi
+  local tmpzip; tmpzip="$(mktemp -d)/app-notarize.zip"
+  if [[ -n "${NOTARY_KEYCHAIN_PROFILE:-}" ]]; then
+    echo "==> notarizing $APP (keychain profile)"
+    ditto -c -k --keepParent "$APP" "$tmpzip"
+    xcrun notarytool submit "$tmpzip" --keychain-profile "$NOTARY_KEYCHAIN_PROFILE" --wait
+  elif [[ -n "${NOTARY_APPLE_ID:-}" && -n "${NOTARY_PASSWORD:-}" && -n "${NOTARY_TEAM_ID:-}" ]]; then
+    echo "==> notarizing $APP (apple-id)"
+    ditto -c -k --keepParent "$APP" "$tmpzip"
+    xcrun notarytool submit "$tmpzip" \
+      --apple-id "$NOTARY_APPLE_ID" --password "$NOTARY_PASSWORD" --team-id "$NOTARY_TEAM_ID" --wait
+  else
+    echo "   (skipping .app notarization — no NOTARY_* credentials set)"
+    return 0
+  fi
+  echo "==> stapling ticket to $APP"
+  xcrun stapler staple "$APP"
+  xcrun stapler validate "$APP" || true
+}
+
+# Staple the .app first; the .dmg/.zip below are then built from a stapled bundle.
+notarize_app
+
 notarize_and_staple() {
   # $1 = path to notarize (dmg or zip). Submits + waits + staples if creds exist.
   local target="$1"
@@ -164,8 +194,10 @@ if [[ "$ZIP" == "1" ]]; then
   ZIP_PATH="$OUT_DIR/${APP_NAME// /-}-macos${SUFFIX}.zip"
   echo "==> zipping -> $ZIP_PATH"
   rm -f "$ZIP_PATH"
-  # ditto preserves the bundle structure, symlinks, and extended attributes.
+  # ditto preserves the bundle structure, symlinks, and extended attributes. The
+  # .app inside is already notarized + stapled (see notarize_app), so the zip needs
+  # no ticket of its own — this is exactly the archive the in-app updater downloads
+  # and extracts, and the extracted bundle validates offline.
   ditto -c -k --keepParent "$APP" "$ZIP_PATH"
-  notarize_and_staple "$ZIP_PATH"
   echo "==> zip ready: $ZIP_PATH"
 fi

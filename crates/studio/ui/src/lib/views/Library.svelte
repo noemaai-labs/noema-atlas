@@ -1,7 +1,7 @@
 <script>
   import { onMount } from "svelte";
   import { api, copyText } from "../api.js";
-  import { fmtSize, rowFormat } from "../format.js";
+  import { fmtSize, rowFormat, formatId } from "../format.js";
   import ShareComposer from "../ShareComposer.svelte";
 
   let items = [];
@@ -27,6 +27,16 @@
             m.iroh_seeding = await api.isIrohSeeding(m.blake3);
           } catch (e) {
             m.iroh_seeding = false;
+          }
+          // Per-model seed-ratio override (null = follow the global cap). Surfaced as
+          // an editable number; the input mirrors the override or "" when unset.
+          try {
+            const r = await api.btBlobRatio(m.blake3);
+            m.ratio_override = r;
+            m.ratio_input = r == null ? "" : String(r);
+          } catch (e) {
+            m.ratio_override = null;
+            m.ratio_input = "";
           }
         })
       );
@@ -116,6 +126,41 @@
       error = String(e);
     }
   }
+  async function applyRatio(m) {
+    const raw = (m.ratio_input ?? "").trim();
+    const cap = raw === "" ? null : Number(raw);
+    if (cap != null && (Number.isNaN(cap) || cap < 0)) {
+      flash("Ratio must be 0 or higher");
+      return;
+    }
+    try {
+      await api.setBtBlobRatio(m.blake3, cap);
+      m.ratio_override = cap;
+      items = items;
+      flash(cap == null ? "Following the global ratio" : "Ratio override set");
+    } catch (e) {
+      error = String(e);
+    }
+  }
+  async function clearRatio(m) {
+    try {
+      await api.setBtBlobRatio(m.blake3, null);
+      m.ratio_override = null;
+      m.ratio_input = "";
+      items = items;
+      flash("Following the global ratio");
+    } catch (e) {
+      error = String(e);
+    }
+  }
+  async function recheck(m) {
+    try {
+      await api.btForceRecheck(m.blake3);
+      flash("Rechecking pieces…");
+    } catch (e) {
+      flash("Recheck failed — the blob may not be a live torrent");
+    }
+  }
   async function install(m) {
     try {
       const dir = (modelsDir || "").replace(/\/$/, "") + "/" + m.name.replace(/[^A-Za-z0-9._-]/g, "-");
@@ -170,7 +215,7 @@
         <div class="grow">
           <div class="title">
             {m.name}
-            {#if rowFormat(m.format, m.name)}<span class="pill">{rowFormat(m.format, m.name)}</span>{/if}
+            {#if rowFormat(m.format, m.name)}<span class="pill fmt f-{formatId(m.format, m.name)}">{rowFormat(m.format, m.name)}</span>{/if}
           </div>
           <div class="muted">
             {fmtSize(m.size_bytes)}{m.quant ? " · " + m.quant : ""} ·
@@ -199,6 +244,21 @@
         <button class="btn sm" on:click={() => copyLink(m)}>Copy link</button>
         {#if m.bt_seeding}
           <button class="btn sm" on:click={() => copyMagnet(m)} title="Copy the BitTorrent magnet for this model">Copy magnet</button>
+          <button class="btn sm" on:click={() => recheck(m)} title="Force a full piece re-hash against the torrent">Recheck</button>
+          <label class="ratio" title="Stop seeding this model at this ratio (0 = unlimited; clear to follow the global cap)">
+            <span class="muted">Ratio</span>
+            <input
+              type="number"
+              min="0"
+              step="0.1"
+              placeholder="default"
+              bind:value={m.ratio_input}
+              on:change={() => applyRatio(m)}
+            />
+            {#if m.ratio_override != null}
+              <button class="btn xs" on:click={() => clearRatio(m)} title="Clear the override — follow the global ratio cap">×</button>
+            {/if}
+          </label>
         {/if}
         <button class="btn sm" on:click={() => (composer = { model: m })}>Edit</button>
         {#if m.install_path}

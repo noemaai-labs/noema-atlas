@@ -9,6 +9,7 @@ use axum::{
 use clap::Parser;
 use noema_core::manifest::{Manifest, PublicKey};
 use noema_core::sign::verify_manifest;
+use noema_core::update::ReleaseManifest;
 use noema_core::util::{now_unix_millis, slugify};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -86,7 +87,12 @@ struct CatalogRow {
     quant: String,
     license: String,
     magnet: String,
+    /// Distinct live peers seeding this over Iroh (the mesh dedup key is the
+    /// NodeId, and every announcer runs the Iroh seeder), minus yourself.
     peers: usize,
+    /// Distinct live peers advertising a BitTorrent swarm for this blob (those
+    /// with a non-empty magnet — set only when actually BT-seeding), minus you.
+    bt_seeders: usize,
     devices: Vec<String>,
     mine: bool,
 }
@@ -244,6 +250,15 @@ impl Tracker {
             // *other* devices you could fetch it from.
             let total = peers_by_b3.get(b3).copied().unwrap_or(provs.len());
             let peers = total.saturating_sub(usize::from(self_is_provider));
+            // Distinct *other* peers seeding over BitTorrent: those whose live
+            // record carries a non-empty magnet (set only when actually BT-seeding).
+            // Deduped on NodeId and excluding yourself, exactly like `peers`.
+            let bt_seeders = provs
+                .iter()
+                .filter(|p| !p.magnet.is_empty() && self_id.is_none_or(|s| p.node_id != s))
+                .map(|p| p.node_id.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len();
             // Magnet from any live provider that has one (a single seeding peer is
             // enough to advertise the swarm), falling back to the representative's.
             let magnet = provs
@@ -261,6 +276,7 @@ impl Tracker {
                 license: rep.license.clone(),
                 magnet,
                 peers,
+                bt_seeders,
                 devices: devices.into_iter().collect(),
                 mine,
             });
@@ -323,6 +339,24 @@ struct Args {
     /// reject all unsigned requests.
     #[arg(long)]
     require_signed: bool,
+    /// Path to the signed auto-update manifest (`release-manifest.json`) served at
+    /// `/update/latest` and `/studio/update/...`. Defaults to
+    /// `<dir>/release-manifest.json`. The release process scp's the signed file here;
+    /// the registry re-reads it on restart. A missing file just means "no update
+    /// available" — the endpoints stay up.
+    #[arg(long)]
+    update_manifest: Option<PathBuf>,
+    /// Ed25519 public key(s) (64-hex) the registry will accept as valid signers of
+    /// the update manifest. If any are given and the manifest doesn't verify against
+    /// them, the registry refuses to serve it (serves "no update" instead).
+    #[arg(long = "update-trust", value_name = "HEX")]
+    update_trust: Vec<String>,
+    /// Serve the update manifest WITHOUT a registry-side signature check when no
+    /// `--update-trust` keys are configured. Off by default (fail closed) — clients
+    /// still verify against their baked-in keys, but the registry won't hand out an
+    /// unverified manifest unless you opt in here.
+    #[arg(long)]
+    update_trust_none: bool,
 }
 
 struct Store {
@@ -380,6 +414,90 @@ struct AppState {
     /// When true, reject any unsigned announce/withdraw; when false (transition),
     /// accept unsigned legacy clients but still verify any proof that *is* present.
     require_signed: bool,
+    /// The signed auto-update manifest, loaded at startup. Immutable per process
+    /// (restart to refresh); the registry only ever serves it, never signs it.
+    update: Arc<ReleaseManifest>,
+    /// Weak ETag for the update manifest, derived from its content so stampedes of
+    /// startup pings collapse to 304s.
+    update_etag: Arc<str>,
+}
+
+/// Load and (optionally) verify the signed update manifest. Fails *safe*: any
+/// problem — missing file, bad JSON, or a signature that doesn't match the
+/// registry's configured trust set — yields an empty manifest so the endpoints
+/// answer "no update available" instead of erroring or serving garbage. The
+/// client is the real trust root (it verifies against its baked-in keys); this
+/// check is operational hygiene so a corrupt file on the VPS isn't handed out.
+fn load_release_manifest(
+    path: &std::path::Path,
+    trust: &[String],
+    allow_untrusted: bool,
+) -> ReleaseManifest {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(_) => {
+            tracing::info!(
+                "no update manifest at {} — serving 'no update'",
+                path.display()
+            );
+            return ReleaseManifest::default();
+        }
+    };
+    let manifest = match ReleaseManifest::from_json(&bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!(
+                "update manifest at {} is not valid JSON: {e}",
+                path.display()
+            );
+            return ReleaseManifest::default();
+        }
+    };
+    if trust.is_empty() {
+        // Fail closed by default: without configured trust keys we don't serve an
+        // unverified manifest. The operator must either pass --update-trust <key> or
+        // explicitly opt into unverified serving with --update-trust-none (clients
+        // still verify against their baked-in keys regardless).
+        if allow_untrusted {
+            tracing::warn!(
+                "serving update manifest from {} WITHOUT registry-side signature check \
+                 (--update-trust-none); clients still verify against their baked-in keys",
+                path.display()
+            );
+            return manifest;
+        }
+        tracing::error!(
+            "refusing to serve update manifest from {}: no --update-trust keys configured \
+             (pass --update-trust <hex> or, to serve unverified, --update-trust-none)",
+            path.display()
+        );
+        return ReleaseManifest::default();
+    }
+    let trust_refs: Vec<&str> = trust.iter().map(|s| s.as_str()).collect();
+    if manifest.is_signed_by_trusted(&trust_refs) {
+        tracing::info!(
+            "loaded signed update manifest from {} (channel={}, {} app(s))",
+            path.display(),
+            manifest.channel,
+            manifest.apps.len()
+        );
+        manifest
+    } else {
+        tracing::error!(
+            "update manifest at {} is unsigned or fails the configured trust set — \
+             refusing to serve it",
+            path.display()
+        );
+        ReleaseManifest::default()
+    }
+}
+
+/// A short, content-derived weak ETag for the update manifest.
+fn manifest_etag(m: &ReleaseManifest) -> String {
+    use sha2::{Digest, Sha256};
+    let bytes = m.canonical_bytes().unwrap_or_default();
+    let digest = Sha256::digest(&bytes);
+    format!("W/\"{}\"", hex::encode(&digest[..8]))
 }
 
 #[derive(Serialize)]
@@ -402,11 +520,19 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
     let store = Store::load(args.dir.clone())?;
+    let update_path = args
+        .update_manifest
+        .clone()
+        .unwrap_or_else(|| args.dir.join("release-manifest.json"));
+    let update = load_release_manifest(&update_path, &args.update_trust, args.update_trust_none);
+    let update_etag = manifest_etag(&update);
     let state = AppState {
         store: Arc::new(Mutex::new(store)),
         tracker: Arc::new(Mutex::new(Tracker::default())),
         public_url: Arc::from(args.public_url.as_str()),
         require_signed: args.require_signed,
+        update: Arc::new(update),
+        update_etag: Arc::from(update_etag.as_str()),
     };
 
     let app = Router::new()
@@ -425,6 +551,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/withdraw", post(withdraw))
         .route("/providers/:hash", get(providers))
         .route("/catalog", get(catalog))
+        // In-app auto-update: Atlas gets the whole signed manifest (it does its own
+        // selection + verification); Studio gets Tauri-updater-shaped JSON.
+        .route("/update/latest", get(update_latest))
+        .route("/studio/update/:target/:arch/:current", get(studio_update))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&args.addr).await?;
@@ -462,6 +592,101 @@ async fn health() -> impl IntoResponse {
     Json(
         serde_json::json!({"service":"noema-registry","status":"ok","version":env!("CARGO_PKG_VERSION")}),
     )
+}
+
+/// Auto-update endpoint for the Atlas (egui) client.
+///
+/// Serves the **whole** signed release manifest, unfiltered. The client does all the
+/// selection (app/os/arch), version comparison, signature verification (against its
+/// baked-in key), and SHA-256 pinning itself — so the bytes served are exactly the
+/// bytes the release key signed. Filtering server-side would invalidate that
+/// signature, so query parameters are intentionally ignored here (kept loggable-free).
+/// Anonymous: a plain GET, no per-user state, no identifying parameters required.
+async fn update_latest(State(state): State<AppState>, headers: header::HeaderMap) -> Response {
+    // Collapse startup-ping stampedes: a client (or CDN) that already has this
+    // version gets a 304 instead of the body.
+    if let Some(inm) = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+    {
+        if inm.split(',').any(|t| t.trim() == &*state.update_etag) {
+            return (
+                StatusCode::NOT_MODIFIED,
+                [
+                    (header::ETAG, state.update_etag.to_string()),
+                    (header::CACHE_CONTROL, "public, max-age=300".to_string()),
+                ],
+            )
+                .into_response();
+        }
+    }
+    let body = match state.update.to_json_pretty() {
+        Ok(b) => b,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("encode: {e}")),
+    };
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/json".to_string()),
+            (header::ETAG, state.update_etag.to_string()),
+            (header::CACHE_CONTROL, "public, max-age=300".to_string()),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// Auto-update endpoint for the Studio (Tauri) client.
+///
+/// Tauri's updater calls a dynamic endpoint and expects its own JSON dialect, doing
+/// its own minisign verification over the asset (the `signature` field is the `.sig`
+/// file's *contents*). Because that signature — not this response shape — is the trust
+/// root for Studio, we can freely reshape the manifest here. Returns **204** when
+/// there's no newer release or no Tauri-installable asset for the platform (the
+/// updater treats 204 as "up to date"); never a 4xx/5xx for unknown platforms.
+async fn studio_update(
+    State(state): State<AppState>,
+    Path((target, arch, current)): Path<(String, String, String)>,
+) -> Response {
+    let no_update = || StatusCode::NO_CONTENT.into_response();
+
+    let Some(app) = state.update.app("studio") else {
+        return no_update();
+    };
+    if !app.is_newer_than(&current) {
+        return no_update();
+    }
+    let os = noema_core::update::normalize_os(&target);
+    // Only offer artifacts Tauri's updater can actually install in place. Notably
+    // .deb is excluded (Tauri can't self-update a system package) and macOS must be
+    // the `.app.tar.gz`, never the `.dmg`.
+    let allowed: &[&str] = match os.as_str() {
+        "macos" => &["app_tar_gz"],
+        "windows" => &["nsis", "msi", "installer"],
+        "linux" => &["appimage"],
+        _ => return no_update(),
+    };
+    let asset = allowed
+        .iter()
+        .find_map(|flavor| app.select_asset(&os, &arch, Some(flavor)));
+    let Some(asset) = asset else {
+        return no_update();
+    };
+    if asset.signature.trim().is_empty() {
+        // No detached .sig => Tauri would reject it anyway. Fail closed.
+        tracing::warn!(
+            "studio asset {} has no minisign signature; not offering it to the updater",
+            asset.name
+        );
+        return no_update();
+    }
+    Json(serde_json::json!({
+        "version": app.version,
+        "notes": app.notes_url,
+        "url": asset.url,
+        "signature": asset.signature,
+    }))
+    .into_response()
 }
 
 async fn publish(State(state): State<AppState>, body: Bytes) -> Response {

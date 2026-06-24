@@ -46,6 +46,11 @@ export const api = {
   btMagnet: (blake3) => invoke("bt_magnet", { blake3 }),
   isIrohSeeding: (blake3) => invoke("is_iroh_seeding", { blake3 }),
   btPeers: (transferId) => invoke("bt_peers", { transferId }),
+  btBlobRatio: (blake3) => invoke("bt_blob_ratio", { blake3 }),
+  setBtBlobRatio: (blake3, cap) => invoke("set_bt_blob_ratio", { blake3, cap }),
+  btForceRecheck: (blake3) => invoke("bt_force_recheck", { blake3 }),
+  downloadQueueOrder: () => invoke("download_queue_order"),
+  queueReorder: (id, dir) => invoke("queue_reorder", { id, dir }),
   setDownloadPreference: (preference) =>
     invoke("set_download_preference", { preference }),
   pauseAll: () => invoke("pause_all"),

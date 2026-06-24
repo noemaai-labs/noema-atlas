@@ -1,6 +1,8 @@
 <script>
   import { onMount } from "svelte";
   import { api, onProgress, onDone, onRegistered } from "./lib/api.js";
+  import { check as checkUpdate } from "@tauri-apps/plugin-updater";
+  import { relaunch } from "@tauri-apps/plugin-process";
   import Sidebar from "./lib/Sidebar.svelte";
   import Discover from "./lib/views/Discover.svelte";
   import Explore from "./lib/views/Explore.svelte";
@@ -17,6 +19,14 @@
   let transfers = {};
   let settings = null;
   let showIntro = false;
+
+  // Auto-update (Tauri updater). `updateInfo` is the plugin's Update handle when a
+  // newer signed build is available; the banner drives download + relaunch.
+  let updateInfo = null;
+  let updateBusy = false;
+  let updateProgress = 0;
+  let updateDismissed = false;
+  let updateError = "";
   let discoverFocus = 0;
   let dropComposer = null;
 
@@ -124,6 +134,48 @@
     }
   }
 
+  // Ask the VPS (via the Tauri updater) whether a newer signed build exists. Returns
+  // "available" | "current" | "error:<msg>" so the Settings "Check now" button can
+  // give feedback. Best-effort: a failure never blocks the app.
+  async function checkForUpdates() {
+    try {
+      const upd = await checkUpdate();
+      if (upd) {
+        updateInfo = upd;
+        updateDismissed = false;
+        return "available";
+      }
+      return "current";
+    } catch (e) {
+      return "error:" + e;
+    }
+  }
+
+  async function installUpdate() {
+    if (!updateInfo || updateBusy) return;
+    updateBusy = true;
+    updateError = "";
+    updateProgress = 0;
+    let total = 0;
+    let done = 0;
+    try {
+      await updateInfo.downloadAndInstall((ev) => {
+        if (ev.event === "Started") total = ev.data?.contentLength || 0;
+        else if (ev.event === "Progress") {
+          done += ev.data?.chunkLength || 0;
+          updateProgress = total ? done / total : 0;
+        } else if (ev.event === "Finished") updateProgress = 1;
+      });
+      // The new version is installed; relaunch into it.
+      await relaunch();
+    } catch (e) {
+      // Keep updateInfo so the banner's Install button can retry the download.
+      updateError = "Update failed: " + e;
+    } finally {
+      updateBusy = false;
+    }
+  }
+
   onMount(async () => {
     try {
       info = await api.appInfo();
@@ -132,6 +184,7 @@
       settings = await api.getSettings();
       applyTheme(settings.theme);
       showIntro = !settings.seen_intro;
+      if (settings.auto_update) checkForUpdates();
     } catch (e) {
       applyTheme("system");
     }
@@ -458,6 +511,22 @@
 <div class="app">
   <Sidebar {tab} {transfers} {info} on:nav={(e) => (tab = e.detail)} />
   <main class="main">
+    {#if (updateInfo && !updateDismissed) || updateError}
+      <div class="update-banner">
+        {#if updateError}
+          <span>{updateError}</span>
+          <button class="btn sm" on:click={() => (updateError = "")}>Dismiss</button>
+        {:else}
+          <span><strong>Studio {updateInfo.version}</strong> is available</span>
+          {#if updateBusy}
+            <span class="muted">Installing… {Math.round(updateProgress * 100)}%</span>
+          {:else}
+            <button class="btn sm primary" on:click={installUpdate}>Install &amp; restart</button>
+            <button class="btn sm" on:click={() => (updateDismissed = true)}>Dismiss</button>
+          {/if}
+        {/if}
+      </div>
+    {/if}
     {#if tab === "discover"}
       <Discover {startDownload} {goTransfers} focus={discoverFocus} />
     {:else if tab === "explore"}
@@ -475,7 +544,7 @@
         {resumeAll}
       />
     {:else if tab === "settings"}
-      <Settings {applyTheme} />
+      <Settings {applyTheme} checkUpdates={checkForUpdates} />
     {/if}
   </main>
 </div>

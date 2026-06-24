@@ -31,7 +31,9 @@ pub struct ModelHit {
     downloads: u64,
     likes: u64,
     gated: bool,
-    has_gguf: bool,
+    /// Weight formats this repo publishes (`gguf`, `safetensors`, `mlx`, …), shown
+    /// as per-format chips on the card. Canonical ids — pretty-printed in the UI.
+    formats: Vec<String>,
     license: Option<String>,
     tags: Vec<String>,
     last_modified: Option<String>,
@@ -42,7 +44,7 @@ fn to_hit(m: noema_core::hf::HfModel) -> ModelHit {
         name: m.name().to_string(),
         author: m.author().to_string(),
         license: m.license(),
-        has_gguf: m.has_gguf(),
+        formats: m.model_formats().into_iter().map(String::from).collect(),
         tags: m.display_tags(),
         id: m.id,
         downloads: m.downloads,
@@ -485,7 +487,10 @@ pub struct MeshItem {
     license: String,
     sha256: String,
     blake3: String,
+    /// Distinct peers seeding this over Iroh (excludes you).
     peers: usize,
+    /// Distinct peers seeding this over BitTorrent (excludes you).
+    bt_seeders: usize,
     /// BitTorrent magnet advertised by a seeding peer (empty when none); fed back
     /// into `add_from_mesh` so the receiver can join the swarm.
     magnet: String,
@@ -515,6 +520,7 @@ pub async fn mesh_search(
             sha256: m.sha256,
             blake3: m.blake3,
             peers: m.peers,
+            bt_seeders: m.bt_seeders,
             magnet: m.magnet,
             in_library: m.in_library,
             mine: m.mine,
@@ -798,6 +804,10 @@ pub async fn save_settings(
     engine.set_hf_download_enabled(settings.allow_hf_download);
     engine.rate_limit().set_bps(settings.cap_bps());
     engine.set_bittorrent_max_ratio(settings.bt_max_ratio.max(0.0));
+    engine.set_bittorrent_sequential(settings.bt_sequential);
+    // Time-of-day bandwidth schedule (alternative speed limits). Applied live; the
+    // schedule's "normal" caps are the manual caps above so disabling it restores them.
+    engine.set_bandwidth_schedule(settings.bandwidth_schedule());
     // Download-routing preference is runtime-adjustable (no restart) — apply it live
     // so the next download's plan honors the new bias immediately.
     engine.set_download_preference(noema_core::DownloadPreference::from_u8(
@@ -1261,10 +1271,13 @@ pub fn is_iroh_seeding(state: State<'_, AppState>, blake3: String) -> bool {
 #[derive(Serialize)]
 pub struct PeerRow {
     addr: String,
+    client: String,
     conn_kind: String,
     state: String,
     downloaded: u64,
     uploaded: u64,
+    down_bps: u64,
+    up_bps: u64,
 }
 
 fn to_peer_rows(peers: Vec<noema_core::transport::BtPeer>) -> Vec<PeerRow> {
@@ -1272,10 +1285,13 @@ fn to_peer_rows(peers: Vec<noema_core::transport::BtPeer>) -> Vec<PeerRow> {
         .into_iter()
         .map(|p| PeerRow {
             addr: p.addr,
+            client: p.client,
             conn_kind: p.conn_kind,
             state: p.state,
             downloaded: p.downloaded,
             uploaded: p.uploaded,
+            down_bps: p.down_bps,
+            up_bps: p.up_bps,
         })
         .collect()
 }
@@ -1324,6 +1340,55 @@ pub fn set_download_preference(state: State<'_, AppState>, preference: u8) {
 #[tauri::command]
 pub fn pause_all(state: State<'_, AppState>) {
     state.engine.request_pause();
+}
+
+/// The model's per-model stop-at-ratio override. `None` follows the global cap;
+/// `Some(0.0)` = unlimited for this model.
+#[tauri::command]
+pub fn bt_blob_ratio(state: State<'_, AppState>, blake3: String) -> Option<f64> {
+    state.engine.bittorrent_blob_max_ratio(&blake3)
+}
+
+/// Set (or clear, when `cap` is `None`) the per-model stop-at-ratio override.
+#[tauri::command]
+pub fn set_bt_blob_ratio(state: State<'_, AppState>, blake3: String, cap: Option<f64>) {
+    state.engine.set_bittorrent_blob_max_ratio(&blake3, cap);
+}
+
+/// Force a full piece re-hash of a seeded/downloaded blob against its torrent.
+#[tauri::command]
+pub async fn bt_force_recheck(state: State<'_, AppState>, blake3: String) -> Result<(), String> {
+    state
+        .engine
+        .bt_force_recheck(&blake3)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Ordered list of waiting (queued) transfer ids; front = next to start.
+#[tauri::command]
+pub fn download_queue_order(state: State<'_, AppState>) -> Vec<String> {
+    state
+        .engine
+        .download_queue_order()
+        .into_iter()
+        .map(|id| id.0)
+        .collect()
+}
+
+/// Reposition a queued transfer. `dir` is "up" | "down" | "top" | "bottom".
+#[tauri::command]
+pub fn queue_reorder(state: State<'_, AppState>, id: String, dir: String) {
+    let mv = match dir.as_str() {
+        "up" => noema_core::QueueMove::Up,
+        "down" => noema_core::QueueMove::Down,
+        "top" => noema_core::QueueMove::Top,
+        "bottom" => noema_core::QueueMove::Bottom,
+        _ => return,
+    };
+    state
+        .engine
+        .queue_reorder(&noema_core::transfer::TransferId(id), mv);
 }
 
 #[tauri::command]
