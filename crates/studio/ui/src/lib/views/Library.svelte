@@ -1,7 +1,7 @@
 <script>
   import { onMount } from "svelte";
   import { api, copyText } from "../api.js";
-  import { fmtSize } from "../format.js";
+  import { fmtSize, rowFormat } from "../format.js";
   import ShareComposer from "../ShareComposer.svelte";
 
   let items = [];
@@ -10,6 +10,7 @@
   let modelsDir = "";
   let composer = null;
   let confirmDelete = null;
+  let confirmShare = null;
   let toast = "";
 
   async function load() {
@@ -17,6 +18,19 @@
     error = "";
     try {
       items = await api.library();
+      // Enrich each row with its live Iroh-seeding state so the Library can show a
+      // "seeding · Iroh" pill symmetric with the engine-provided `bt_seeding` one.
+      // Best-effort and per-row: a failure just leaves the pill off.
+      await Promise.all(
+        items.map(async (m) => {
+          try {
+            m.iroh_seeding = await api.isIrohSeeding(m.blake3);
+          } catch (e) {
+            m.iroh_seeding = false;
+          }
+        })
+      );
+      items = items;
     } catch (e) {
       error = String(e);
     } finally {
@@ -36,10 +50,35 @@
   }
 
   async function toggleShare(m) {
+    // Turning sharing ON for a gated / restrictively-licensed model needs an
+    // explicit confirmation first (engine.needs_share_confirmation).
+    if (!m.shareable) {
+      try {
+        if (await api.shareNeedsConfirmation(m.manifest_id)) {
+          confirmShare = m;
+          // Re-render so the checkbox snaps back to off until the user confirms.
+          items = items;
+          return;
+        }
+      } catch (e) {}
+    }
     try {
       await api.setShare(m.blake3, m.sha256, !m.shareable);
       m.shareable = !m.shareable;
       items = items;
+    } catch (e) {
+      error = String(e);
+    }
+  }
+  async function acceptGatedShare() {
+    const m = confirmShare;
+    confirmShare = null;
+    if (!m) return;
+    try {
+      await api.confirmGatedShare(m.blake3, m.sha256);
+      m.shareable = true;
+      items = items;
+      flash("Sharing confirmed");
     } catch (e) {
       error = String(e);
     }
@@ -64,6 +103,19 @@
       error = String(e);
     }
   }
+  async function copyMagnet(m) {
+    try {
+      const magnet = await api.btMagnet(m.blake3);
+      if (!magnet) {
+        flash("No magnet yet — share this model over BitTorrent first");
+        return;
+      }
+      await copyText(magnet);
+      flash("Magnet link copied");
+    } catch (e) {
+      error = String(e);
+    }
+  }
   async function install(m) {
     try {
       const dir = (modelsDir || "").replace(/\/$/, "") + "/" + m.name.replace(/[^A-Za-z0-9._-]/g, "-");
@@ -75,17 +127,29 @@
     }
   }
   async function reveal(m) {
+    // Never hand the OS reveal an empty path (it would open the wrong place, or
+    // nothing). Prefer the installed file, fall back to the models dir.
+    const path = (m.install_path || modelsDir || "").trim();
+    if (!path) {
+      flash("No location to open — set a models folder in Settings");
+      return;
+    }
     try {
-      await api.reveal(m.install_path || modelsDir || "");
+      await api.reveal(path);
     } catch (e) {
-      error = String(e);
+      flash("Could not open the folder — the file may have moved");
     }
   }
   async function openFolder() {
+    const path = (modelsDir || "").trim();
+    if (!path) {
+      flash("No models folder set — choose one in Settings");
+      return;
+    }
     try {
-      await api.reveal(modelsDir);
+      await api.reveal(path);
     } catch (e) {
-      error = String(e);
+      flash("Could not open the folder — it may not exist yet");
     }
   }
 </script>
@@ -104,11 +168,24 @@
     <div class="card">
       <div class="card-head" style="cursor:default">
         <div class="grow">
-          <div class="title">{m.name}</div>
+          <div class="title">
+            {m.name}
+            {#if rowFormat(m.format, m.name)}<span class="pill">{rowFormat(m.format, m.name)}</span>{/if}
+          </div>
           <div class="muted">
             {fmtSize(m.size_bytes)}{m.quant ? " · " + m.quant : ""} ·
             {m.install_path ? "installed" : "cached"}{m.license ? " · " + m.license : ""}
           </div>
+          {#if m.shareable && (m.bt_seeding || m.iroh_seeding)}
+            <div class="muted pills">
+              {#if m.iroh_seeding}
+                <span class="pill ok" title="Seeding over Iroh">seeding · Iroh</span>
+              {/if}
+              {#if m.bt_seeding}
+                <span class="pill ok" title="Seeding over BitTorrent">seeding · BitTorrent</span>
+              {/if}
+            </div>
+          {/if}
         </div>
         <label class="switch" title="Share worldwide">
           <input type="checkbox" checked={m.shareable} on:change={() => toggleShare(m)} />
@@ -120,9 +197,12 @@
         <span class="muted mono">{m.blake3.slice(0, 16)}…</span>
         <div class="spacer"></div>
         <button class="btn sm" on:click={() => copyLink(m)}>Copy link</button>
+        {#if m.bt_seeding}
+          <button class="btn sm" on:click={() => copyMagnet(m)} title="Copy the BitTorrent magnet for this model">Copy magnet</button>
+        {/if}
         <button class="btn sm" on:click={() => (composer = { model: m })}>Edit</button>
         {#if m.install_path}
-          <button class="btn sm" on:click={() => reveal(m)}>Reveal</button>
+          <button class="btn sm" on:click={() => reveal(m)} title="Show the installed file in Finder">Open folder</button>
         {:else}
           <button class="btn sm" on:click={() => install(m)}>Install</button>
         {/if}
@@ -153,5 +233,22 @@
       if (msg) flash(msg);
     }}
   />
+{/if}
+
+{#if confirmShare}
+  <div class="modal-backdrop">
+    <div class="modal" style="max-width:440px">
+      <div class="modal-head"><h3>Share this model with peers?</h3></div>
+      <p class="muted">
+        <strong>{confirmShare.name}</strong> is {confirmShare.gated ? "gated" : "restrictively licensed"}.
+        Sharing it re-seeds it to peers worldwide. Only do this if its license permits
+        redistribution — gated and restrictive models stay private until you confirm.
+      </p>
+      <div class="actions">
+        <button class="btn" on:click={() => (confirmShare = null)}>Cancel</button>
+        <button class="btn primary" on:click={acceptGatedShare}>Share it</button>
+      </div>
+    </div>
+  </div>
 {/if}
 {#if toast}<div class="toast">{toast}</div>{/if}

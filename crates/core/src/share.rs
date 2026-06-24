@@ -53,6 +53,12 @@ pub struct ShareTarget {
     /// Where this came from — e.g. the old Hugging Face URL, now gone.
     #[serde(rename = "o", default, skip_serializing_if = "String::is_empty")]
     pub origin: String,
+    /// BitTorrent magnet (info-hash) when the sender is seeding this file over
+    /// BitTorrent — lets a receiver join the swarm straight from the link. Like the
+    /// other descriptive fields it is "sender says"; the bytes are still verified
+    /// against the content hashes above.
+    #[serde(rename = "mag", default, skip_serializing_if = "String::is_empty")]
+    pub magnet: String,
 }
 
 impl ShareTarget {
@@ -223,6 +229,7 @@ mod tests {
             quant: "Q4_K_M".into(),
             desc: "Rescued reupload after the repo was removed.".into(),
             origin: "huggingface.co/Qwen/Qwen3-8B-GGUF".into(),
+            magnet: "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567".into(),
         };
         let token = t.encode();
         assert!(token.starts_with("atlas1:"));

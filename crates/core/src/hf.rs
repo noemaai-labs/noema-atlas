@@ -76,13 +76,13 @@ pub struct HfFile {
 
 impl HfFile {
     pub fn format(&self) -> Option<String> {
-        let ext = self.rfilename.rsplit('.').next()?.to_ascii_lowercase();
-        match ext.as_str() {
-            "gguf" => Some("gguf".into()),
-            "safetensors" => Some("safetensors".into()),
-            "json" => Some("json".into()),
-            _ => None,
+        // Sidecar config/index files are JSON; otherwise defer to the shared
+        // detector so the HF browser labels the same formats as the rest of the
+        // app (GGUF, Safetensors, ONNX, MLX, PyTorch, Core ML, …).
+        if self.rfilename.to_ascii_lowercase().ends_with(".json") {
+            return Some("json".into());
         }
+        crate::inspect::format_from_name(&self.rfilename)
     }
     /// A weight file worth surfacing as a download (and verifiable via sha256).
     pub fn is_downloadable_weight(&self) -> bool {
@@ -571,7 +571,6 @@ pub fn manifest_for(detail: &HfModelDetail, file: &HfFile) -> Result<Manifest> {
                 SourceClass::Huggingface,
                 SourceClass::HttpsMirror,
                 SourceClass::Iroh,
-                SourceClass::Ipfs,
             ],
         },
         artifacts: vec![Artifact {
@@ -687,7 +686,6 @@ pub fn manifest_for_gguf_quant(detail: &HfModelDetail, files: &[HfFile]) -> Resu
                 SourceClass::Huggingface,
                 SourceClass::HttpsMirror,
                 SourceClass::Iroh,
-                SourceClass::Ipfs,
             ],
         },
         artifacts,
@@ -816,7 +814,6 @@ pub fn manifest_for_bundle(detail: &HfModelDetail) -> Result<Manifest> {
                 SourceClass::Huggingface,
                 SourceClass::HttpsMirror,
                 SourceClass::Iroh,
-                SourceClass::Ipfs,
             ],
         },
         artifacts,

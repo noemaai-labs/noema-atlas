@@ -111,10 +111,17 @@ impl RedistributionClass {
         })
     }
 
-    /// Whether public peer redistribution (IPFS/BT/Iroh/public LAN advertising)
-    /// is permitted for this class.
+    /// Whether public peer redistribution (BitTorrent/Iroh advertising) is
+    /// permitted for this class. Public-by-default: open AND unknown/unclassified
+    /// licenses (`PublicP2pAllowed`, `PublicDownloadOnly`) may be reseeded; only the
+    /// explicitly restrictive classes (`GatedNoRedistribution`, `EnterprisePrivate`)
+    /// are withheld — and those are shareable after the user's one-time confirmation
+    /// (handled at the share-toggle layer), not blocked outright.
     pub fn allows_public_redistribution(&self) -> bool {
-        matches!(self, RedistributionClass::PublicP2pAllowed)
+        !matches!(
+            self,
+            RedistributionClass::GatedNoRedistribution | RedistributionClass::EnterprisePrivate
+        )
     }
 
     /// Classify a license tag (SPDX or HF-style) into a redistribution policy:
@@ -184,7 +191,7 @@ pub struct Access {
     #[serde(default = "default_true")]
     pub require_signed_manifest: bool,
     /// Which source classes the publisher permits for this model.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_source_classes")]
     pub allowed_source_classes: Vec<SourceClass>,
 }
 
@@ -192,12 +199,41 @@ fn default_true() -> bool {
     true
 }
 
+/// Deserialize a `Vec<Source>`, silently dropping any entry whose `type` this build
+/// no longer understands — e.g. an `ipfs` source in a manifest published before IPFS
+/// was removed. Without this, one stale source type fails the *whole* manifest, which
+/// breaks Explore/Library for any pre-existing data. The dropped source is simply
+/// unavailable as a route; the artifact's other sources and its content hashes are
+/// untouched (integrity is always the manifest hash, never the source list).
+fn lenient_sources<'de, D>(d: D) -> std::result::Result<Vec<Source>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Vec::<serde_json::Value>::deserialize(d)?;
+    Ok(raw
+        .into_iter()
+        .filter_map(|v| serde_json::from_value(v).ok())
+        .collect())
+}
+
+/// Same tolerance for `allowed_source_classes`: drop a class name this build does not
+/// know (e.g. `ipfs`) rather than failing the manifest.
+fn lenient_source_classes<'de, D>(d: D) -> std::result::Result<Vec<SourceClass>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Vec::<serde_json::Value>::deserialize(d)?;
+    Ok(raw
+        .into_iter()
+        .filter_map(|v| serde_json::from_value(v).ok())
+        .collect())
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceClass {
     Huggingface,
     HttpsMirror,
-    Ipfs,
     Iroh,
     BittorrentV2,
     LanPeer,
@@ -217,7 +253,7 @@ pub struct Artifact {
     /// File format, e.g. `gguf`, `safetensors`, `json`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_sources")]
     pub sources: Vec<Source>,
 }
 
@@ -241,13 +277,6 @@ pub enum Source {
     },
     HttpsMirror {
         url: String,
-        #[serde(default)]
-        auth: AuthPolicy,
-    },
-    Ipfs {
-        cid: String,
-        #[serde(default)]
-        retrieval: Vec<String>,
         #[serde(default)]
         auth: AuthPolicy,
     },
@@ -280,7 +309,6 @@ impl Source {
         match self {
             Source::Huggingface { .. } => SourceClass::Huggingface,
             Source::HttpsMirror { .. } => SourceClass::HttpsMirror,
-            Source::Ipfs { .. } => SourceClass::Ipfs,
             Source::Iroh { .. } => SourceClass::Iroh,
             Source::BittorrentV2 { .. } => SourceClass::BittorrentV2,
             Source::LanPeer { .. } => SourceClass::LanPeer,
@@ -300,7 +328,6 @@ impl Source {
                 format!("hf:{repo_id}@{revision}/{path}")
             }
             Source::HttpsMirror { url, .. } => format!("https:{url}"),
-            Source::Ipfs { cid, .. } => format!("ipfs:{cid}"),
             Source::Iroh { blob_hash, .. } => format!("iroh:{blob_hash}"),
             Source::BittorrentV2 { magnet_uri, .. } => format!("btv2:{magnet_uri}"),
             Source::LanPeer { url, .. } => format!("lan:{url}"),
@@ -312,7 +339,6 @@ impl Source {
         match self {
             Source::Huggingface { auth, .. }
             | Source::HttpsMirror { auth, .. }
-            | Source::Ipfs { auth, .. }
             | Source::Iroh { auth, .. }
             | Source::BittorrentV2 { auth, .. }
             | Source::LanPeer { auth, .. } => *auth,
@@ -323,7 +349,7 @@ impl Source {
     /// Whether this source class is reachable purely with public discovery (and
     /// therefore subject to redistribution policy when advertising).
     pub fn is_public_distribution(&self) -> bool {
-        matches!(self, Source::Ipfs { .. } | Source::Iroh { .. })
+        matches!(self, Source::Iroh { .. } | Source::BittorrentV2 { .. })
     }
 }
 
@@ -415,10 +441,7 @@ impl Manifest {
                 s.auth() == AuthPolicy::None
                     && matches!(
                         s.class(),
-                        SourceClass::Huggingface
-                            | SourceClass::HttpsMirror
-                            | SourceClass::Ipfs
-                            | SourceClass::Iroh
+                        SourceClass::Huggingface | SourceClass::HttpsMirror | SourceClass::Iroh
                     )
             })
         })
@@ -658,6 +681,30 @@ mod tests {
     }
 
     #[test]
+    fn legacy_ipfs_source_and_class_are_dropped_not_fatal() {
+        // A manifest published before IPFS removal carries `{"type":"ipfs",...}` and
+        // "ipfs" in allowed_source_classes. The new build must LOAD it (dropping the
+        // ipfs bits) instead of failing the whole manifest with "unknown variant
+        // `ipfs`" — which previously broke Explore/Library on any pre-existing data.
+        let m = sample();
+        let original_sources = m.artifacts[0].sources.len();
+        let original_classes = m.access.allowed_source_classes.clone();
+        let mut v = serde_json::to_value(&m).unwrap();
+        v["artifacts"][0]["sources"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"type":"ipfs","cid":"bafy","retrieval":[],"auth":"none"}));
+        v["access"]["allowed_source_classes"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!("ipfs"));
+        let back = Manifest::from_json(&serde_json::to_vec(&v).unwrap())
+            .expect("legacy ipfs manifest must still deserialize");
+        assert_eq!(back.artifacts[0].sources.len(), original_sources);
+        assert_eq!(back.access.allowed_source_classes, original_classes);
+    }
+
+    #[test]
     fn canonical_bytes_ignore_signatures_and_are_stable() {
         let mut m = sample();
         let c1 = m.canonical_bytes().unwrap();
@@ -699,13 +746,13 @@ mod tests {
 
     #[test]
     fn source_tagging() {
-        let s = Source::Ipfs {
-            cid: "bafy123".into(),
-            retrieval: vec!["gateway".into()],
+        let s = Source::Iroh {
+            blob_hash: "abc123".into(),
+            tickets: vec!["ticket".into()],
             auth: AuthPolicy::None,
         };
         let j = serde_json::to_string(&s).unwrap();
-        assert!(j.contains("\"type\":\"ipfs\""));
+        assert!(j.contains("\"type\":\"iroh\""));
         let back: Source = serde_json::from_str(&j).unwrap();
         assert_eq!(s, back);
     }

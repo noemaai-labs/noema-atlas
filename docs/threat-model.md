@@ -21,7 +21,7 @@ don't match a signed manifest.
 |-----------|----------|
 | Signed manifest from a key in the user's trust store | **Trusted** |
 | Manifest signature math (embedded key) | Verifiable, not inherently trusted |
-| Any transport source (HF, mirror, IPFS, peer) | **Untrusted** for content |
+| Any transport source (HF, mirror, peer) | **Untrusted** for content |
 | OS keystore | Trusted for secret storage |
 | Local CAS blobs (post-commit) | Trusted (immutable, verified) |
 
@@ -37,7 +37,7 @@ don't match a signed manifest.
 | 6 | **Path traversal** via artifact paths | `validate_artifact_path` rejects `..`, absolute, drive-letter, NUL on import and before every write. (`path_traversal_artifact_is_rejected_on_import`) |
 | 7 | **Stolen tokens** | Tokens live only in the OS keystore (Keychain / Credential Manager / kernel keyutils) or read-only env; never written to plaintext files in the cache. |
 | 8 | **Redistribution of gated/licensed models** | License *enforcement* is **out of scope by design** — Atlas is a content-addressed P2P service that verifies *bytes*, not licenses. But the *default* is conservative: with worldwide sharing on (the default), only **openly-licensed** public models are auto-seeded. **Gated/token-walled and restrictively-licensed** content, plus **privately-imported** files, are NOT auto-shared unless the operator opts in — globally ("also share gated/licensed models" in Settings) or per-model — so a license-walled or personal file isn't broadcast by surprise. Once opted in, Atlas doesn't police it; **redistribution-licence compliance is the operator's responsibility** (a disclosure is shown on first run). (`blob_shareable_default_public`) |
-| 9 | **Untrusted IPFS gateway / DHT** | Gateways are treated as untrusted transports; bytes are verified client-side, so a lying gateway only causes a retry/fail, never acceptance. (`ipfs_gateway_fetch_matches_manifest`) |
+| 9 | **Untrusted P2P peer / DHT** | Peers (Iroh, BitTorrent) are treated as untrusted transports; bytes are verified client-side, so a lying peer only causes a retry/fail, never acceptance. |
 | 10 | **Cache eviction races / interrupted writes / power loss** | Downloads write to `tmp/`; commit is an atomic `rename`; blobs are immutable & made read-only; partial files never become blobs. |
 | 11 | **Over-long / hostile responses** | Streaming guards reject a source that sends more than the declared size; safetensors header parsing is size-capped. |
 | 12 | **DoS via huge manifests / leaf lists** | Manifests are bounded JSON; fetched leaf lists are validated against the signed Merkle root before trust. |

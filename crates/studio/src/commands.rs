@@ -223,9 +223,12 @@ pub async fn model_detail(state: State<'_, AppState>, id: String) -> Result<Mode
     })
 }
 
-/// Progress event payload pushed to the webview during a download.
+/// Progress event payload pushed to the webview during a download. `transfer_id`
+/// keys the per-row card in the front-end's `transfers` map (it equals the
+/// manifest id, the engine's stable transfer key).
 #[derive(Serialize, Clone)]
 pub struct ProgressEvent {
+    transfer_id: String,
     manifest_id: String,
     artifact: String,
     source: Option<String>,
@@ -236,6 +239,11 @@ pub struct ProgressEvent {
     failover_reason: Option<String>,
     /// Verified offset a resumed source attempt started from.
     effective_start: Option<u64>,
+    /// Connected swarm peers (BitTorrent; `0` for byte-only sources).
+    peers: u32,
+    /// Cumulative bytes uploaded to peers this transfer (BitTorrent seeding) —
+    /// lets the UI show a seed ratio. `0` for non-swarm transports.
+    uploaded_bytes: u64,
 }
 
 /// Build the `download://progress` emitter handed to the engine's downloader.
@@ -244,6 +252,7 @@ fn progress_emitter(app: AppHandle) -> Progress {
         let _ = app.emit(
             "download://progress",
             ProgressEvent {
+                transfer_id: p.manifest_id.clone(),
                 manifest_id: p.manifest_id,
                 artifact: p.artifact_path,
                 source: p.source_id,
@@ -252,6 +261,8 @@ fn progress_emitter(app: AppHandle) -> Progress {
                 phase: p.phase.to_string(),
                 failover_reason: p.failover_reason,
                 effective_start: p.effective_start,
+                peers: p.peers,
+                uploaded_bytes: p.uploaded_bytes,
             },
         );
     })
@@ -276,44 +287,71 @@ fn download_end_status(e: &noema_core::Error) -> &'static str {
     }
 }
 
-/// A progress emitter that also records the engine's manifest id from the first
-/// tick, so a download started by content/link (where the id is synthesized
-/// internally) can still be resumed later from the Transfers page.
-fn capturing_emitter(
-    app: AppHandle,
-    id_cell: std::sync::Arc<std::sync::Mutex<String>>,
-) -> Progress {
-    Arc::new(move |p: DownloadProgress| {
-        if let Ok(mut g) = id_cell.lock() {
-            if g.is_empty() {
-                g.clone_from(&p.manifest_id);
-            }
-        }
-        let _ = app.emit(
-            "download://progress",
-            ProgressEvent {
-                manifest_id: p.manifest_id,
-                artifact: p.artifact_path,
-                source: p.source_id,
-                bytes_done: p.bytes_done,
-                bytes_total: p.bytes_total,
-                phase: p.phase.to_string(),
-                failover_reason: p.failover_reason,
-                effective_start: p.effective_start,
-            },
-        );
-    })
+/// A double-press of Resume hits the engine's already-running guard, which is not
+/// a real failure — the first run is still live and will emit its own `done`. Detect
+/// it so the command can stay silent instead of flipping the live card to "error".
+fn is_already_running(e: &noema_core::Error) -> bool {
+    matches!(e, noema_core::Error::Other(msg) if msg.contains("already running"))
+}
+
+/// The engine's deterministic manifest id for a content / link download
+/// (`mdl_p2p_<seed[..12]>`, seed = sha256 if 64 chars else blake3). Mirrors
+/// `content_manifest` in the engine so the front-end can re-key its provisional
+/// row by the exact id before the download starts, without a FIFO adopt.
+fn content_manifest_id(sha256: &str, blake3: &str) -> String {
+    let seed = if sha256.len() == 64 { sha256 } else { blake3 };
+    format!("mdl_p2p_{}", &seed[..12.min(seed.len())])
 }
 
 /// Import the chosen variant's manifest, then download it, streaming verified
 /// bytes into the cache. Emits `download://progress` per chunk-boundary and
 /// `download://done` at the end.
+/// Tell the front-end the engine's real transfer id for a download it kicked off
+/// with a provisional (`tmp_…`) key, so it can re-key *its own* row deterministically
+/// instead of guessing via FIFO. Emitted right after the manifest is registered,
+/// before the (long) download await.
+#[derive(Serialize, Clone)]
+struct RegisteredEvent {
+    client_ref: String,
+    transfer_id: String,
+}
+
+fn emit_registered(app: &AppHandle, client_ref: &Option<String>, transfer_id: &str) {
+    if let Some(client_ref) = client_ref {
+        if !client_ref.is_empty() {
+            let _ = app.emit(
+                "download://registered",
+                RegisteredEvent {
+                    client_ref: client_ref.clone(),
+                    transfer_id: transfer_id.to_string(),
+                },
+            );
+        }
+    }
+}
+
+/// Emit the terminal `download://done` for one transfer id, settling its card.
+/// `status` is one of done/paused/stopped/waiting/error; `message` carries the
+/// error text when relevant.
+fn emit_download_done(app: &AppHandle, mid: &str, status: &str, message: Option<&str>) {
+    let mut payload = serde_json::json!({
+        "transfer_id": mid,
+        "manifest_id": mid,
+        "status": status,
+    });
+    if let Some(msg) = message {
+        payload["message"] = serde_json::Value::String(msg.to_string());
+    }
+    let _ = app.emit("download://done", payload);
+}
+
 #[tauri::command]
 pub async fn download_model(
     app: AppHandle,
     state: State<'_, AppState>,
     id: String,
     file: Option<String>,
+    client_ref: Option<String>,
 ) -> Result<DownloadResult, String> {
     let engine = state.engine.clone();
     let detail = engine
@@ -351,13 +389,18 @@ pub async fn download_model(
 
     let manifest_id = import.manifest_id.clone();
 
+    // Register up front so the front-end can re-key its provisional row by this
+    // exact id before any progress arrives (no FIFO adopt).
+    let transfer = engine.register_transfer(&manifest_id);
+    emit_registered(&app, &client_ref, &manifest_id);
+
     let progress = progress_emitter(app.clone());
 
-    match engine.download(&manifest_id, Some(progress)).await {
+    match engine.run_download(&transfer, Some(progress)).await {
         Ok(out) => {
             let _ = app.emit(
                 "download://done",
-                serde_json::json!({ "manifest_id": out.manifest_id, "status": "done" }),
+                serde_json::json!({ "transfer_id": out.manifest_id, "manifest_id": out.manifest_id, "status": "done" }),
             );
             Ok(DownloadResult {
                 manifest_id: out.manifest_id,
@@ -370,6 +413,7 @@ pub async fn download_model(
             let _ = app.emit(
                 "download://done",
                 serde_json::json!({
+                    "transfer_id": manifest_id,
                     "manifest_id": manifest_id,
                     "status": download_end_status(&e),
                     "message": e.to_string(),
@@ -398,17 +442,27 @@ pub async fn resume_download(
         Ok(out) => {
             let _ = app.emit(
                 "download://done",
-                serde_json::json!({ "manifest_id": out.manifest_id, "status": "done" }),
+                serde_json::json!({ "transfer_id": out.manifest_id, "manifest_id": out.manifest_id, "status": "done" }),
             );
             Ok(DownloadResult {
                 manifest_id: out.manifest_id,
                 artifacts: out.artifacts.len(),
             })
         }
+        Err(e) if is_already_running(&e) => {
+            // A double-press of Resume: the first run is still live and owns the
+            // card. Stay silent — emitting a `done` here would flip the live row to
+            // an error. The in-flight transfer emits its own terminal event.
+            Ok(DownloadResult {
+                manifest_id,
+                artifacts: 0,
+            })
+        }
         Err(e) => {
             let _ = app.emit(
                 "download://done",
                 serde_json::json!({
+                    "transfer_id": manifest_id,
                     "manifest_id": manifest_id,
                     "status": download_end_status(&e),
                     "message": e.to_string(),
@@ -432,6 +486,9 @@ pub struct MeshItem {
     sha256: String,
     blake3: String,
     peers: usize,
+    /// BitTorrent magnet advertised by a seeding peer (empty when none); fed back
+    /// into `add_from_mesh` so the receiver can join the swarm.
+    magnet: String,
     in_library: bool,
     mine: bool,
     devices: Vec<String>,
@@ -443,10 +500,9 @@ pub async fn mesh_search(
     state: State<'_, AppState>,
     query: String,
 ) -> Result<Vec<MeshItem>, String> {
-    let group = noema_core::identity::group_id(&StudioSettings::load(&state.root).group_code);
     let rows = state
         .engine
-        .network_catalog(&query, group)
+        .network_catalog(&query)
         .await
         .map_err(|e| e.to_string())?;
     Ok(rows
@@ -459,6 +515,7 @@ pub async fn mesh_search(
             sha256: m.sha256,
             blake3: m.blake3,
             peers: m.peers,
+            magnet: m.magnet,
             in_library: m.in_library,
             mine: m.mine,
             devices: m.devices,
@@ -473,46 +530,70 @@ pub async fn add_by_link(
     app: AppHandle,
     state: State<'_, AppState>,
     link: String,
+    client_ref: Option<String>,
 ) -> Result<usize, String> {
     let link = link.trim().to_string();
     if link.is_empty() {
         return Err("paste a share link (atlas1:… or atlasb1:…)".into());
     }
     let engine = state.engine.clone();
-    let id_cell = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-    let progress = capturing_emitter(app.clone(), id_cell.clone());
 
-    let result = if noema_core::is_bundle_link(&link) {
+    if noema_core::is_bundle_link(&link) {
+        // A bundle is N independent files, each with its own deterministic
+        // manifest id. The engine downloads them one by one (each emitting progress
+        // under its own id), so the UI sees N cards. Drive them per-file here: the
+        // FIRST file re-keys the provisional row the UI created (via client_ref),
+        // and every file gets its own `registered` + terminal `done`. Without the
+        // per-file done, files 2..N spawned orphan cards (created on first progress)
+        // that never settled and lingered forever.
         let bundle = noema_core::ShareBundle::decode(&link).map_err(|e| e.to_string())?;
-        engine
-            .add_bundle(bundle, Some(progress))
-            .await
-            .map(|v| v.len())
-    } else {
-        let target = noema_core::ShareTarget::decode(&link).map_err(|e| e.to_string())?;
-        engine
-            .add_by_content(target, Some(progress))
-            .await
-            .map(|o| o.artifacts.len())
-    };
-    let mid = id_cell.lock().map(|g| g.clone()).unwrap_or_default();
-    match result {
-        Ok(n) => {
-            let _ = app.emit(
-                "download://done",
-                serde_json::json!({ "manifest_id": mid, "status": "done" }),
-            );
-            Ok(n)
+        let files: Vec<_> = bundle
+            .files
+            .into_iter()
+            .filter(|f| f.has_content_id())
+            .collect();
+        if files.is_empty() {
+            return Err("bundle had no fetchable files".into());
+        }
+        let mut done = 0usize;
+        for (i, file) in files.into_iter().enumerate() {
+            let mid = content_manifest_id(&file.sha256, &file.blake3);
+            // Register up front so Pause / Stop work before the first byte (see
+            // `download_model`); `add_by_content` reuses this id.
+            engine.register_transfer(&mid);
+            // Re-key the one provisional row to the first file; later files have no
+            // provisional row and surface as their own cards on first progress.
+            let cref = if i == 0 { client_ref.clone() } else { None };
+            emit_registered(&app, &cref, &mid);
+            let progress = progress_emitter(app.clone());
+            match engine.add_by_content(file, Some(progress)).await {
+                Ok(out) => {
+                    emit_download_done(&app, &mid, "done", None);
+                    done += out.artifacts.len();
+                }
+                Err(e) => {
+                    // Settle this file's card so it can't linger; keep going so a
+                    // single bad shard doesn't strand the rest as orphan cards.
+                    emit_download_done(&app, &mid, download_end_status(&e), Some(&e.to_string()));
+                }
+            }
+        }
+        return Ok(done);
+    }
+
+    let target = noema_core::ShareTarget::decode(&link).map_err(|e| e.to_string())?;
+    let mid = content_manifest_id(&target.sha256, &target.blake3);
+    // Register up front so Pause / Stop have a control before the first byte.
+    engine.register_transfer(&mid);
+    emit_registered(&app, &client_ref, &mid);
+    let progress = progress_emitter(app.clone());
+    match engine.add_by_content(target, Some(progress)).await {
+        Ok(out) => {
+            emit_download_done(&app, &mid, "done", None);
+            Ok(out.artifacts.len())
         }
         Err(e) => {
-            let _ = app.emit(
-                "download://done",
-                serde_json::json!({
-                    "manifest_id": mid,
-                    "status": download_end_status(&e),
-                    "message": e.to_string(),
-                }),
-            );
+            emit_download_done(&app, &mid, download_end_status(&e), Some(&e.to_string()));
             Ok(0)
         }
     }
@@ -534,6 +615,11 @@ pub struct LibItem {
     shareable: bool,
     gated: bool,
     install_path: Option<String>,
+    /// Whether this model is being seeded over BitTorrent in the live session — so
+    /// the Library can show a truthful "sharing" state even when only BT is active.
+    bt_seeding: bool,
+    /// Recognized weight format tag (`gguf`, `safetensors`, …); surfaced as a badge.
+    format: Option<String>,
 }
 
 #[tauri::command]
@@ -542,6 +628,7 @@ pub fn list_library(state: State<'_, AppState>) -> Result<Vec<LibItem>, String> 
     Ok(models
         .into_iter()
         .map(|m| LibItem {
+            bt_seeding: state.engine.is_bt_seeding(&m.blake3),
             manifest_id: m.manifest_id,
             name: m.name,
             size_bytes: m.size_bytes,
@@ -555,6 +642,7 @@ pub fn list_library(state: State<'_, AppState>) -> Result<Vec<LibItem>, String> 
             shareable: m.shareable,
             gated: m.gated,
             install_path: m.install_path,
+            format: m.format,
         })
         .collect())
 }
@@ -592,6 +680,18 @@ pub fn source_health(state: State<'_, AppState>) -> Result<serde_json::Value, St
         .collect::<Vec<_>>()))
 }
 
+/// Re-announce the now-shareable catalog to the tracker (no-op when the seeder
+/// isn't running). Shared by `set_share` and `confirm_gated_share`.
+async fn announce_shared(state: &AppState) {
+    if let Some(w) = state.share.lock().await.as_ref() {
+        if let Ok(items) = state.engine.share_announce_items() {
+            w.seeder_handle()
+                .announce(&items, &StudioSettings::load(&state.root).tracker())
+                .await;
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn set_share(
     state: State<'_, AppState>,
@@ -603,18 +703,48 @@ pub async fn set_share(
         .engine
         .set_model_shared(&blake3, &sha256, on)
         .map_err(|e| e.to_string())?;
-    if let Some(w) = state.share.lock().await.as_ref() {
-        if on {
-            if let Ok(items) = state.engine.share_announce_items() {
-                w.seeder_handle()
-                    .announce(&items, &StudioSettings::load(&state.root).tracker())
-                    .await;
-            }
-        } else {
+    if on {
+        announce_shared(&state).await;
+    } else {
+        // Stop seeding over BitTorrent (engine-owned) as well as Iroh (UI-held).
+        let _ = state.engine.unseed_bittorrent(&blake3).await;
+        if let Some(w) = state.share.lock().await.as_ref() {
             w.unseed_and_disconnect(&blake3).await;
-            state.engine.withdraw_from_tracker(&[blake3.clone()]).await;
         }
+        state.engine.withdraw_from_tracker(&[blake3.clone()]).await;
     }
+    Ok(())
+}
+
+/// Whether turning sharing on for this model needs an explicit confirmation —
+/// true for gated / restrictively-licensed content the user hasn't confirmed
+/// before. The Library shows a modal and, on accept, calls `confirm_gated_share`.
+#[tauri::command]
+pub fn share_needs_confirmation(
+    state: State<'_, AppState>,
+    manifest_id: String,
+) -> Result<bool, String> {
+    let manifest = state
+        .engine
+        .get_manifest(&manifest_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "model not found in library".to_string())?;
+    Ok(state.engine.needs_share_confirmation(&manifest))
+}
+
+/// Record the explicit confirm-before-share for a gated / restrictive model and
+/// announce it. Called after the user accepts the confirmation modal.
+#[tauri::command]
+pub async fn confirm_gated_share(
+    state: State<'_, AppState>,
+    blake3: String,
+    sha256: String,
+) -> Result<(), String> {
+    state
+        .engine
+        .confirm_gated_share(&blake3, &sha256)
+        .map_err(|e| e.to_string())?;
+    announce_shared(&state).await;
     Ok(())
 }
 
@@ -658,20 +788,51 @@ pub fn get_settings(state: State<'_, AppState>) -> StudioSettings {
 /// restart. Proxy / mirror / tracker live in `EngineConfig` and take effect on
 /// next launch — the front-end says as much.
 #[tauri::command]
-pub fn save_settings(state: State<'_, AppState>, settings: StudioSettings) -> Result<(), String> {
+pub async fn save_settings(
+    state: State<'_, AppState>,
+    settings: StudioSettings,
+) -> Result<(), String> {
     settings.save(&state.root).map_err(|e| e.to_string())?;
     let engine = &state.engine;
     engine.set_max_download_connections(settings.download_connections.max(1) as usize);
-    engine.set_share_gated_enabled(settings.share_gated);
     engine.set_hf_download_enabled(settings.allow_hf_download);
     engine.rate_limit().set_bps(settings.cap_bps());
+    engine.set_bittorrent_max_ratio(settings.bt_max_ratio.max(0.0));
+    // Download-routing preference is runtime-adjustable (no restart) — apply it live
+    // so the next download's plan honors the new bias immediately.
+    engine.set_download_preference(noema_core::DownloadPreference::from_u8(
+        settings.download_preference,
+    ));
+
+    // Turning the gated-share toggle OFF must promptly stop sharing every confirmed
+    // gated model — clear the confirmations and sever its blobs (Iroh + BitTorrent)
+    // — instead of leaving them seeding until the slow background reconcile.
+    // `revoke_gated_shares` clears the overrides and tears down BT seeding itself,
+    // returning each cleared `(blake3, sha256)` so we Iroh-unseed + withdraw here.
+    // Best-effort.
+    let gated_was_on = engine.share_gated_enabled();
+    if gated_was_on && !settings.share_gated {
+        engine.set_share_gated_enabled(false);
+        let cleared = engine.revoke_gated_shares().await.unwrap_or_default();
+        let blake3s: Vec<String> = cleared.into_iter().map(|(b3, _)| b3).collect();
+        if let Some(w) = state.share.lock().await.as_ref() {
+            for b3 in &blake3s {
+                w.unseed_and_disconnect(b3).await;
+            }
+        }
+        if !blake3s.is_empty() {
+            engine.withdraw_from_tracker(&blake3s).await;
+        }
+    } else {
+        engine.set_share_gated_enabled(settings.share_gated);
+    }
     Ok(())
 }
 
 /// Start the worldwide seeder (idempotent), storing the handle in managed state.
 /// Shared by the `start_worldwide` command and the launch `setup` hook.
 pub async fn start_worldwide_inner(
-    engine: &noema_core::Engine,
+    engine: &Arc<noema_core::Engine>,
     root: &std::path::Path,
     share: &tokio::sync::Mutex<Option<noema_core::engine::WorldwideShare>>,
 ) -> anyhow::Result<String> {
@@ -690,7 +851,7 @@ pub async fn start_worldwide_inner(
 
 #[tauri::command]
 pub async fn start_worldwide(state: State<'_, AppState>) -> Result<String, String> {
-    start_worldwide_inner(state.engine.as_ref(), &state.root, &state.share)
+    start_worldwide_inner(&state.engine, &state.root, &state.share)
         .await
         .map_err(|e| e.to_string())
 }
@@ -714,62 +875,60 @@ pub async fn worldwide_status(state: State<'_, AppState>) -> Result<serde_json::
     }))
 }
 
-#[tauri::command]
-pub async fn seeder_metrics(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    let guard = state.share.lock().await;
-    Ok(match guard.as_ref() {
-        Some(w) => serde_json::json!({ "sharing": true, "active_uploads": w.active_uploads() }),
-        None => serde_json::json!({ "sharing": false, "active_uploads": 0 }),
-    })
-}
-
-/// Per-model upload activity: every shared model in the library together with
-/// how many peers are pulling it right now. Drives the live "sharing" view.
+/// Per-model upload activity: every shared model in the library together with how
+/// many peers are pulling it right now (Iroh) and whether it's being seeded over
+/// BitTorrent. Drives the live "sharing" view. BitTorrent seeding is engine-owned
+/// and runs even when the Iroh worldwide session isn't up, so a model can be
+/// truthfully "sharing" over BT alone.
 #[tauri::command]
 pub async fn uploads_list(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    let guard = state.share.lock().await;
-    let Some(w) = guard.as_ref() else {
-        return Ok(serde_json::json!({ "sharing": false, "total": 0, "models": [] }));
-    };
+    let iroh_live = state.share.lock().await.is_some();
     let models = state.engine.installed_models().map_err(|e| e.to_string())?;
     let mut rows = Vec::new();
     let mut total: u64 = 0;
+    let mut bt_seeding = false;
     for m in models.into_iter().filter(|m| m.shareable) {
-        let uploads = w.active_uploads_for(&m.blake3);
+        // Iroh peers actively pulling this blob (0 when the worldwide session is off).
+        let uploads = {
+            let guard = state.share.lock().await;
+            guard
+                .as_ref()
+                .map(|w| w.active_uploads_for(&m.blake3))
+                .unwrap_or(0)
+        };
+        let seeding_bt = state.engine.is_bt_seeding(&m.blake3);
+        bt_seeding |= seeding_bt;
         total += uploads;
         rows.push(serde_json::json!({
             "name": m.name,
             "blake3": m.blake3,
             "uploads": uploads,
+            "bt_seeding": seeding_bt,
+            // Whether the live Iroh worldwide session is seeding this blob — so the
+            // sharing view can show a "seeding · Iroh" pill symmetric with BT.
+            "iroh_seeding": iroh_live && state.engine.is_iroh_seeding(&m.blake3),
         }));
     }
-    Ok(serde_json::json!({ "sharing": true, "total": total, "models": rows }))
+    // "sharing" is true if either route is live: the Iroh worldwide session is up,
+    // or at least one blob is seeded over BitTorrent.
+    Ok(serde_json::json!({
+        "sharing": iroh_live || bt_seeding,
+        "iroh": iroh_live,
+        "bt_seeding": bt_seeding,
+        "total": total,
+        "models": rows,
+    }))
 }
 
 #[tauri::command]
-pub async fn apply_identity(
-    state: State<'_, AppState>,
-    device_name: String,
-    group_code: String,
-) -> Result<(), String> {
+pub async fn apply_identity(state: State<'_, AppState>, device_name: String) -> Result<(), String> {
     let mut s = StudioSettings::load(&state.root);
     s.device_name = device_name.trim().to_string();
-    s.group_code = group_code.trim().to_string();
     s.save(&state.root).map_err(|e| e.to_string())?;
     if let Some(w) = state.share.lock().await.as_ref() {
         w.set_identity(s.identity());
     }
     Ok(())
-}
-
-#[tauri::command]
-pub fn create_group() -> String {
-    noema_core::identity::new_group_code()
-}
-
-#[tauri::command]
-pub async fn worldwide_peers(state: State<'_, AppState>, hash: String) -> Result<usize, String> {
-    Ok(state.engine.worldwide_peers(&hash).await)
 }
 
 #[tauri::command]
@@ -799,14 +958,98 @@ pub fn token_status(state: State<'_, AppState>) -> Result<bool, String> {
     state.engine.token_status(&src).map_err(|e| e.to_string())
 }
 
+/// Pause one transfer by id (keeps its partial for resume). With no id, pauses
+/// every active transfer (back-compat).
 #[tauri::command]
-pub fn pause_download(state: State<'_, AppState>) {
-    state.engine.request_pause();
+pub fn pause_download(state: State<'_, AppState>, transfer_id: Option<String>) {
+    match transfer_id {
+        Some(id) if !id.is_empty() => {
+            state.engine.pause(&noema_core::TransferId(id));
+        }
+        _ => state.engine.request_pause(),
+    }
+}
+
+/// Stop one transfer by id (discards its partial). With no id, stops every
+/// active transfer (back-compat).
+#[tauri::command]
+pub fn stop_download(state: State<'_, AppState>, transfer_id: Option<String>) {
+    match transfer_id {
+        Some(id) if !id.is_empty() => {
+            state.engine.stop(&noema_core::TransferId(id));
+        }
+        _ => state.engine.request_stop(),
+    }
+}
+
+/// Snapshot of every live transfer the engine is tracking — id + lifecycle state.
+/// Lets the front-end reconcile its `transfers` map after a reload or restart.
+#[derive(Serialize)]
+pub struct TransferRow {
+    transfer_id: String,
+    state: String,
 }
 
 #[tauri::command]
-pub fn stop_download(state: State<'_, AppState>) {
-    state.engine.request_stop();
+pub fn list_transfers(state: State<'_, AppState>) -> Vec<TransferRow> {
+    state
+        .engine
+        .list_transfers()
+        .into_iter()
+        .map(|(id, st)| TransferRow {
+            transfer_id: id.0,
+            state: format!("{st:?}"),
+        })
+        .collect()
+}
+
+/// Forget a finished / stopped transfer, freeing its registry slot. Called when
+/// the user dismisses a row from the Transfers list.
+#[tauri::command]
+pub fn remove_transfer(state: State<'_, AppState>, transfer_id: String) {
+    state
+        .engine
+        .remove_transfer(&noema_core::TransferId(transfer_id));
+}
+
+/// Fully discard a paused / waiting transfer: delete its leftover `.part` temp(s)
+/// and resumable DB row (the bytes that would otherwise leak), then free the
+/// registry slot. Used by the front-end's Remove on a not-done row.
+#[tauri::command]
+pub fn discard_transfer(state: State<'_, AppState>, transfer_id: String) -> Result<(), String> {
+    state
+        .engine
+        .discard_transfer(&noema_core::TransferId(transfer_id))
+        .map_err(|e| e.to_string())
+}
+
+/// One interrupted download a restart can re-offer: its manifest id (the transfer
+/// key), display artifact, and how far it got. The front-end seeds a Paused card
+/// per row on launch so paused downloads reappear after a full app restart.
+#[derive(Serialize)]
+pub struct ResumableRow {
+    transfer_id: String,
+    artifact: String,
+    bytes_done: u64,
+    bytes_total: u64,
+}
+
+#[tauri::command]
+pub fn resumable_downloads(state: State<'_, AppState>) -> Result<Vec<ResumableRow>, String> {
+    Ok(state
+        .engine
+        .resumable_downloads()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(
+            |(manifest_id, artifact, bytes_done, bytes_total)| ResumableRow {
+                transfer_id: manifest_id,
+                artifact,
+                bytes_done,
+                bytes_total,
+            },
+        )
+        .collect())
 }
 
 #[derive(Serialize)]
@@ -832,6 +1075,7 @@ struct ImportProgressEvent {
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn import_local(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -908,6 +1152,7 @@ pub async fn import_local(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub fn edit_model(
     state: State<'_, AppState>,
     manifest_id: String,
@@ -947,6 +1192,10 @@ pub async fn delete_model(
         .engine
         .evict_cache(noema_core::EvictPolicy::Blob(blake3.clone()))
         .map_err(|e| e.to_string())?;
+    // Stop seeding the deleted blob over BitTorrent (engine-owned) and Iroh
+    // (UI-held). evict_cache already detaches BT internally, but call it
+    // explicitly so a delete never leaves a dangling seed if eviction was a no-op.
+    let _ = state.engine.unseed_bittorrent(&blake3).await;
     if let Some(w) = state.share.lock().await.as_ref() {
         w.unseed_and_disconnect(&blake3).await;
     }
@@ -955,7 +1204,10 @@ pub async fn delete_model(
     Ok(report.freed_bytes)
 }
 
-fn target_for(m: &noema_core::InstalledModel) -> noema_core::ShareTarget {
+fn target_for(
+    engine: &noema_core::Engine,
+    m: &noema_core::InstalledModel,
+) -> noema_core::ShareTarget {
     noema_core::ShareTarget {
         name: m.name.clone(),
         size: m.size_bytes,
@@ -967,6 +1219,9 @@ fn target_for(m: &noema_core::InstalledModel) -> noema_core::ShareTarget {
         quant: m.quant.clone().unwrap_or_default(),
         desc: m.description.clone().unwrap_or_default(),
         origin: m.origin.clone().unwrap_or_default(),
+        // Advertise the BitTorrent swarm in the link when this blob is seeded over
+        // BT, so a receiver can join it straight from the link (empty otherwise).
+        magnet: engine.bt_magnet(&m.blake3),
     }
 }
 
@@ -976,7 +1231,7 @@ fn link_for(engine: &noema_core::Engine, manifest_id: &str) -> Option<String> {
         .ok()?
         .into_iter()
         .find(|m| m.manifest_id == manifest_id)?;
-    Some(target_for(&m).encode())
+    Some(target_for(engine, &m).encode())
 }
 
 #[tauri::command]
@@ -985,7 +1240,94 @@ pub fn copy_share_link(state: State<'_, AppState>, manifest_id: String) -> Resul
         .ok_or_else(|| "model not found in library".to_string())
 }
 
+/// The BitTorrent magnet for a seeded blob (empty string when it isn't seeded over
+/// BT). Returned to the front-end so a Library / Transfers row can copy it to the
+/// clipboard. The blob must be seeded over BitTorrent for a magnet to exist.
 #[tauri::command]
+pub fn bt_magnet(state: State<'_, AppState>, blake3: String) -> String {
+    state.engine.bt_magnet(&blake3)
+}
+
+/// Whether a blob is being seeded over **Iroh** right now (the live worldwide
+/// session is up and serving it). Symmetric with the `bt_seeding` flag on library
+/// rows so the UI can show a per-transport "seeding · Iroh" pill.
+#[tauri::command]
+pub fn is_iroh_seeding(state: State<'_, AppState>, blake3: String) -> bool {
+    state.engine.is_iroh_seeding(&blake3)
+}
+
+/// One live BitTorrent peer of a transfer, surfaced to the per-transfer peers
+/// table in Transfers.
+#[derive(Serialize)]
+pub struct PeerRow {
+    addr: String,
+    conn_kind: String,
+    state: String,
+    downloaded: u64,
+    uploaded: u64,
+}
+
+fn to_peer_rows(peers: Vec<noema_core::transport::BtPeer>) -> Vec<PeerRow> {
+    peers
+        .into_iter()
+        .map(|p| PeerRow {
+            addr: p.addr,
+            conn_kind: p.conn_kind,
+            state: p.state,
+            downloaded: p.downloaded,
+            uploaded: p.uploaded,
+        })
+        .collect()
+}
+
+/// Live BitTorrent peers for a transfer, by its transfer/manifest id (the key the
+/// Transfers list already holds). Resolves the manifest's blob blake3(s) and
+/// aggregates each blob's managed-torrent peers (its seed and/or in-flight leech).
+/// Empty when BitTorrent is off / not built in, the session isn't up, the manifest
+/// is unknown, or the blob isn't a live torrent here. Synchronous.
+#[tauri::command]
+pub fn bt_peers(state: State<'_, AppState>, transfer_id: String) -> Vec<PeerRow> {
+    let manifest = match state.engine.get_manifest(&transfer_id) {
+        Ok(Some(m)) => m,
+        _ => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for art in &manifest.artifacts {
+        let b3 = &art.hashes.blake3;
+        if b3.is_empty() {
+            continue;
+        }
+        out.extend(to_peer_rows(state.engine.bt_peers(b3)));
+    }
+    out
+}
+
+/// Live BitTorrent peers for a blob by its blake3 directly (used where the caller
+/// already has a content id, e.g. a Library row). Same semantics as `bt_peers`.
+#[tauri::command]
+pub fn bt_peers_for_blob(state: State<'_, AppState>, blake3: String) -> Vec<PeerRow> {
+    to_peer_rows(state.engine.bt_peers(&blake3))
+}
+
+/// Set the download-routing preference live (no restart). Mirrors the engine's
+/// other runtime toggles; persisted separately in `StudioSettings` via
+/// `save_settings`.
+#[tauri::command]
+pub fn set_download_preference(state: State<'_, AppState>, preference: u8) {
+    state
+        .engine
+        .set_download_preference(noema_core::DownloadPreference::from_u8(preference));
+}
+
+/// Pause every active transfer (keeps each partial for resume). Header action in
+/// Transfers.
+#[tauri::command]
+pub fn pause_all(state: State<'_, AppState>) {
+    state.engine.request_pause();
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn add_from_mesh(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -994,24 +1336,35 @@ pub async fn add_from_mesh(
     name: String,
     size: u64,
     license: String,
+    magnet: Option<String>,
+    client_ref: Option<String>,
 ) -> Result<usize, String> {
+    // The id is deterministic from the content id, so tell the front-end now (no
+    // FIFO adopt) — the engine derives the same id inside `add_by_content`.
+    let mid = content_manifest_id(&sha256, &blake3);
+    // Register the transfer up front (mirrors `download_model`) so Pause / Stop have
+    // a live control the instant the card appears — `add_by_content` reuses this
+    // registered id, so a pause pressed before the first byte isn't a silent no-op.
+    state.engine.register_transfer(&mid);
+    emit_registered(&app, &client_ref, &mid);
     let target = noema_core::ShareTarget {
         name,
         size,
         sha256,
         blake3,
         license,
+        // A non-empty magnet adds a BitTorrent source to the synthesized manifest,
+        // so the receiver can join the swarm (RECV side of Phase 7).
+        magnet: magnet.unwrap_or_default(),
         ..Default::default()
     };
-    let id_cell = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-    let progress = capturing_emitter(app.clone(), id_cell.clone());
+    let progress = progress_emitter(app.clone());
     let result = state.engine.add_by_content(target, Some(progress)).await;
-    let mid = id_cell.lock().map(|g| g.clone()).unwrap_or_default();
     match result {
         Ok(out) => {
             let _ = app.emit(
                 "download://done",
-                serde_json::json!({ "manifest_id": mid, "status": "done" }),
+                serde_json::json!({ "transfer_id": mid, "manifest_id": mid, "status": "done" }),
             );
             Ok(out.artifacts.len())
         }
@@ -1019,6 +1372,7 @@ pub async fn add_from_mesh(
             let _ = app.emit(
                 "download://done",
                 serde_json::json!({
+                    "transfer_id": mid,
                     "manifest_id": mid,
                     "status": download_end_status(&e),
                     "message": e.to_string(),
@@ -1043,10 +1397,19 @@ pub fn export_diagnostics(state: State<'_, AppState>) -> Result<serde_json::Valu
     state.engine.export_diagnostics().map_err(|e| e.to_string())
 }
 
-/// Reveal a file/dir in the OS file manager (Finder / Explorer / xdg).
+/// Reveal a file/dir in the OS file manager (Finder / Explorer / xdg). Errors on an
+/// empty or nonexistent path so the front-end can show "file is missing" feedback
+/// instead of silently opening nothing (or the wrong place).
 #[tauri::command]
 pub fn reveal(path: String) -> Result<(), String> {
-    let p = std::path::PathBuf::from(&path);
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("no location to open".into());
+    }
+    let p = std::path::PathBuf::from(path);
+    if !p.exists() {
+        return Err("file not found — it may have moved or been deleted".into());
+    }
     #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open")

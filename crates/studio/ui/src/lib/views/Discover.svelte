@@ -1,7 +1,7 @@
 <script>
   import { onMount } from "svelte";
   import { api, copyText } from "../api.js";
-  import { fmtSize } from "../format.js";
+  import { fmtSize, prettyFormat } from "../format.js";
   export let startDownload;
   export let goTransfers = () => {};
   export let focus = 0;
@@ -15,8 +15,14 @@
     return v.file || v.label;
   }
   function start(v) {
-    startDownload(detail.id, v.file);
-    started.add(vkey(v));
+    const key = vkey(v);
+    // Clear the inline "Downloading…" ack once this transfer settles (success OR
+    // failure / stop / waiting), so the Download button never stays stuck.
+    startDownload(detail.id, v.file, () => {
+      started.delete(key);
+      started = started;
+    });
+    started.add(key);
     started = started;
   }
   let results = [];
@@ -134,8 +140,9 @@
                 <div>
                   <span class="vlabel">{v.label}</span>
                   {#if v.recommended}<span class="pill ok">Recommended</span>{/if}
+                  {#if prettyFormat(v.format)}<span class="pill">{prettyFormat(v.format)}</span>{/if}
                   <span class="muted">
-                    {v.format} · {fmtSize(v.size)}{v.shards > 1 ? ` · ${v.shards} shards` : ""}
+                    {fmtSize(v.size)}{v.shards > 1 ? ` · ${v.shards} shards` : ""}
                   </span>
                   {#if v.recommended && v.fit_reason}
                     <div class="muted">Recommended for this machine · {v.fit_reason}</div>

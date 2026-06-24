@@ -65,7 +65,7 @@ pub struct BuildArgs {
     #[arg(long = "artifact", value_name = "INSTALL=FILE")]
     pub artifacts: Vec<String>,
     /// A source `install_path:type:locator` (repeatable). Types: http, hf, lan,
-    /// ipfs, file, iroh. hf locator is `repo@revision/path`.
+    /// file, iroh. hf locator is `repo@revision/path`.
     #[arg(long = "source", value_name = "PATH:TYPE:LOCATOR")]
     pub sources: Vec<String>,
     /// Merkle leaf size in bytes.
@@ -318,11 +318,6 @@ fn make_source(ty: &str, locator: &str) -> Result<Source> {
         },
         // `lan` is intentionally not authorable: LAN peering was removed and the
         // engine refuses to fetch a LanPeer source, so minting one is a dead end.
-        "ipfs" => Source::Ipfs {
-            cid: locator.to_string(),
-            retrieval: vec!["gateway".into()],
-            auth: AuthPolicy::None,
-        },
         "file" => Source::LocalFile {
             path: locator.to_string(),
         },

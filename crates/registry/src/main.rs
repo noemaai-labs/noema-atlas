@@ -32,11 +32,11 @@ const PROVIDER_TTL_MS: i64 = 15 * 60 * 1000;
 /// provider record**, not as a single content-global field. Public visibility
 /// and group membership are therefore derived from the *currently-live* set of
 /// providers: one peer cannot promote, hijack, or rewrite another peer's
-/// listing, and a flag reverts as soon as its provider expires. (Announces are
-/// unauthenticated, so a live peer can still publish a spoofed *label* for a
-/// hash it claims to serve — bytes are always blake3/sha256-verified on fetch,
-/// so this can mislabel but never deliver wrong content. Signed announces are
-/// future work.)
+/// listing, and a flag reverts as soon as its provider expires. Announces are
+/// authenticated — each is keyed on a signature-verified NodeId — so no one can
+/// publish under another node's id; a peer can still mislabel a hash *it* serves,
+/// but bytes are always blake3/sha256-verified on fetch, so a bad label can never
+/// deliver wrong content.
 #[derive(Default)]
 struct Tracker {
     providers: HashMap<String, Vec<Provider>>,
@@ -47,10 +47,10 @@ struct Tracker {
 struct Provider {
     /// The current reachable node ticket (addresses change over time).
     node: String,
-    /// The peer's *stable* identity (hex NodeId). This — not the ticket — is the
-    /// de-duplication key, so one device that re-announces with changed addresses
-    /// stays a single peer instead of inflating the count. Falls back to `node`
-    /// for older clients that don't send it.
+    /// The peer's *stable* identity (hex NodeId), cryptographically verified on
+    /// announce. This — not the ticket — is the de-duplication key, so one device
+    /// that re-announces with changed addresses stays a single peer instead of
+    /// inflating the count.
     node_id: String,
     device: String,
     group: Option<String>,
@@ -60,6 +60,7 @@ struct Provider {
     size: u64,
     quant: String,
     license: String,
+    magnet: String,
     expires_at: i64,
 }
 
@@ -71,6 +72,7 @@ struct AnnouncedItem {
     size: u64,
     quant: String,
     license: String,
+    magnet: String,
     listable: bool,
 }
 
@@ -83,6 +85,7 @@ struct CatalogRow {
     size: u64,
     quant: String,
     license: String,
+    magnet: String,
     peers: usize,
     devices: Vec<String>,
     mine: bool,
@@ -92,18 +95,16 @@ impl Tracker {
     fn announce(
         &mut self,
         node: &str,
-        node_id: Option<&str>,
+        node_id: &str,
         device: Option<&str>,
         group: Option<&str>,
         items: &[AnnouncedItem],
     ) {
         let now = now_unix_millis();
         let exp = now + PROVIDER_TTL_MS;
-        // De-dup on the stable NodeId; fall back to the ticket for older clients.
-        let id = node_id
-            .filter(|s| !s.is_empty())
-            .unwrap_or(node)
-            .to_string();
+        // Rows are keyed on the cryptographically-verified stable NodeId (the caller
+        // proves ownership before this is reached), never an attacker-supplied value.
+        let id = node_id.to_string();
         for it in items {
             let b3 = it.blake3.to_lowercase();
             let sha = it
@@ -126,6 +127,7 @@ impl Tracker {
                 size: it.size,
                 quant: it.quant.clone(),
                 license: it.license.clone(),
+                magnet: it.magnet.clone(),
                 expires_at: exp,
             });
             if !sha.is_empty() {
@@ -242,6 +244,14 @@ impl Tracker {
             // *other* devices you could fetch it from.
             let total = peers_by_b3.get(b3).copied().unwrap_or(provs.len());
             let peers = total.saturating_sub(usize::from(self_is_provider));
+            // Magnet from any live provider that has one (a single seeding peer is
+            // enough to advertise the swarm), falling back to the representative's.
+            let magnet = provs
+                .iter()
+                .map(|p| p.magnet.as_str())
+                .find(|m| !m.is_empty())
+                .unwrap_or(rep.magnet.as_str())
+                .to_string();
             rows.push(CatalogRow {
                 blake3: b3.clone(),
                 sha256: rep.sha256.clone(),
@@ -249,6 +259,7 @@ impl Tracker {
                 size: rep.size,
                 quant: rep.quant.clone(),
                 license: rep.license.clone(),
+                magnet,
                 peers,
                 devices: devices.into_iter().collect(),
                 mine,
@@ -298,6 +309,20 @@ struct Args {
     /// Directory to persist manifests.
     #[arg(long, default_value = "./registry-data")]
     dir: PathBuf,
+    /// This registry's own canonical public base URL. It's bound into every
+    /// announce/withdraw signature as the *audience*, so a request captured for one
+    /// registry can't be replayed against another. Recomputed from this value — not
+    /// from an attacker-controllable `Host` header — so it must match the URL clients
+    /// post to. Defaults to the well-known Atlas tracker URL.
+    #[arg(long, default_value = noema_core::DEFAULT_TRACKER)]
+    public_url: String,
+    /// Require a signed ownership proof on every announce/withdraw. Off by default
+    /// for a transition window: already-released, *unsigned* clients keep working,
+    /// while signed clients are still cryptographically verified (a present-but-bad
+    /// signature is always rejected). Flip this on once clients have upgraded, to
+    /// reject all unsigned requests.
+    #[arg(long)]
+    require_signed: bool,
 }
 
 struct Store {
@@ -349,6 +374,12 @@ impl Store {
 struct AppState {
     store: Arc<Mutex<Store>>,
     tracker: Arc<Mutex<Tracker>>,
+    /// This registry's canonical base URL, bound as the audience in every
+    /// announce/withdraw signature (cross-registry replay protection).
+    public_url: Arc<str>,
+    /// When true, reject any unsigned announce/withdraw; when false (transition),
+    /// accept unsigned legacy clients but still verify any proof that *is* present.
+    require_signed: bool,
 }
 
 #[derive(Serialize)]
@@ -374,6 +405,8 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         store: Arc::new(Mutex::new(store)),
         tracker: Arc::new(Mutex::new(Tracker::default())),
+        public_url: Arc::from(args.public_url.as_str()),
+        require_signed: args.require_signed,
     };
 
     let app = Router::new()
@@ -540,6 +573,9 @@ struct AnnounceItem {
     quant: String,
     #[serde(default)]
     license: String,
+    /// BitTorrent magnet (info-hash) when the sharer is seeding this file over BT.
+    #[serde(default)]
+    magnet: String,
     /// Whether this file may appear in the public catalog (the sharer opted it in).
     #[serde(default)]
     listable: bool,
@@ -547,10 +583,12 @@ struct AnnounceItem {
 
 #[derive(Deserialize)]
 struct AnnounceReq {
-    /// The announcer's Iroh node ticket (reachable worldwide via relays).
+    /// The announcer's Iroh node ticket (reachable worldwide via relays). Bound into
+    /// the signature, so a MITM can't swap it for an address it controls.
     node: String,
-    /// The announcer's *stable* NodeId (hex) — the peer de-dup key. Optional for
-    /// backward compatibility; falls back to `node` when absent.
+    /// The announcer's *stable* NodeId (hex/base32) — the peer de-dup key, and the
+    /// public key the signature is verified against. Mandatory: an announce without a
+    /// proven NodeId is rejected.
     #[serde(default)]
     node_id: Option<String>,
     /// Human device name (for "from your devices").
@@ -562,12 +600,52 @@ struct AnnounceReq {
     /// Content this peer is sharing, with optional browse metadata.
     #[serde(default)]
     items: Vec<AnnounceItem>,
+    /// Ownership-proof timestamp (ms) + base64 Ed25519 signature over the canonical
+    /// payload, signed with the node secret key (see `noema_core::announce_auth`).
+    /// Both are mandatory — an unsigned announce is rejected.
+    #[serde(default)]
+    ts: Option<i64>,
+    #[serde(default)]
+    sig: Option<String>,
 }
 
-/// A peer announces the content it shares so others can find it worldwide.
+/// A peer announces the content it shares so others can find it worldwide. The
+/// announce carries a NodeId and, for upgraded clients, a ts + signature over the
+/// canonical payload (binding the node ticket, this registry's audience, and the
+/// announced blake3s), verified *before* any state mutation. During the transition
+/// window an unsigned legacy client is still accepted (see `--require-signed`); a
+/// signature that IS present is always verified, so a forged/replayed proof is
+/// rejected. Catalog/provider rows are keyed on the announced NodeId.
 async fn announce(State(state): State<AppState>, Json(req): Json<AnnounceReq>) -> Response {
     if req.node.trim().is_empty() || req.items.is_empty() {
         return err(StatusCode::BAD_REQUEST, "node and items are required");
+    }
+    // Proof of ownership is mandatory: a missing/empty node_id is unauthenticated.
+    let Some(node_id) = req.node_id.as_deref().filter(|s| !s.is_empty()) else {
+        return err(
+            StatusCode::UNAUTHORIZED,
+            "announce requires a signed node_id",
+        );
+    };
+    // Verify the Ed25519 signature over the announced blake3s — bound to the received
+    // ticket and this registry's own canonical URL as the audience — against the
+    // claimed NodeId (which *is* the public key), BEFORE touching any state. Reject a
+    // spoofed, unsigned, MITM-rewritten, or cross-registry-replayed request.
+    let item_ids: Vec<String> = req.items.iter().map(|i| i.blake3.clone()).collect();
+    if !announce_authorized(
+        state.require_signed,
+        "announce",
+        node_id,
+        req.ts,
+        req.sig.as_deref(),
+        &req.node,
+        &state.public_url,
+        &item_ids,
+    ) {
+        return err(
+            StatusCode::UNAUTHORIZED,
+            "invalid or missing announce signature",
+        );
     }
     let items: Vec<AnnouncedItem> = req
         .items
@@ -581,13 +659,14 @@ async fn announce(State(state): State<AppState>, Json(req): Json<AnnounceReq>) -
             size: i.size,
             quant: i.quant,
             license: i.license,
+            magnet: i.magnet,
             listable: i.listable,
         })
         .collect();
     let n = items.len();
     state.tracker.lock().unwrap().announce(
         &req.node,
-        req.node_id.as_deref(),
+        node_id,
         req.device.as_deref(),
         req.group.as_deref(),
         &items,
@@ -636,6 +715,13 @@ struct WithdrawReq {
     /// blake3 hashes to withdraw; empty/absent means "withdraw everything".
     #[serde(default)]
     items: Vec<String>,
+    /// Ownership-proof timestamp (ms) + base64 Ed25519 signature over the canonical
+    /// payload. Without it a registry can't tell a real owner from an attacker
+    /// trying to wipe a victim's records.
+    #[serde(default)]
+    ts: Option<i64>,
+    #[serde(default)]
+    sig: Option<String>,
 }
 
 /// A peer un-announces content it no longer serves (deleted, stopped sharing, or
@@ -645,12 +731,88 @@ async fn withdraw(State(state): State<AppState>, Json(req): Json<WithdrawReq>) -
     if req.node_id.trim().is_empty() {
         return err(StatusCode::BAD_REQUEST, "node_id is required");
     }
+    // Withdraw is the dangerous verb (it deletes records). When present, the signature
+    // over the requested item ids is verified against the claimed NodeId so no one can
+    // wipe another peer's entries; during the transition window an unsigned legacy
+    // withdraw is still honored (a stale entry would otherwise just TTL out anyway).
+    // Withdraw carries no node ticket, so the bound ticket is empty; the audience is
+    // this registry's own URL (cross-registry replay protection).
+    if !announce_authorized(
+        state.require_signed,
+        "withdraw",
+        &req.node_id,
+        req.ts,
+        req.sig.as_deref(),
+        "",
+        &state.public_url,
+        &req.items,
+    ) {
+        return err(
+            StatusCode::UNAUTHORIZED,
+            "invalid or missing withdraw signature",
+        );
+    }
     state
         .tracker
         .lock()
         .unwrap()
         .withdraw(&req.node_id, &req.items);
     (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
+}
+
+/// Verify an announce/withdraw ownership proof: the `ts` + `sig` must be a valid,
+/// fresh Ed25519 signature over the canonical payload — bound to `ticket` (the
+/// node ticket the registry received) and `audience` (this registry's own canonical
+/// URL) — signed by the secret key whose public key *is* `node_id`. Missing `ts`/`sig`
+/// is a rejection (no proof).
+#[allow(clippy::too_many_arguments)]
+fn verify_announce_auth(
+    method: &str,
+    node_id: &str,
+    ts: Option<i64>,
+    sig: Option<&str>,
+    ticket: &str,
+    audience: &str,
+    item_ids: &[String],
+) -> bool {
+    let (Some(ts), Some(sig)) = (ts, sig) else {
+        return false;
+    };
+    noema_core::announce_auth::verify(
+        method,
+        node_id,
+        ts,
+        ticket,
+        audience,
+        item_ids,
+        sig,
+        now_unix_millis(),
+    )
+}
+
+/// Authorize an announce/withdraw under the registry's auth mode.
+/// - A request carrying a `ts` + `sig` is ALWAYS cryptographically verified; a
+///   present-but-invalid proof (forged, tampered, replayed) is rejected regardless
+///   of mode.
+/// - A request with no proof is accepted only during the transition window
+///   (`require_signed == false`), so already-released unsigned clients keep working;
+///   with `require_signed == true` it is rejected.
+#[allow(clippy::too_many_arguments)]
+fn announce_authorized(
+    require_signed: bool,
+    method: &str,
+    node_id: &str,
+    ts: Option<i64>,
+    sig: Option<&str>,
+    ticket: &str,
+    audience: &str,
+    item_ids: &[String],
+) -> bool {
+    if ts.is_some() && sig.is_some() {
+        verify_announce_auth(method, node_id, ts, sig, ticket, audience, item_ids)
+    } else {
+        !require_signed
+    }
 }
 
 /// Look up peers worldwide that have a given content hash (blake3 or sha256).
@@ -709,6 +871,7 @@ mod tests {
             size: 100,
             quant: String::new(),
             license: "apache-2.0".to_string(),
+            magnet: String::new(),
             listable,
         }
     }
@@ -733,7 +896,7 @@ mod tests {
         let priv_b3 = "bb".repeat(32);
         t.announce(
             "nodeA",
-            Some("nodeA"),
+            "nodeA",
             Some("Mac A"),
             Some("grp1"),
             &[
@@ -773,7 +936,7 @@ mod tests {
         let b3 = "cc".repeat(32);
         t.announce(
             "nodeA",
-            Some("nodeA"),
+            "nodeA",
             Some("Mac A"),
             None,
             &[item(&b3, "Open Model", true)],
@@ -796,7 +959,7 @@ mod tests {
         // Owner A shares X privately (not listable) under group A.
         t.announce(
             "A",
-            Some("A"),
+            "A",
             Some("Mac A"),
             Some("grpA"),
             &[item(&x, "A-Private-Name", false)],
@@ -809,7 +972,7 @@ mod tests {
         // public row must show B's label, never A's private one.
         t.announce(
             "B",
-            Some("B"),
+            "B",
             Some("Mac B"),
             None,
             &[item(&x, "B-Public-Name", true)],
@@ -826,14 +989,14 @@ mod tests {
         let x = "ee".repeat(32);
         t.announce(
             "A",
-            Some("A"),
+            "A",
             Some("Mac A"),
             Some("grpA"),
             &[item(&x, "Model", false)],
         );
         t.announce(
             "B",
-            Some("B"),
+            "B",
             Some("Mac B"),
             Some("grpB"),
             &[item(&x, "Model", false)],
@@ -857,14 +1020,14 @@ mod tests {
         // same stable NodeId, but a *different* node ticket string.
         t.announce(
             "ticket-v1",
-            Some("node-1"),
+            "node-1",
             Some("Mac A"),
             None,
             &[item(&b3, "Open Model", true)],
         );
         t.announce(
             "ticket-v2",
-            Some("node-1"),
+            "node-1",
             Some("Mac A"),
             None,
             &[item(&b3, "Open Model", true)],
@@ -880,7 +1043,7 @@ mod tests {
         // A genuinely different device is a second peer.
         t.announce(
             "ticket-x",
-            Some("node-2"),
+            "node-2",
             Some("Mac B"),
             None,
             &[item(&b3, "Open Model", true)],
@@ -901,7 +1064,7 @@ mod tests {
         // You are the only seeder of a public model.
         t.announce(
             "ticket-a",
-            Some("node-self"),
+            "node-self",
             Some("My Mac"),
             None,
             &[item(&b3, "Solo Model", true)],
@@ -923,7 +1086,7 @@ mod tests {
         // A second, genuinely different device joins as a real peer.
         t.announce(
             "ticket-b",
-            Some("node-other"),
+            "node-other",
             Some("Their Mac"),
             None,
             &[item(&b3, "Solo Model", true)],
@@ -943,14 +1106,14 @@ mod tests {
         let b3 = "ab".repeat(32);
         t.announce(
             "ta",
-            Some("node-a"),
+            "node-a",
             Some("Mac A"),
             None,
             &[item(&b3, "Shared", true)],
         );
         t.announce(
             "tb",
-            Some("node-b"),
+            "node-b",
             Some("Mac B"),
             None,
             &[item(&b3, "Shared", true)],
@@ -976,5 +1139,76 @@ mod tests {
         // Alias gone, so the sha256 no longer resolves to the blake3.
         assert_ne!(resolved, b3);
         assert!(ps.is_empty());
+    }
+
+    #[test]
+    fn unsigned_or_partial_proof_is_rejected() {
+        let node_id = "aa".repeat(32);
+        let items = vec!["bb".repeat(32)];
+        // No ts/sig at all: rejected (the legacy unsigned fallback is gone).
+        assert!(!verify_announce_auth(
+            "announce",
+            &node_id,
+            None,
+            None,
+            "ticket",
+            noema_core::DEFAULT_TRACKER,
+            &items,
+        ));
+        // ts present but sig missing (and vice versa): still rejected.
+        assert!(!verify_announce_auth(
+            "announce",
+            &node_id,
+            Some(now_unix_millis()),
+            None,
+            "ticket",
+            noema_core::DEFAULT_TRACKER,
+            &items,
+        ));
+        assert!(!verify_announce_auth(
+            "announce",
+            &node_id,
+            None,
+            Some("AAAA"),
+            "ticket",
+            noema_core::DEFAULT_TRACKER,
+            &items,
+        ));
+        // A garbage signature over an otherwise well-formed request is rejected.
+        assert!(!verify_announce_auth(
+            "announce",
+            &node_id,
+            Some(now_unix_millis()),
+            Some("AAAA"),
+            "ticket",
+            noema_core::DEFAULT_TRACKER,
+            &items,
+        ));
+    }
+
+    #[test]
+    fn transition_mode_accepts_unsigned_but_still_verifies_a_present_proof() {
+        let node_id = "aa".repeat(32);
+        let items = vec!["bb".repeat(32)];
+        let aud = noema_core::DEFAULT_TRACKER;
+        // Transition (require_signed = false): an unsigned legacy announce is accepted.
+        assert!(announce_authorized(
+            false, "announce", &node_id, None, None, "t", aud, &items
+        ));
+        // ...but a present-but-garbage signature is still rejected even in transition.
+        assert!(!announce_authorized(
+            false,
+            "announce",
+            &node_id,
+            Some(now_unix_millis()),
+            Some("AAAA"),
+            "t",
+            aud,
+            &items
+        ));
+        // Strict (require_signed = true): the unsigned announce is rejected.
+        assert!(!announce_authorized(
+            true, "announce", &node_id, None, None, "t", aud, &items
+        ));
     }
 }

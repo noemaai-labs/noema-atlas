@@ -66,10 +66,6 @@ impl TestServer {
         format!("http://{}{}", self.addr, path)
     }
 
-    pub fn base(&self) -> String {
-        format!("http://{}", self.addr)
-    }
-
     pub fn hits(&self, path: &str) -> usize {
         self.specs
             .lock()

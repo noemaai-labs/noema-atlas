@@ -14,7 +14,7 @@ description = "Noema Atlas Studio — opt-in polished desktop UI (Tauri + Svelte
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-noema-core = { path = "../core", features = ["iroh"] }
+noema-core = { path = "../core", features = ["iroh", "bittorrent"] }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }

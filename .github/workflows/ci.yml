@@ -27,6 +27,10 @@ jobs:
       - name: rustfmt
         run: cargo fmt --all -- --check
       - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --features bittorrent -- -D warnings
+      # `--features bittorrent` so the BitTorrent transport and its (ignored)
+      # integration tests compile in CI. The networked seed/leech tests are
+      # `#[ignore]`d; run them with `cargo test --features bittorrent -- --ignored`
+      # on a machine with real swarm/DHT connectivity.
       - name: test
-        run: cargo test --workspace
+        run: cargo test --workspace --features bittorrent

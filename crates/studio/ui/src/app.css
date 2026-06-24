@@ -349,6 +349,12 @@ select:focus {
   border-color: var(--warn);
   color: var(--warn);
 }
+.pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
 
 .detail {
   margin-top: 14px;
@@ -485,6 +491,36 @@ select:focus {
   height: 30px;
   padding: 0 12px;
   font-size: 10px;
+}
+.btn.xs {
+  height: 24px;
+  padding: 0 8px;
+  font-size: 9px;
+}
+.peers-toggle {
+  margin-top: 8px;
+}
+table.peers {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 8px;
+  font-size: 11px;
+}
+table.peers th,
+table.peers td {
+  text-align: left;
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--border);
+}
+table.peers th {
+  color: var(--text-2);
+  font-weight: 500;
+  text-transform: uppercase;
+  font-size: 9px;
+  letter-spacing: 0.05em;
+}
+table.peers td.mono {
+  font-family: var(--font-mono);
 }
 .btn.danger {
   color: #ef4444;

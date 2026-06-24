@@ -1,6 +1,6 @@
 <script>
   import { onMount } from "svelte";
-  import { api, onProgress, onDone } from "./lib/api.js";
+  import { api, onProgress, onDone, onRegistered } from "./lib/api.js";
   import Sidebar from "./lib/Sidebar.svelte";
   import Discover from "./lib/views/Discover.svelte";
   import Explore from "./lib/views/Explore.svelte";
@@ -11,12 +11,25 @@
 
   let tab = "discover";
   let info = { name: "Noema Studio", version: "", root: "" };
-  let transfer = null;
-  let lastTick = null;
+  // Concurrent transfers, keyed by transfer_id (the engine's stable per-transfer
+  // key, equal to the manifest id). Each row also carries a derived mbps/eta and a
+  // per-row lastTick for the rolling speed estimate.
+  let transfers = {};
   let settings = null;
   let showIntro = false;
   let discoverFocus = 0;
   let dropComposer = null;
+
+  // Provisional rows we created optimistically before the engine assigned the real
+  // transfer_id (mesh / link / Hub downloads synthesize the id server-side). Each
+  // start passes its temp key as `client_ref`; the `download://registered` event
+  // echoes it back with the real id, so we re-key that exact row — no FIFO guessing.
+  let tmpSeq = 0;
+  // Per-transfer "settled" callbacks the launching view registers so its inline
+  // "Downloading…" acknowledgement clears the moment the transfer reaches a terminal
+  // state (done/stopped/error/waiting) — not just on success. Keyed by the same id
+  // as `transfers`, so it follows the row through the tmp→real re-key (`adopt`).
+  let settleCbs = {};
 
   function applyTheme(theme) {
     const resolved =
@@ -28,11 +41,93 @@
     document.documentElement.setAttribute("data-theme", resolved);
   }
 
+  const settledPhase = (ph) =>
+    !ph ||
+    ["done", "paused", "stopped", "waiting"].includes(ph) ||
+    String(ph).startsWith("error");
+
+  // Phases a single-row Resume is allowed from: a settled, non-running card. Anything
+  // mid-flight (starting / downloading / pausing / stopping) is already live, so a
+  // second resume is a no-op rather than an error flip. A failed card can be retried
+  // individually, so error is allowed here.
+  const isResumablePhase = (ph) =>
+    ph === "paused" || ph === "waiting" || String(ph).startsWith("error");
+
+  // Phases Resume-all acts on: only the cards the UI shows as resumable — paused or
+  // waiting-for-peers. Failed / errored rows are excluded (matches the desktop's
+  // resume_all and qBittorrent: a bulk resume doesn't retry failures), as are
+  // mid-flight and done rows.
+  const isResumeAllPhase = (ph) => ph === "paused" || ph === "waiting";
+
+  // A live, pauseable transfer: mid-flight, not already settling or settled.
+  const isActivePhase = (ph) =>
+    !settledPhase(ph) && ph !== "pausing" && ph !== "stopping";
+
+  // Map a backend lifecycle state (TransferState's Debug string) to the UI phase
+  // a reconciled card should show. The granular live states map to the same lower-
+  // case tokens the progress event emits, so the card caption (via phaseLabel)
+  // reads "Connecting…" / "Verifying…" / "Waiting for peers…" instead of a generic
+  // "Downloading…". Terminal states return null so a finished / failed transfer
+  // never resurrects as a fake live card after a reload.
+  function phaseFromState(state) {
+    switch (state) {
+      case "Paused":
+        return "paused";
+      case "WaitingForPeers":
+        return "waiting";
+      case "Queued":
+        return "queued";
+      case "Connecting":
+        return "connecting";
+      case "Verifying":
+        return "verifying";
+      case "Seeding":
+        return "seeding";
+      case "Downloading":
+        return "downloading";
+      // Failed / Stopped / Complete (and any unknown) are terminal — skip them so
+      // they don't reappear as live rows.
+      default:
+        return null;
+    }
+  }
+
+  // Re-key the provisional row identified by `clientRef` to its real transfer_id,
+  // driven by the engine's `download://registered` event. Deterministic: each row
+  // is matched by the exact temp key it was created with, so concurrent starts
+  // never get misattributed (the old FIFO bug).
+  function adopt(clientRef, realId) {
+    if (clientRef == null || !transfers[clientRef]) return false;
+    if (clientRef === realId) return true;
+    const row = transfers[clientRef];
+    delete transfers[clientRef];
+    transfers[realId] = { ...row, manifest_id: realId };
+    transfers = { ...transfers };
+    // Carry the launching view's settle-callback across the re-key so it still
+    // fires when this (now correctly-keyed) transfer settles.
+    if (settleCbs[clientRef]) {
+      settleCbs[realId] = settleCbs[clientRef];
+      delete settleCbs[clientRef];
+    }
+    return true;
+  }
+
+  // Fire and drop the settle-callback for a transfer id, clearing the launching
+  // view's inline "Downloading…" acknowledgement. Idempotent.
+  function settle(id) {
+    const cb = settleCbs[id];
+    if (cb) {
+      delete settleCbs[id];
+      try {
+        cb();
+      } catch (e) {}
+    }
+  }
+
   onMount(async () => {
     try {
       info = await api.appInfo();
-    } catch (e) {
-    }
+    } catch (e) {}
     try {
       settings = await api.getSettings();
       applyTheme(settings.theme);
@@ -41,48 +136,120 @@
       applyTheme("system");
     }
 
+    // Re-key the right provisional row the moment the engine registers the id —
+    // before any progress arrives, so the card never flickers under a temp key.
+    onRegistered((r) => {
+      if (r && r.client_ref && r.transfer_id) adopt(r.client_ref, r.transfer_id);
+    });
+
     onProgress((p) => {
+      let id = p.transfer_id || p.manifest_id;
+      // The provisional row was already re-keyed by `onRegistered`; a still-unknown
+      // id here means a transfer we never created a card for (e.g. resumed in
+      // another view), so start a fresh row.
+      if (!transfers[id]) transfers[id] = { manifest_id: id };
+      const row = transfers[id];
       // Once a pause/stop is initiated (or settled), ignore late in-flight ticks
       // so the card doesn't flicker back to "downloading" before the done event.
-      if (transfer && ["pausing", "stopping", "paused", "waiting"].includes(transfer.phase))
+      if (["pausing", "stopping", "paused", "waiting"].includes(row.phase)) {
+        transfers = { ...transfers };
         return;
+      }
       const now = performance.now();
-      let mbps = transfer?.mbps ?? 0;
-      if (lastTick && p.bytes_done >= lastTick.bytes) {
-        const dt = (now - lastTick.t) / 1000;
+      let mbps = row.mbps ?? 0;
+      if (row.lastTick && p.bytes_done >= row.lastTick.bytes) {
+        const dt = (now - row.lastTick.t) / 1000;
         if (dt > 0.25) {
-          mbps = (p.bytes_done - lastTick.bytes) / dt / 1e6;
-          lastTick = { t: now, bytes: p.bytes_done };
+          mbps = (p.bytes_done - row.lastTick.bytes) / dt / 1e6;
+          row.lastTick = { t: now, bytes: p.bytes_done };
         }
       } else {
-        lastTick = { t: now, bytes: p.bytes_done };
+        row.lastTick = { t: now, bytes: p.bytes_done };
       }
       const remaining = p.bytes_total - p.bytes_done;
       const etaSec = mbps > 0 && remaining > 0 ? Math.round(remaining / (mbps * 1e6)) : null;
-      transfer = { ...p, mbps, etaSec };
+      transfers[id] = { ...row, ...p, manifest_id: id, mbps, etaSec, lastTick: row.lastTick };
+      transfers = { ...transfers };
     });
+
     onDone((payload) => {
-      if (!transfer) return;
       const status = payload && typeof payload === "object" ? payload.status : "done";
-      const mid = (payload && payload.manifest_id) || transfer.manifest_id;
+      const id = (payload && (payload.transfer_id || payload.manifest_id)) || null;
+      // Clear the launching view's inline "Downloading…" ack on ANY terminal status
+      // (done / stopped / error / waiting) — not just success — so a failed or
+      // stopped download never leaves a stuck button. Done before the row guard
+      // below so it fires even if the row was already pruned.
+      if (id != null) settle(id);
+      // The row is keyed by the engine id (re-keyed at `onRegistered`), so the done
+      // event's id matches directly — no FIFO fallback.
+      if (id == null || !transfers[id]) return;
+      const row = transfers[id];
       if (status === "stopped") {
-        transfer = null;
+        delete transfers[id];
       } else if (status === "paused") {
-        transfer = { ...transfer, manifest_id: mid, phase: "paused", mbps: 0, etaSec: null };
+        transfers[id] = { ...row, manifest_id: id, phase: "paused", mbps: 0, etaSec: null };
       } else if (status === "waiting") {
-        transfer = { ...transfer, manifest_id: mid, phase: "waiting", mbps: 0, etaSec: null };
+        transfers[id] = { ...row, manifest_id: id, phase: "waiting", mbps: 0, etaSec: null };
       } else if (status === "error") {
         const msg = (payload && payload.message) || "failed";
-        transfer = { ...transfer, phase: "error: " + msg, mbps: 0, etaSec: null };
+        transfers[id] = { ...row, phase: "error: " + msg, mbps: 0, etaSec: null };
       } else {
-        transfer = { ...transfer, phase: "done", mbps: 0, etaSec: null };
-        // Clear a finished transfer after a moment so the card doesn't linger
-        // forever — unless it's been replaced by a new one in the meantime.
+        transfers[id] = { ...row, phase: "done", mbps: 0, etaSec: null };
+        // Clear a finished row after a moment so it doesn't linger forever — unless
+        // the user is still looking at it / it changed in the meantime.
         setTimeout(() => {
-          if (transfer && transfer.phase === "done") transfer = null;
+          if (transfers[id] && transfers[id].phase === "done") {
+            delete transfers[id];
+            transfers = { ...transfers };
+          }
         }, 4000);
       }
+      transfers = { ...transfers };
     });
+
+    // Reconcile with the engine's live transfer registry on launch (e.g. a window
+    // reload that lost the in-memory map but left downloads running).
+    try {
+      const live = await api.listTransfers();
+      for (const t of live) {
+        const phase = phaseFromState(t.state);
+        // Skip terminal rows (Failed / Complete / Stopped) so they don't come
+        // back as phantom downloads; only seed cards for live/resumable states.
+        if (phase && !transfers[t.transfer_id]) {
+          transfers[t.transfer_id] = {
+            manifest_id: t.transfer_id,
+            artifact: t.transfer_id,
+            phase,
+            bytes_done: 0,
+            bytes_total: 0,
+            mbps: 0,
+          };
+        }
+      }
+      transfers = { ...transfers };
+    } catch (e) {}
+
+    // After a full app restart the live registry is empty, but interrupted
+    // downloads survive on disk (kept `.part` + manifest). Re-offer them as Paused
+    // cards so the user can resume; the keyed map means a later live tick for the
+    // same id just updates the existing row.
+    try {
+      const resumable = await api.resumableDownloads();
+      for (const r of resumable) {
+        if (!transfers[r.transfer_id]) {
+          transfers[r.transfer_id] = {
+            manifest_id: r.transfer_id,
+            artifact: r.artifact || r.transfer_id,
+            phase: "paused",
+            bytes_done: r.bytes_done || 0,
+            bytes_total: r.bytes_total || 0,
+            mbps: 0,
+          };
+        }
+      }
+      transfers = { ...transfers };
+    } catch (e) {}
+
     try {
       const { getCurrentWebview } = await import("@tauri-apps/api/webview");
       await getCurrentWebview().onDragDropEvent((event) => {
@@ -93,8 +260,7 @@
           if (f) dropComposer = { path: f };
         }
       });
-    } catch (e) {
-    }
+    } catch (e) {}
   });
 
   function onKey(e) {
@@ -108,33 +274,92 @@
     }
   }
 
-  async function pauseTransfer() {
-    if (transfer) transfer = { ...transfer, phase: "pausing", mbps: 0, etaSec: null };
+  // Per-row pause/stop/resume/remove, keyed by transfer_id.
+  async function pauseTransfer(id) {
+    if (transfers[id])
+      transfers[id] = { ...transfers[id], phase: "pausing", mbps: 0, etaSec: null };
+    transfers = { ...transfers };
     try {
-      await api.pauseDownload();
+      await api.pauseDownload(id);
     } catch (e) {}
   }
-  async function stopTransfer() {
-    if (transfer) transfer = { ...transfer, phase: "stopping", mbps: 0, etaSec: null };
+  async function stopTransfer(id) {
+    if (transfers[id])
+      transfers[id] = { ...transfers[id], phase: "stopping", mbps: 0, etaSec: null };
+    transfers = { ...transfers };
     try {
-      await api.stopDownload();
+      await api.stopDownload(id);
     } catch (e) {}
   }
-  async function resumeTransfer() {
-    if (!transfer) return;
-    const id = transfer.manifest_id;
-    // Always give immediate feedback so a press never feels like a no-op; the
-    // real phase (downloading / waiting for peers / error) arrives via events.
-    transfer = { ...transfer, phase: "starting", mbps: 0, etaSec: null };
-    lastTick = null;
+  async function resumeTransfer(id) {
+    const row = transfers[id];
+    if (!row) return;
+    // Guard against a double-press: once the row is starting / running, a second
+    // resume would hit the engine's already-running guard and flip the live card
+    // to a scary "transfer is already running" error. Only resume a settled row.
+    const ph = row.phase || "";
+    if (!isResumablePhase(ph)) return;
+    // Always give immediate feedback so a press never feels like a no-op; the real
+    // phase (downloading / waiting for peers / error) arrives via events.
+    transfers[id] = { ...row, phase: "starting", mbps: 0, etaSec: null, lastTick: null };
+    transfers = { ...transfers };
     if (!id) {
-      transfer = { ...transfer, phase: "error: nothing to resume" };
+      transfers[id] = { ...transfers[id], phase: "error: nothing to resume" };
+      transfers = { ...transfers };
       return;
     }
     try {
       await api.resumeDownload(id);
     } catch (e) {
-      transfer = { ...transfer, phase: "error: " + e };
+      transfers[id] = { ...transfers[id], phase: "error: " + e };
+      transfers = { ...transfers };
+    }
+  }
+  async function removeTransfer(id) {
+    // A paused / waiting / errored row still has a kept `.part` + resumable DB row
+    // on disk; removing it must discard those (else they leak). A done / stopped
+    // row was already cleaned up, so a registry-only forget is enough. discard is
+    // a superset of remove, so erring toward it is safe.
+    const phase = (transfers[id] && transfers[id].phase) || "";
+    const hasPartial =
+      phase === "paused" ||
+      phase === "waiting" ||
+      phase === "failed" ||
+      phase.startsWith("error");
+    delete transfers[id];
+    transfers = { ...transfers };
+    try {
+      if (hasPartial) await api.discardTransfer(id);
+      else await api.removeTransfer(id);
+    } catch (e) {}
+  }
+
+  // Pause / resume every transfer at once (Transfers header actions). Pause-all
+  // optimistically flips each live row to "pausing" for instant feedback; the per-
+  // transfer done events settle them. Resume-all asks the engine to re-drive every
+  // resumable transfer; each emits its own terminal event handled by onDone.
+  async function pauseAll() {
+    for (const id of Object.keys(transfers)) {
+      const ph = (transfers[id] && transfers[id].phase) || "";
+      if (isActivePhase(ph))
+        transfers[id] = { ...transfers[id], phase: "pausing", mbps: 0, etaSec: null };
+    }
+    transfers = { ...transfers };
+    try {
+      await api.pauseAll();
+    } catch (e) {}
+  }
+  async function resumeAll() {
+    // Snapshot only the rows the UI currently shows as resumable (paused / waiting),
+    // excluding failed/errored cards and any transfer with no visible card. Drive
+    // each through the same per-id resume path as the row's own Resume button — so a
+    // bulk resume can never silently re-drive a failed download or an orphaned
+    // backend row the user can't see (the old `api.resumeAll()` did both).
+    const ids = Object.keys(transfers).filter((id) =>
+      isResumeAllPhase((transfers[id] && transfers[id].phase) || "")
+    );
+    for (const id of ids) {
+      resumeTransfer(id);
     }
   }
 
@@ -142,58 +367,78 @@
     tab = "transfers";
   }
 
-  const settledPhase = (ph) =>
-    !ph ||
-    ["done", "paused", "stopped", "waiting"].includes(ph) ||
-    String(ph).startsWith("error");
+  // Create an optimistic provisional row under a unique temp key and return it.
+  // The key is passed to the backend as `client_ref`; the `download://registered`
+  // event echoes it back with the real id so we re-key exactly this row. An optional
+  // `onSettle` is invoked once the transfer reaches a terminal state, so the
+  // launching view can clear its inline acknowledgement.
+  function beginProvisional(seed, onSettle) {
+    const tmp = "tmp_" + tmpSeq++;
+    transfers[tmp] = { manifest_id: tmp, mbps: 0, lastTick: null, ...seed };
+    if (typeof onSettle === "function") settleCbs[tmp] = onSettle;
+    transfers = { ...transfers };
+    return tmp;
+  }
 
-  // Tear down any in-flight transfer and wait for the engine to unwind it before
-  // starting a new one, so two downloads never overlap (which can leave the next
-  // pull stuck reusing a half-open peer connection).
-  async function stopActiveAndSettle() {
-    if (!transfer || settledPhase(transfer.phase)) return;
+  // Tag a provisional row as errored — but only if it hasn't already been re-keyed
+  // to its real id (in which case the `done` event carries the failure instead).
+  // Either way the launching view's ack must clear, so settle the ref too.
+  function failProvisional(ref, e) {
+    if (ref && transfers[ref]) {
+      transfers[ref] = { ...transfers[ref], phase: "error: " + e };
+      transfers = { ...transfers };
+    }
+    if (ref) settle(ref);
+  }
+
+  async function startMesh(m, onSettle) {
+    const ref = beginProvisional(
+      {
+        artifact: m.name,
+        bytes_done: 0,
+        bytes_total: m.size || 0,
+        phase: "starting",
+      },
+      onSettle
+    );
     try {
-      await api.stopDownload();
-    } catch (e) {}
-    for (let i = 0; i < 25; i++) {
-      if (!transfer || settledPhase(transfer.phase)) return;
-      await new Promise((r) => setTimeout(r, 100));
+      await api.addFromMesh(m, ref);
+    } catch (e) {
+      failProvisional(ref, e);
     }
   }
 
-  async function startMesh(m) {
-    await stopActiveAndSettle();
-    transfer = {
-      manifest_id: m.blake3,
-      artifact: m.name,
-      bytes_done: 0,
-      bytes_total: m.size || 0,
-      phase: "starting",
-      mbps: 0,
-    };
-    lastTick = null;
+  async function startDownload(id, file, onSettle) {
+    const ref = beginProvisional(
+      {
+        artifact: file || id,
+        bytes_done: 0,
+        bytes_total: 0,
+        phase: "starting",
+      },
+      onSettle
+    );
     try {
-      await api.addFromMesh(m);
+      await api.download(id, file, ref);
     } catch (e) {
-      transfer = { ...transfer, phase: "error: " + e };
+      failProvisional(ref, e);
     }
   }
 
-  async function startDownload(id, file) {
-    await stopActiveAndSettle();
-    transfer = {
-      manifest_id: id,
-      artifact: file || id,
-      bytes_done: 0,
-      bytes_total: 0,
-      phase: "starting",
-      mbps: 0,
-    };
-    lastTick = null;
+  async function startLink(link, onSettle) {
+    const ref = beginProvisional(
+      {
+        artifact: "share link",
+        bytes_done: 0,
+        bytes_total: 0,
+        phase: "starting",
+      },
+      onSettle
+    );
     try {
-      await api.download(id, file);
+      await api.addByLink(link, ref);
     } catch (e) {
-      transfer = { ...transfer, phase: "error: " + e };
+      failProvisional(ref, e);
     }
   }
 
@@ -206,30 +451,12 @@
       } catch (e) {}
     }
   }
-
-  async function startLink(link) {
-    await stopActiveAndSettle();
-    transfer = {
-      manifest_id: link,
-      artifact: "share link",
-      bytes_done: 0,
-      bytes_total: 0,
-      phase: "starting",
-      mbps: 0,
-    };
-    lastTick = null;
-    try {
-      await api.addByLink(link);
-    } catch (e) {
-      transfer = { ...transfer, phase: "error: " + e };
-    }
-  }
 </script>
 
 <svelte:window on:keydown={onKey} />
 
 <div class="app">
-  <Sidebar {tab} {transfer} {info} on:nav={(e) => (tab = e.detail)} />
+  <Sidebar {tab} {transfers} {info} on:nav={(e) => (tab = e.detail)} />
   <main class="main">
     {#if tab === "discover"}
       <Discover {startDownload} {goTransfers} focus={discoverFocus} />
@@ -238,7 +465,15 @@
     {:else if tab === "library"}
       <Library />
     {:else if tab === "transfers"}
-      <Transfers {transfer} pause={pauseTransfer} stop={stopTransfer} resume={resumeTransfer} />
+      <Transfers
+        {transfers}
+        pause={pauseTransfer}
+        stop={stopTransfer}
+        resume={resumeTransfer}
+        remove={removeTransfer}
+        {pauseAll}
+        {resumeAll}
+      />
     {:else if tab === "settings"}
       <Settings {applyTheme} />
     {/if}
@@ -250,13 +485,21 @@
     <div class="modal" style="max-width:460px">
       <div class="modal-head"><h3>Welcome to Noema Studio</h3></div>
       <p class="muted">
-        Verified, multi-source model downloads that dedup into one cache and can
-        be shared worldwide over the mesh.
+        Verified, multi-source model downloads that dedup into one cache and can be
+        shared worldwide over the mesh.
       </p>
       <p class="muted">
-        Worldwide sharing is on by default — your verified, openly-licensed
-        downloads are re-seeded to peers. Gated and privately-imported models
-        stay private unless you opt them in.
+        Sharing is on by default — your verified, openly-licensed downloads are
+        re-seeded to peers over BitTorrent and the worldwide mesh. BitTorrent binds
+        local ports for inbound peers; reachability isn't guaranteed behind every
+        NAT, so we can't promise a relay. Gated and privately-imported models stay
+        private unless you opt them in.
+      </p>
+      <p class="muted">
+        Privacy note: BitTorrent announces your IP address and the model's info-hash
+        to the DHT and public trackers, so peers can see your IP is downloading or
+        sharing that file. A SOCKS5 proxy routes this through the proxy; any other
+        proxy still exposes your real IP. Tune trackers and proxy under Settings.
       </p>
       <div class="actions">
         <button class="btn" on:click={() => { dismissIntro(); tab = "settings"; }}>Review sharing</button>

@@ -2,7 +2,7 @@
   import { createEventDispatcher } from "svelte";
   import logo from "./logo.png?inline";
   export let tab;
-  export let transfer = null;
+  export let transfers = {};
   export let info;
   const dispatch = createEventDispatcher();
   const items = [
@@ -12,7 +12,23 @@
     { id: "transfers", label: "Transfers" },
     { id: "settings", label: "Settings" },
   ];
-  $: active = transfer && transfer.phase !== "done" && !String(transfer.phase).startsWith("error");
+  // Active = genuinely running, fetching bytes. Exclude paused / waiting-for-peers /
+  // pausing / stopping and the terminal states (done / stopped / error) — a paused or
+  // stalled transfer isn't "downloading" and must not inflate the badge or the
+  // aggregate speed. The running phases mirror the engine's live tokens.
+  const RUNNING = new Set([
+    "starting",
+    "queued",
+    "connecting",
+    "discovering peers",
+    "downloading",
+    "verifying",
+    "seeding",
+  ]);
+  $: rows = Object.values(transfers);
+  $: activeRows = rows.filter((t) => RUNNING.has(t.phase));
+  $: active = activeRows.length > 0;
+  $: totalMbps = activeRows.reduce((a, t) => a + (t.mbps || 0), 0);
 </script>
 
 <aside class="side">
@@ -45,8 +61,10 @@
 
   <div class="side-foot">
     {#if active}
-      <div class="dl">↓ {transfer.mbps ? transfer.mbps.toFixed(1) : "0.0"} MB/s</div>
-      <div class="muted">downloading…</div>
+      <div class="dl">↓ {totalMbps.toFixed(1)} MB/s</div>
+      <div class="muted">
+        {activeRows.length} transfer{activeRows.length === 1 ? "" : "s"}…
+      </div>
     {:else}
       <div class="muted">idle</div>
     {/if}

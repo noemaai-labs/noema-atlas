@@ -94,15 +94,19 @@
 
   async function applyDevice() {
     try {
-      await api.applyIdentity(s.device_name, s.group_code);
+      await api.applyIdentity(s.device_name);
       flash("Device identity updated");
     } catch (e) {
       error = String(e);
     }
   }
-  async function makeGroup() {
+
+  // The download-routing preference applies live (no restart), then persists.
+  async function applyPreference() {
     try {
-      s.group_code = await api.createGroup();
+      await api.setDownloadPreference(s.download_preference);
+      await api.saveSettings(s);
+      flash("Download preference updated");
     } catch (e) {
       error = String(e);
     }
@@ -153,11 +157,6 @@
 
     <div class="section">This device</div>
     <label class="field"><span>Device name (shown to peers)</span><input bind:value={s.device_name} on:blur={applyDevice} /></label>
-    <label class="field">
-      <span>Link my own devices — shared group code</span>
-      <input bind:value={s.group_code} placeholder="paste the same code on each device" on:blur={applyDevice} />
-    </label>
-    <button class="btn sm" on:click={makeGroup}>Generate a group code</button>
 
     <div class="section">Hugging Face account</div>
     <div class="row">
@@ -180,7 +179,50 @@
     </div>
     <label class="field"><span>Download speed cap (Mbps, 0 = unlimited)</span><input type="number" min="0" bind:value={s.download_cap_mbps} on:change={save} /></label>
     <label class="field"><span>Parallel connections (1–16)</span><input type="number" min="1" max="16" bind:value={s.download_connections} on:change={save} /></label>
-    <label class="check"><input type="checkbox" bind:checked={s.skip_download_confirm} on:change={save} /> Download share links & Explore models immediately (skip confirm)</label>
+    <label class="field">
+      <span>Download preference</span>
+      <select bind:value={s.download_preference} on:change={applyPreference}>
+        <option value={0}>Auto (balanced)</option>
+        <option value={1}>Prefer peer-to-peer</option>
+        <option value={2}>Prefer BitTorrent</option>
+        <option value={3}>Save data (single mirror)</option>
+      </select>
+    </label>
+
+    <div class="section">BitTorrent</div>
+    <div class="row">
+      <div>
+        <div>Enable BitTorrent</div>
+        <div class="muted">Download from and connect to the BitTorrent swarm (µTP + DHT)</div>
+      </div>
+      <label class="switch"><input type="checkbox" bind:checked={s.bt_enabled} on:change={save} /><span></span></label>
+    </div>
+    <div class="row">
+      <div>
+        <div>Use public BitTorrent trackers</div>
+        <div class="muted">Find more peers via well-known public trackers, in addition to the DHT</div>
+      </div>
+      <label class="switch"><input type="checkbox" bind:checked={s.bt_use_public_trackers} on:change={save} disabled={!s.bt_enabled} /><span></span></label>
+    </div>
+    <p class="muted" style="margin-top:6px">
+      Privacy: BitTorrent announces your IP address and the model's info-hash to the DHT
+      and, when enabled above, to public trackers — so peers and tracker operators can see
+      that your IP is downloading or sharing that file. A SOCKS5 proxy routes this through
+      the proxy; any other proxy still exposes your real IP to BitTorrent peers.
+    </p>
+    <div class="row">
+      <div>
+        <div>Seed completed downloads</div>
+        <div class="muted">Re-share verified, openly-licensed blobs back over BitTorrent</div>
+      </div>
+      <label class="switch"><input type="checkbox" bind:checked={s.bt_seed} on:change={save} disabled={!s.bt_enabled} /><span></span></label>
+    </div>
+    <label class="field"><span>Preferred listen port (0 = default range)</span><input type="number" min="0" max="65535" bind:value={s.bt_port} on:change={save} disabled={!s.bt_enabled} /></label>
+    <label class="field"><span>Upload cap (Mbps, 0 = unlimited)</span><input type="number" min="0" bind:value={s.bt_up_cap_mbps} on:change={save} disabled={!s.bt_enabled} /></label>
+    <label class="field"><span>Download cap (Mbps, 0 = unlimited)</span><input type="number" min="0" bind:value={s.bt_down_cap_mbps} on:change={save} disabled={!s.bt_enabled} /></label>
+    <label class="field"><span>Max concurrent transfers (applies on next launch)</span><input type="number" min="1" max="32" bind:value={s.bt_max_concurrent} on:change={save} /></label>
+    <label class="field"><span>Stop seeding at ratio (0 = unlimited)</span><input type="number" min="0" step="0.1" bind:value={s.bt_max_ratio} on:change={save} disabled={!s.bt_enabled} /></label>
+    <p class="muted" style="margin-top:6px">BitTorrent changes apply on next launch — the session binds ports at startup. Inbound peers depend on your network (no relay guarantee).</p>
 
     <div class="section">Network</div>
     <div class="row">

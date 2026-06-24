@@ -3,9 +3,9 @@ use eframe::egui;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum TransportKind {
     Iroh,
-    Ipfs,
     Https,
     HuggingFace,
+    BitTorrent,
     File,
     Unknown,
 }
@@ -18,9 +18,9 @@ impl TransportKind {
     pub fn display_name(self) -> &'static str {
         match self {
             Self::Iroh => "Iroh",
-            Self::Ipfs => "IPFS",
             Self::Https => "HTTPS",
             Self::HuggingFace => "Hugging Face",
+            Self::BitTorrent => "BitTorrent",
             Self::File => "Local file",
             Self::Unknown => "Source",
         }
@@ -29,9 +29,9 @@ impl TransportKind {
     pub fn short_label(self) -> &'static str {
         match self {
             Self::Iroh => "Iroh",
-            Self::Ipfs => "IPFS",
             Self::Https => "HTTPS",
             Self::HuggingFace => "HF",
+            Self::BitTorrent => "BT",
             Self::File => "File",
             Self::Unknown => "SRC",
         }
@@ -40,9 +40,9 @@ impl TransportKind {
     pub fn color(self) -> egui::Color32 {
         match self {
             Self::Iroh => egui::Color32::from_rgb(0x6c, 0x9c, 0xff),
-            Self::Ipfs => egui::Color32::from_rgb(0x4d, 0xd0, 0xe1),
             Self::Https => egui::Color32::from_rgb(0x5d, 0xb0, 0xff),
             Self::HuggingFace => egui::Color32::from_rgb(0xff, 0xb3, 0x47),
+            Self::BitTorrent => egui::Color32::from_rgb(0x6f, 0xcf, 0x7f),
             Self::File => egui::Color32::from_rgb(0x9a, 0x9a, 0x9a),
             Self::Unknown => egui::Color32::from_rgb(0x8a, 0x8a, 0x8a),
         }
@@ -65,12 +65,12 @@ pub fn kind_from_source_id(source_id: &str) -> TransportKind {
     let s = source_id.trim().to_ascii_lowercase();
     if s.starts_with("iroh:") {
         TransportKind::Iroh
-    } else if s.starts_with("ipfs:") {
-        TransportKind::Ipfs
     } else if s.starts_with("https:") {
         TransportKind::Https
     } else if s.starts_with("hf:") {
         TransportKind::HuggingFace
+    } else if s.starts_with("bittorrent") || s.starts_with("magnet:") {
+        TransportKind::BitTorrent
     } else if s.starts_with("file:") {
         TransportKind::File
     } else {
@@ -127,28 +127,6 @@ pub fn paint_transport_glyph(
             painter.line_segment([c, a], stroke);
             painter.circle_stroke(center, radius * 0.30, stroke);
         }
-        TransportKind::Ipfs => {
-            let top = center + egui::vec2(0.0, -radius * 0.82);
-            let upper_left = center + egui::vec2(-radius * 0.70, -radius * 0.32);
-            let upper_right = center + egui::vec2(radius * 0.70, -radius * 0.32);
-            let lower_left = center + egui::vec2(-radius * 0.70, radius * 0.38);
-            let lower_right = center + egui::vec2(radius * 0.70, radius * 0.38);
-            let bottom = center + egui::vec2(0.0, radius * 0.86);
-            painter.add(egui::Shape::closed_line(
-                vec![
-                    top,
-                    upper_right,
-                    lower_right,
-                    bottom,
-                    lower_left,
-                    upper_left,
-                ],
-                stroke,
-            ));
-            painter.line_segment([upper_left, center], stroke);
-            painter.line_segment([upper_right, center], stroke);
-            painter.line_segment([bottom, center], stroke);
-        }
         TransportKind::Https => {
             let body = egui::Rect::from_center_size(
                 center + egui::vec2(0.0, radius * 0.22),
@@ -201,6 +179,24 @@ pub fn paint_transport_glyph(
                 ],
                 stroke,
             );
+        }
+        TransportKind::BitTorrent => {
+            // A swarm glyph: a central node with peers around it feeding in.
+            painter.circle_stroke(center, radius * 0.30, stroke);
+            for (dx, dy) in [
+                (-0.78_f32, -0.62_f32),
+                (0.78, -0.62),
+                (-0.78, 0.62),
+                (0.78, 0.62),
+            ] {
+                let node = center + egui::vec2(radius * dx, radius * dy);
+                painter.circle_filled(node, radius * 0.16, color);
+                let dir = (center - node).normalized();
+                painter.line_segment(
+                    [node + dir * radius * 0.20, center - dir * radius * 0.34],
+                    stroke,
+                );
+            }
         }
         TransportKind::File => {
             let page =

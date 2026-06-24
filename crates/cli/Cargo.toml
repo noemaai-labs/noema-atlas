@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [features]
 iroh = ["noema-core/iroh"]
+bittorrent = ["noema-core/bittorrent"]
 
 [dependencies]
 noema-core = { workspace = true }
