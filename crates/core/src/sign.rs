@@ -45,6 +45,13 @@ impl KeyPair {
         format!("ed25519:{}", self.public_hex())
     }
 
+    /// Raw ed25519 signature (64 bytes) over arbitrary bytes. Used by callers that
+    /// sign their own canonical payload rather than a [`Manifest`] (e.g. the release
+    /// manifest in [`crate::update`]).
+    pub fn sign_bytes(&self, msg: &[u8]) -> [u8; 64] {
+        self.signing.sign(msg).to_bytes()
+    }
+
     /// The [`PublicKey`] descriptor to embed in a manifest.
     pub fn public_key_descriptor(&self) -> PublicKey {
         PublicKey {

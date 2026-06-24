@@ -50,6 +50,40 @@ impl HfModel {
     pub fn has_gguf(&self) -> bool {
         self.tags.iter().any(|t| t == "gguf")
     }
+    /// The weight/serialization formats this repo publishes (GGUF, Safetensors,
+    /// MLX, ONNX, …), read from its Hub tags and returned as canonical ids in a
+    /// stable display order. Ids match [`crate::inspect::pretty_format`], so the
+    /// Discover card chips read identically to the per-variant format badges.
+    /// Deduped; empty when no recognized format tag is present.
+    pub fn model_formats(&self) -> Vec<&'static str> {
+        // (Hub tag, canonical format id), ordered by display priority. GGUF and
+        // MLX lead because they're the locally-runnable formats Atlas targets.
+        // Tags are the library identifiers the Hub actually emits; a couple of
+        // formats have two spellings (jax/flax, paddle/paddlepaddle) folded here.
+        const MAP: &[(&str, &str)] = &[
+            ("gguf", "gguf"),
+            ("mlx", "mlx"),
+            ("safetensors", "safetensors"),
+            ("onnx", "onnx"),
+            ("coreml", "coreml"),
+            ("pytorch", "pytorch"),
+            ("ggml", "ggml"),
+            ("tflite", "tflite"),
+            ("keras", "keras"),
+            ("flax", "flax"),
+            ("jax", "flax"),
+            ("paddlepaddle", "paddle"),
+            ("paddle", "paddle"),
+            ("tensorrt", "tensorrt"),
+        ];
+        let mut out: Vec<&'static str> = Vec::new();
+        for (tag, fmt) in MAP {
+            if !out.contains(fmt) && self.tags.iter().any(|t| t.eq_ignore_ascii_case(tag)) {
+                out.push(fmt);
+            }
+        }
+        out
+    }
     /// A few human-friendly capability tags for display (deduped, no `prefix:`).
     pub fn display_tags(&self) -> Vec<String> {
         self.tags
@@ -978,6 +1012,45 @@ mod tests {
         assert!(parse_gated(&serde_json::json!("manual")));
         assert!(!parse_gated(&serde_json::json!(false)));
         assert!(!parse_gated(&serde_json::json!("false")));
+    }
+
+    fn hf_model(tags: &[&str]) -> HfModel {
+        HfModel {
+            id: "org/Model".into(),
+            downloads: 0,
+            likes: 0,
+            pipeline_tag: None,
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            last_modified: None,
+            gated: false,
+        }
+    }
+
+    #[test]
+    fn model_formats_from_tags() {
+        // Multiple format tags surface as canonical ids in display order,
+        // independent of tag order in the API payload.
+        assert_eq!(
+            hf_model(&["safetensors", "transformers", "gguf", "region:us"]).model_formats(),
+            vec!["gguf", "safetensors"],
+        );
+        // The real Hub library tags map to their canonical ids, case-insensitively.
+        assert_eq!(
+            hf_model(&["MLX", "CoreML", "flax"]).model_formats(),
+            vec!["mlx", "coreml", "flax"],
+        );
+        // Alias spellings fold to the same id (jax -> flax, paddlepaddle -> paddle)
+        // and never produce a duplicate chip for that format.
+        assert_eq!(hf_model(&["jax", "flax"]).model_formats(), vec!["flax"],);
+        assert_eq!(hf_model(&["paddlepaddle"]).model_formats(), vec!["paddle"],);
+        // No recognized weight format -> no chips.
+        assert!(hf_model(&["text-generation", "en", "license:mit"])
+            .model_formats()
+            .is_empty());
+        // The mixed-case labels (Core ML / Safetensors / PaddlePaddle) come from
+        // the shared pretty_format, so card chips read the same as variant badges.
+        assert_eq!(crate::inspect::pretty_format("coreml"), "Core ML");
+        assert_eq!(crate::inspect::pretty_format("safetensors"), "Safetensors");
     }
 
     #[test]

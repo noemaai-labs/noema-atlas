@@ -143,6 +143,15 @@ CREATE TABLE IF NOT EXISTS bt_uploaded (
     uploaded_bytes INTEGER NOT NULL,
     updated_at     TEXT NOT NULL
 );
+
+-- Per-model BitTorrent stop-at-ratio override (blake3 -> cap). Present only for
+-- blobs the user gave an explicit per-model ratio; absent blobs follow the global
+-- cap. `cap` is stored as a REAL (0.0 = unlimited for this blob).
+CREATE TABLE IF NOT EXISTS bt_blob_ratio (
+    blake3      TEXT PRIMARY KEY,
+    cap         REAL NOT NULL,
+    updated_at  TEXT NOT NULL
+);
 "#;
 
 /// Additive column migrations for indexes created before the column existed.
@@ -683,6 +692,55 @@ impl Db {
             )
             .optional()?;
         Ok(v.unwrap_or(0).max(0) as u64)
+    }
+
+    /// Set or clear a per-model BitTorrent stop-at-ratio override. `Some(cap)` stores
+    /// it (`0.0` = unlimited for this blob); `None` removes the override so the blob
+    /// follows the global cap. Best-effort: a DB error is logged, not propagated, so a
+    /// settings change never fails on persistence.
+    pub fn set_bt_blob_ratio(&self, blake3: &str, cap: Option<f64>) {
+        let conn = self.lock();
+        let res = match cap {
+            Some(c) => conn.execute(
+                "INSERT OR REPLACE INTO bt_blob_ratio (blake3, cap, updated_at)
+                 VALUES (?1, ?2, ?3)",
+                params![blake3, c, crate::util::now_rfc3339()],
+            ),
+            None => conn.execute(
+                "DELETE FROM bt_blob_ratio WHERE blake3 = ?1",
+                params![blake3],
+            ),
+        };
+        if let Err(e) = res {
+            tracing::warn!(error = %e, blake3, "db: set_bt_blob_ratio failed");
+        }
+    }
+
+    /// This blob's per-model ratio override, if one is stored (else `None`).
+    pub fn bt_blob_ratio(&self, blake3: &str) -> Option<f64> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT cap FROM bt_blob_ratio WHERE blake3 = ?1",
+            params![blake3],
+            |r| r.get::<_, f64>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    /// All persisted per-model ratio overrides, for re-applying at engine startup.
+    pub fn all_bt_blob_ratios(&self) -> Vec<(String, f64)> {
+        let conn = self.lock();
+        let mut stmt = match conn.prepare("SELECT blake3, cap FROM bt_blob_ratio") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)));
+        match rows {
+            Ok(it) => it.filter_map(|r| r.ok()).collect(),
+            Err(_) => Vec::new(),
+        }
     }
 
     pub fn upsert_cache_blob(&self, meta: &BlobMeta, state: &str) -> Result<()> {
@@ -1251,6 +1309,30 @@ mod tests {
         // Monotonic overwrite (the watcher persists the running lifetime total).
         db.set_bt_uploaded(&b3, 9_500).unwrap();
         assert_eq!(db.bt_uploaded(&b3).unwrap(), 9_500);
+    }
+
+    #[test]
+    fn bt_blob_ratio_round_trip() {
+        let db = Db::open_in_memory().unwrap();
+        let a = "11".repeat(32);
+        let b = "22".repeat(32);
+        // No override by default.
+        assert_eq!(db.bt_blob_ratio(&a), None);
+        assert!(db.all_bt_blob_ratios().is_empty());
+        // Set, read back, and overwrite.
+        db.set_bt_blob_ratio(&a, Some(2.5));
+        db.set_bt_blob_ratio(&b, Some(0.0)); // 0.0 = unlimited override
+        assert_eq!(db.bt_blob_ratio(&a), Some(2.5));
+        assert_eq!(db.bt_blob_ratio(&b), Some(0.0));
+        db.set_bt_blob_ratio(&a, Some(4.0));
+        assert_eq!(db.bt_blob_ratio(&a), Some(4.0));
+        let mut all = db.all_bt_blob_ratios();
+        all.sort_by(|x, y| x.0.cmp(&y.0));
+        assert_eq!(all, vec![(a.clone(), 4.0), (b.clone(), 0.0)]);
+        // Clearing removes the override.
+        db.set_bt_blob_ratio(&a, None);
+        assert_eq!(db.bt_blob_ratio(&a), None);
+        assert_eq!(db.all_bt_blob_ratios(), vec![(b.clone(), 0.0)]);
     }
 
     #[test]

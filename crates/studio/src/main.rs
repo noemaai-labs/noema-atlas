@@ -35,9 +35,14 @@ fn build_engine(root: &std::path::Path, s: &StudioSettings) -> anyhow::Result<En
     // Always wire the tracker (falls back to the hosted default) so Explore /
     // worldwide discovery works.
     cfg.tracker_url = Some(s.tracker());
+    // Iroh fetch route: master AND its download sub-switch. The worldwide seeder is
+    // gated separately (the share toggle / launch auto-start below), so "seed on,
+    // download off" and "download on, seed off" both work.
+    cfg.transport.iroh_enabled = s.iroh_enabled && s.iroh_download;
     // BitTorrent settings take effect on next launch (the session binds ports and
     // opens the store at engine open) — the front-end says as much.
     cfg.transport.bittorrent_enabled = s.bt_enabled;
+    cfg.transport.bittorrent_download = s.bt_download;
     cfg.transport.bittorrent_seed = s.bt_seed;
     cfg.transport.bittorrent_listen_port_range = s.bt_listen_range();
     cfg.transport.bittorrent_max_up_bps = s.bt_up_bps();
@@ -45,6 +50,7 @@ fn build_engine(root: &std::path::Path, s: &StudioSettings) -> anyhow::Result<En
     // Stop-at-ratio: the seeding watch is armed at session open, so this takes
     // effect on next launch (the Settings field says as much).
     cfg.transport.bittorrent_max_ratio = s.bt_max_ratio.max(0.0);
+    cfg.transport.bittorrent_sequential = s.bt_sequential;
     // Public trackers (in addition to the DHT). Privacy-relevant — see the Settings
     // disclosure. Takes effect on next launch (trackers are attached at add-time).
     cfg.transport.bittorrent_use_public_trackers = s.bt_use_public_trackers;
@@ -90,8 +96,12 @@ fn main() {
 
     let engine = build_engine(&root, &settings).expect("failed to open the Noema engine");
     engine.set_hf_download_enabled(settings.allow_hf_download);
+    // Install the time-of-day bandwidth schedule (alternative speed limits) and start
+    // its per-minute ticker.
+    engine.set_bandwidth_schedule(settings.bandwidth_schedule());
 
-    let start_share_on_launch = settings.share_worldwide;
+    // Seed over Iroh only when the master is on AND the seed sub-switch is on.
+    let start_share_on_launch = settings.iroh_enabled && settings.share_worldwide;
     let state = AppState {
         engine: Arc::new(engine),
         root,
@@ -100,6 +110,8 @@ fn main() {
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             commands::app_info,
@@ -144,6 +156,11 @@ fn main() {
             commands::bt_peers_for_blob,
             commands::set_download_preference,
             commands::pause_all,
+            commands::bt_blob_ratio,
+            commands::set_bt_blob_ratio,
+            commands::bt_force_recheck,
+            commands::download_queue_order,
+            commands::queue_reorder,
             commands::clear_cache,
             commands::export_diagnostics,
             commands::reveal,

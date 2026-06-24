@@ -3,6 +3,27 @@
   import { api } from "../api.js";
   import { fmtSize } from "../format.js";
   export let applyTheme;
+  // Provided by App.svelte: runs the Tauri updater check, returns
+  // "available" | "current" | "error:<msg>".
+  export let checkUpdates = async () => "current";
+
+  let updChecking = false;
+  async function onAutoUpdateToggle() {
+    await save();
+    // Enabling it mid-session should check right away, not wait for next launch.
+    if (s.auto_update) checkNow();
+  }
+  async function checkNow() {
+    updChecking = true;
+    try {
+      const r = await checkUpdates();
+      if (r === "available") flash("Update available — see the banner at the top.");
+      else if (r === "current") flash("You're on the latest version.");
+      else flash("Update check failed: " + r.replace(/^error:/, ""));
+    } finally {
+      updChecking = false;
+    }
+  }
 
   let s = null;
   let saving = false;
@@ -19,6 +40,34 @@
   function flash(m) {
     toast = m;
     setTimeout(() => (toast = ""), 2500);
+  }
+
+  // Bandwidth schedule helpers. Time inputs are "HH:MM"; the engine stores minutes
+  // since local midnight. Days are a bitmask (bit 0 = Mon … bit 6 = Sun).
+  const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+  function minToTime(min) {
+    const m = ((Number(min) || 0) % 1440 + 1440) % 1440;
+    const h = Math.floor(m / 60);
+    const r = m % 60;
+    return String(h).padStart(2, "0") + ":" + String(r).padStart(2, "0");
+  }
+  function timeToMin(v) {
+    const [h, m] = String(v || "0:0").split(":").map((x) => parseInt(x, 10) || 0);
+    return (h * 60 + m) % 1440;
+  }
+  function hasDay(i) {
+    return (s.bt_schedule_days & (1 << i)) !== 0;
+  }
+  function toggleDay(i) {
+    s.bt_schedule_days ^= 1 << i;
+    saveSchedule();
+  }
+  async function saveSchedule() {
+    try {
+      await api.saveSettings(s);
+    } catch (e) {
+      error = String(e);
+    }
   }
 
   onMount(async () => {
@@ -55,17 +104,20 @@
     }
   }
 
-  async function toggleWorldwide() {
+  // Iroh's seeder toggles live; the download route applies on next launch. Both the
+  // "Use Iroh" master and the "Seed worldwide" sub-switch reconcile through here, so
+  // the live seeder matches (iroh_enabled && share_worldwide).
+  async function reconcileIroh() {
     try {
       await api.saveSettings(s);
-      if (s.share_worldwide) {
+      if (s.iroh_enabled && s.share_worldwide) {
         await api.startWorldwide();
         sharing = true;
-        flash("Sharing worldwide");
+        flash("Seeding worldwide over Iroh");
       } else {
         await api.stopWorldwide();
         sharing = false;
-        flash("Stopped sharing");
+        flash(s.iroh_enabled ? "Stopped seeding over Iroh" : "Iroh off");
       }
     } catch (e) {
       error = String(e);
@@ -139,21 +191,105 @@
   {#if error}<p class="err">{error}</p>{/if}
 
   {#if s}
-    <div class="section">Sharing</div>
+    <div class="section">Iroh</div>
     <div class="row">
       <div>
-        <div>Share downloads worldwide</div>
+        <div>Use Iroh</div>
         <div class="muted">
-          Seed verified, openly-licensed models to peers over the mesh
-          {#if sharing}<span class="pill ok">live</span>{/if}
+          NAT-traversing peer-to-peer networking — no ports to open. Turn it off to disable
+          Iroh entirely; while it's on, the switches below choose whether you download from
+          peers, seed back to the mesh, or both.
+          {#if sharing}<span class="pill ok">seeding</span>{/if}
         </div>
       </div>
-      <label class="switch"><input type="checkbox" bind:checked={s.share_worldwide} on:change={toggleWorldwide} /><span></span></label>
+      <label class="switch"><input type="checkbox" bind:checked={s.iroh_enabled} on:change={reconcileIroh} /><span></span></label>
     </div>
+    <div class="subgroup">
+      <div class="row">
+        <div><div>Download over Iroh</div><div class="muted">Fetch model bytes from peers. Applies on next launch.</div></div>
+        <label class="switch"><input type="checkbox" bind:checked={s.iroh_download} on:change={save} disabled={!s.iroh_enabled} /><span></span></label>
+      </div>
+      <div class="row">
+        <div><div>Seed my models to the world</div><div class="muted">Share verified, openly-licensed models so peers can find them in Discover</div></div>
+        <label class="switch"><input type="checkbox" bind:checked={s.share_worldwide} on:change={reconcileIroh} disabled={!s.iroh_enabled} /><span></span></label>
+      </div>
+      <div class="row">
+        <div><div>Also share gated / licensed</div><div class="muted">Off by default — opt in deliberately</div></div>
+        <label class="switch"><input type="checkbox" bind:checked={s.share_gated} on:change={save} disabled={!s.iroh_enabled} /><span></span></label>
+      </div>
+    </div>
+
+    <div class="section">BitTorrent</div>
     <div class="row">
-      <div><div>Also share gated / licensed</div><div class="muted">Off by default — opt in deliberately</div></div>
-      <label class="switch"><input type="checkbox" bind:checked={s.share_gated} on:change={save} /><span></span></label>
+      <div>
+        <div>Use BitTorrent</div>
+        <div class="muted">Connect to the BitTorrent swarm (µTP + DHT). While connected, the switches below choose whether you download from the swarm, seed back to it, or both.</div>
+      </div>
+      <label class="switch"><input type="checkbox" bind:checked={s.bt_enabled} on:change={save} /><span></span></label>
     </div>
+    <div class="subgroup">
+      <div class="row">
+        <div><div>Download over BitTorrent</div><div class="muted">Fetch model bytes from the swarm. Applies on next launch.</div></div>
+        <label class="switch"><input type="checkbox" bind:checked={s.bt_download} on:change={save} disabled={!s.bt_enabled} /><span></span></label>
+      </div>
+      <div class="row">
+        <div>
+          <div>Seed openly-licensed models</div>
+          <div class="muted">Re-share verified, openly-licensed blobs back over BitTorrent</div>
+        </div>
+        <label class="switch"><input type="checkbox" bind:checked={s.bt_seed} on:change={save} disabled={!s.bt_enabled} /><span></span></label>
+      </div>
+      <div class="row">
+        <div>
+          <div>Use public BitTorrent trackers</div>
+          <div class="muted">Find more peers via well-known public trackers, in addition to the DHT</div>
+        </div>
+        <label class="switch"><input type="checkbox" bind:checked={s.bt_use_public_trackers} on:change={save} disabled={!s.bt_enabled} /><span></span></label>
+      </div>
+    </div>
+    <p class="muted" style="margin-top:6px">
+      Privacy: BitTorrent announces your IP address and the model's info-hash to the DHT
+      and, when enabled above, to public trackers — so peers and tracker operators can see
+      that your IP is downloading or sharing that file. A SOCKS5 proxy routes this through
+      the proxy; any other proxy still exposes your real IP to BitTorrent peers.
+    </p>
+    <label class="field"><span>Preferred listen port (0 = default range)</span><input type="number" min="0" max="65535" bind:value={s.bt_port} on:change={save} disabled={!s.bt_enabled} /></label>
+    <label class="field"><span>Upload cap (Mbps, 0 = unlimited)</span><input type="number" min="0" bind:value={s.bt_up_cap_mbps} on:change={save} disabled={!s.bt_enabled} /></label>
+    <label class="field"><span>Download cap (Mbps, 0 = unlimited)</span><input type="number" min="0" bind:value={s.bt_down_cap_mbps} on:change={save} disabled={!s.bt_enabled} /></label>
+    <label class="field"><span>Max concurrent transfers (applies on next launch)</span><input type="number" min="1" max="32" bind:value={s.bt_max_concurrent} on:change={save} /></label>
+    <label class="field"><span>Stop seeding at ratio (0 = unlimited)</span><input type="number" min="0" step="0.1" bind:value={s.bt_max_ratio} on:change={save} disabled={!s.bt_enabled} /></label>
+    <div class="row">
+      <div>
+        <div>Sequential download</div>
+        <div class="muted">Fetch pieces front-to-back (e.g. for streaming) instead of rarest-first. Applies live.</div>
+      </div>
+      <label class="switch"><input type="checkbox" bind:checked={s.bt_sequential} on:change={save} disabled={!s.bt_enabled} /><span></span></label>
+    </div>
+    <p class="muted" style="margin-top:6px">BitTorrent changes apply on next launch — the session binds ports at startup. Inbound peers depend on your network (no relay guarantee).</p>
+
+    <div class="section">Bandwidth schedule</div>
+    <div class="row">
+      <div>
+        <div>Alternative speed limits on a schedule</div>
+        <div class="muted">Apply the alternative caps below during a daily window (e.g. throttle by day, open up overnight). Applies live.</div>
+      </div>
+      <label class="switch"><input type="checkbox" bind:checked={s.bt_schedule_enabled} on:change={saveSchedule} /><span></span></label>
+    </div>
+    {#if s.bt_schedule_enabled}
+      <div class="variant">
+        <label class="field"><span>From</span><input type="time" value={minToTime(s.bt_schedule_from_min)} on:change={(e) => { s.bt_schedule_from_min = timeToMin(e.target.value); saveSchedule(); }} /></label>
+        <label class="field"><span>To</span><input type="time" value={minToTime(s.bt_schedule_to_min)} on:change={(e) => { s.bt_schedule_to_min = timeToMin(e.target.value); saveSchedule(); }} /></label>
+      </div>
+      <div class="days">
+        {#each DAYS as d, i}
+          <button class="btn xs {hasDay(i) ? 'primary' : ''}" type="button" on:click={() => toggleDay(i)}>{d}</button>
+        {/each}
+      </div>
+      <p class="muted" style="margin-top:4px">No days selected = every day. A window that ends before it starts wraps past midnight.</p>
+      <label class="field"><span>Alt upload cap (Mbps, 0 = unlimited)</span><input type="number" min="0" bind:value={s.bt_alt_up_cap_mbps} on:change={saveSchedule} /></label>
+      <label class="field"><span>Alt BitTorrent download cap (Mbps, 0 = unlimited)</span><input type="number" min="0" bind:value={s.bt_alt_down_cap_mbps} on:change={saveSchedule} /></label>
+      <label class="field"><span>Alt HTTP download cap (Mbps, 0 = unlimited)</span><input type="number" min="0" bind:value={s.alt_download_cap_mbps} on:change={saveSchedule} /></label>
+    {/if}
 
     <div class="section">This device</div>
     <label class="field"><span>Device name (shown to peers)</span><input bind:value={s.device_name} on:blur={applyDevice} /></label>
@@ -189,41 +325,6 @@
       </select>
     </label>
 
-    <div class="section">BitTorrent</div>
-    <div class="row">
-      <div>
-        <div>Enable BitTorrent</div>
-        <div class="muted">Download from and connect to the BitTorrent swarm (µTP + DHT)</div>
-      </div>
-      <label class="switch"><input type="checkbox" bind:checked={s.bt_enabled} on:change={save} /><span></span></label>
-    </div>
-    <div class="row">
-      <div>
-        <div>Use public BitTorrent trackers</div>
-        <div class="muted">Find more peers via well-known public trackers, in addition to the DHT</div>
-      </div>
-      <label class="switch"><input type="checkbox" bind:checked={s.bt_use_public_trackers} on:change={save} disabled={!s.bt_enabled} /><span></span></label>
-    </div>
-    <p class="muted" style="margin-top:6px">
-      Privacy: BitTorrent announces your IP address and the model's info-hash to the DHT
-      and, when enabled above, to public trackers — so peers and tracker operators can see
-      that your IP is downloading or sharing that file. A SOCKS5 proxy routes this through
-      the proxy; any other proxy still exposes your real IP to BitTorrent peers.
-    </p>
-    <div class="row">
-      <div>
-        <div>Seed completed downloads</div>
-        <div class="muted">Re-share verified, openly-licensed blobs back over BitTorrent</div>
-      </div>
-      <label class="switch"><input type="checkbox" bind:checked={s.bt_seed} on:change={save} disabled={!s.bt_enabled} /><span></span></label>
-    </div>
-    <label class="field"><span>Preferred listen port (0 = default range)</span><input type="number" min="0" max="65535" bind:value={s.bt_port} on:change={save} disabled={!s.bt_enabled} /></label>
-    <label class="field"><span>Upload cap (Mbps, 0 = unlimited)</span><input type="number" min="0" bind:value={s.bt_up_cap_mbps} on:change={save} disabled={!s.bt_enabled} /></label>
-    <label class="field"><span>Download cap (Mbps, 0 = unlimited)</span><input type="number" min="0" bind:value={s.bt_down_cap_mbps} on:change={save} disabled={!s.bt_enabled} /></label>
-    <label class="field"><span>Max concurrent transfers (applies on next launch)</span><input type="number" min="1" max="32" bind:value={s.bt_max_concurrent} on:change={save} /></label>
-    <label class="field"><span>Stop seeding at ratio (0 = unlimited)</span><input type="number" min="0" step="0.1" bind:value={s.bt_max_ratio} on:change={save} disabled={!s.bt_enabled} /></label>
-    <p class="muted" style="margin-top:6px">BitTorrent changes apply on next launch — the session binds ports at startup. Inbound peers depend on your network (no relay guarantee).</p>
-
     <div class="section">Network</div>
     <div class="row">
       <div><div>Use a Hugging Face mirror</div></div>
@@ -256,6 +357,21 @@
         <option value="dark">Dark</option>
       </select>
     </label>
+
+    <div class="section">Updates</div>
+    <div class="row">
+      <div>
+        <div>Check for updates automatically</div>
+        <div class="muted">
+          On launch, anonymously check whether a newer Studio build is available.
+          Updates are signature-verified before installing.
+        </div>
+      </div>
+      <label class="switch"><input type="checkbox" bind:checked={s.auto_update} on:change={onAutoUpdateToggle} /><span></span></label>
+    </div>
+    <button class="btn sm" on:click={checkNow} disabled={updChecking}>
+      {updChecking ? "Checking…" : "Check now"}
+    </button>
 
     <div class="section">About</div>
     <button class="btn sm" on:click={exportDiag}>Export diagnostics</button>

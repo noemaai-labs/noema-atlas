@@ -1,5 +1,6 @@
 mod manifestcmd;
 mod ui;
+mod updatecmd;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -68,6 +69,9 @@ enum Cmd {
     /// Build, sign, verify, or show a manifest.
     #[command(subcommand)]
     Manifest(ManifestCmd),
+    /// Mint or inspect the signed auto-update manifest (offline release tooling).
+    #[command(subcommand)]
+    Update(updatecmd::UpdateCmd),
     /// Import a manifest into the local store.
     Import { manifest: PathBuf },
     /// List imported manifests.
@@ -361,6 +365,7 @@ async fn run(cli: Cli) -> Result<()> {
             ManifestCmd::Verify(a) => manifestcmd::verify(a),
             ManifestCmd::Show(a) => manifestcmd::show(a),
         },
+        Cmd::Update(cmd) => updatecmd::run(cmd),
         Cmd::Import { manifest } => {
             let engine = build_engine(&g)?;
             let res = engine.import_manifest_path(&manifest)?;

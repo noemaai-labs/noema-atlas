@@ -11,6 +11,13 @@ export function fmtSize(bytes) {
   return n.toFixed(i > 1 ? 2 : 0) + " " + units[i];
 }
 
+// Bytes/sec → short rate string ("1.2 MB/s"). "—" when zero/unknown.
+export function fmtRate(bps) {
+  const n = Number(bps) || 0;
+  if (n === 0) return "—";
+  return fmtSize(n) + "/s";
+}
+
 // Seed ratio = bytes uploaded to peers / bytes of the file downloaded. Returns a
 // short string ("0.00", "1.4×") or "" when there's nothing downloaded yet.
 export function fmtRatio(uploaded, downloaded) {
@@ -101,4 +108,11 @@ export function formatFromName(filename) {
 // only a name. Returns "" when nothing recognizable.
 export function rowFormat(format, name) {
   return prettyFormat(format || formatFromName(name));
+}
+
+// The canonical format id (lowercase: "gguf", "mlx", …) for a row, from its
+// explicit format or its filename. "" when unrecognized. Used as the `.f-<id>`
+// chip class so the format badge is color-coded the same everywhere it appears.
+export function formatId(format, name) {
+  return (format ? String(format).toLowerCase() : formatFromName(name)) || "";
 }

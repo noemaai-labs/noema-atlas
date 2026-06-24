@@ -2,7 +2,7 @@
 
 [package]
 name = "noema-studio"
-version = "0.1.0"
+version = "2.0.0-alpha.2"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -17,6 +17,9 @@ tauri-build = { version = "2", features = [] }
 noema-core = { path = "../core", features = ["iroh", "bittorrent"] }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
+# Auto-update: the official Tauri updater (minisign-verified) + process (relaunch).
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
@@ -24,3 +27,8 @@ tokio = { version = "1", features = ["sync"] }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
+
+# Studio is its own workspace, so it needs the same vendored-librqbit patch as the
+# root workspace (see ../../Cargo.toml). Path is relative to this manifest.
+[patch.crates-io]
+librqbit = { path = "../../vendor/librqbit" }

@@ -891,6 +891,96 @@ mod bittorrent_adapter {
         }
     }
 
+    /// Per-peer rate state kept between `peers_for` polls. `base_*` is the byte
+    /// snapshot at `at`; the rate is recomputed over that window only once it spans at
+    /// least `PEER_RATE_WINDOW`, and held steady (`last_*_bps`) in between. This keeps
+    /// per-peer speeds stable whether the UI polls every frame (egui) or every few
+    /// seconds (Studio), instead of dividing by a noisy sub-second delta.
+    #[derive(Clone, Copy)]
+    struct PeerSample {
+        base_down: u64,
+        base_up: u64,
+        at: std::time::Instant,
+        last_down_bps: u64,
+        last_up_bps: u64,
+    }
+
+    /// Minimum window over which a per-peer rate is averaged before the baseline rolls.
+    const PEER_RATE_WINDOW: Duration = Duration::from_millis(1000);
+
+    /// Decode a BitTorrent peer_id (20 raw bytes) into a human client name, following
+    /// the common Azureus-style (`-XXVVVV-…`) convention. Returns `"unknown"` when the
+    /// prefix isn't recognized. Best-effort and purely cosmetic (peer_ids are
+    /// self-reported and can be spoofed).
+    fn decode_peer_client(id: [u8; 20]) -> String {
+        // Azureus style: '-' + two-char client code + four version chars + '-'.
+        if id[0] == b'-' && id[7] == b'-' {
+            let code = [id[1], id[2]];
+            let name = match &code {
+                b"qB" | b"qb" => "qBittorrent",
+                b"TR" => "Transmission",
+                b"UT" => "\u{00b5}Torrent",
+                b"UM" => "\u{00b5}Torrent Mac",
+                b"UE" => "\u{00b5}Torrent Embedded",
+                b"UW" => "\u{00b5}Torrent Web",
+                b"DE" => "Deluge",
+                b"LT" | b"lt" => "libtorrent",
+                b"BT" => "BitTorrent",
+                b"BI" => "BiglyBT",
+                b"AZ" => "Azureus",
+                b"FD" => "Free Download Manager",
+                b"WW" | b"WT" => "WebTorrent",
+                b"LR" | b"RQ" | b"rq" => "librqbit",
+                b"TX" => "Tixati",
+                b"KT" => "KTorrent",
+                b"qD" => "qDownloader",
+                _ => "",
+            };
+            if !name.is_empty() {
+                // Version: 4 chars after the code → up to 3 dotted parts ("4650" → "4.6.5").
+                let v = &id[3..7];
+                if v.iter().all(u8::is_ascii_alphanumeric) {
+                    let s: String = v.iter().map(|b| *b as char).collect();
+                    return format!("{name} {}.{}.{}", &s[0..1], &s[1..2], &s[2..3]);
+                }
+                return name.to_string();
+            }
+            // Unknown but well-formed code: surface the raw two letters so it's at
+            // least identifiable rather than a blanket "unknown".
+            if code.iter().all(u8::is_ascii_graphic) {
+                return format!("{}{}", code[0] as char, code[1] as char);
+            }
+        }
+        "unknown".to_string()
+    }
+
+    #[cfg(test)]
+    mod client_decode_tests {
+        use super::decode_peer_client;
+
+        fn id(prefix: &str) -> [u8; 20] {
+            let mut b = [0u8; 20];
+            let p = prefix.as_bytes();
+            b[..p.len().min(20)].copy_from_slice(&p[..p.len().min(20)]);
+            b
+        }
+
+        #[test]
+        fn decodes_known_azureus_clients() {
+            assert_eq!(decode_peer_client(id("-qB4650-")), "qBittorrent 4.6.5");
+            assert_eq!(decode_peer_client(id("-TR4050-")), "Transmission 4.0.5");
+            assert_eq!(decode_peer_client(id("-LR0001-")), "librqbit 0.0.0");
+        }
+
+        #[test]
+        fn unknown_or_malformed_falls_back() {
+            // Well-formed but unrecognized two-letter code is surfaced raw.
+            assert_eq!(decode_peer_client(id("-ZZ1234-")), "ZZ");
+            // Not Azureus-shaped at all → "unknown".
+            assert_eq!(decode_peer_client([0u8; 20]), "unknown");
+        }
+    }
+
     /// Fetches ONE file from a BitTorrent swarm by magnet into a scratch dir, then
     /// streams it back for the engine to verify (mirroring the Iroh adapter's
     /// download-to-tempfile-then-stream-back shape; `prefetched: true`). The torrent
@@ -906,14 +996,22 @@ mod bittorrent_adapter {
     #[derive(Debug, Clone)]
     pub struct BtPeer {
         pub addr: String,
+        /// Decoded BitTorrent client name from the peer_id (e.g. `"qBittorrent 4.6.5"`,
+        /// `"Transmission 4.0"`, `"librqbit"`), or `"unknown"` when unrecognized/not live.
+        pub client: String,
         /// Transport carrying this connection: `"TCP"`, `"uTP"`, or `"unknown"`.
         pub conn_kind: String,
         /// librqbit's peer state name (e.g. `"live"`).
         pub state: String,
-        /// Bytes fetched *from* this peer (we downloaded).
+        /// Bytes fetched *from* this peer (we downloaded), cumulative.
         pub downloaded: u64,
-        /// Bytes uploaded *to* this peer (we served).
+        /// Bytes uploaded *to* this peer (we served), cumulative.
         pub uploaded: u64,
+        /// Current download rate from this peer (bytes/sec), derived from the delta of
+        /// `downloaded` between successive `peers_for` polls. `0` on the first sighting.
+        pub down_bps: u64,
+        /// Current upload rate to this peer (bytes/sec), derived likewise from `uploaded`.
+        pub up_bps: u64,
     }
 
     pub struct BittorrentAdapter {
@@ -937,8 +1035,20 @@ mod bittorrent_adapter {
         use_public_trackers: bool,
         /// Seed/upload ratio at which a seeded torrent is paused (`0.0` = unlimited).
         /// Stored as f64 *bits* in an atomic so the UI can raise/lower/clear it at
-        /// runtime; lowering or clearing it resumes blobs the watcher had paused.
+        /// runtime; lowering or clearing it resumes blobs the watcher had paused. This
+        /// is the **global default**; per-blob overrides in `blob_max_ratio` win.
         max_ratio: Arc<AtomicU64>,
+        /// Per-blob stop-at-ratio overrides (blake3 → cap). When a blob has an entry
+        /// here the watcher uses it instead of the global `max_ratio`; `0.0` pins that
+        /// blob to unlimited even if the global cap is set. Absent ⇒ use the global.
+        blob_max_ratio: Arc<Mutex<HashMap<String, f64>>>,
+        /// Download pieces in order (sequential) for new BT leeches. Applied to the add
+        /// options and pushed live onto active torrents on change. `0.0`-style default
+        /// is off (normal first/last/rarest picking).
+        sequential: Arc<AtomicBool>,
+        /// Previous per-peer byte snapshot, keyed blake3 → addr, so `peers_for` can
+        /// derive per-peer bytes/sec from the delta between polls.
+        peer_samples: Arc<Mutex<HashMap<String, HashMap<String, PeerSample>>>>,
         /// Blake3s the ratio watcher has paused after reaching the lifetime cap. Kept
         /// distinct from a user Pause so `is_seeding` can report them as NOT seeding
         /// (the pill mustn't lie) and so a later cap raise/clear can resume exactly
@@ -990,6 +1100,7 @@ mod bittorrent_adapter {
             down_bps: u64,
             use_public_trackers: bool,
             max_ratio: f64,
+            sequential: bool,
             upload_store: Option<Arc<dyn BtUploadStore>>,
         ) -> Self {
             BittorrentAdapter {
@@ -1003,6 +1114,9 @@ mod bittorrent_adapter {
                 down_bps,
                 use_public_trackers,
                 max_ratio: Arc::new(AtomicU64::new(max_ratio.to_bits())),
+                blob_max_ratio: Arc::new(Mutex::new(HashMap::new())),
+                sequential: Arc::new(AtomicBool::new(sequential)),
+                peer_samples: Arc::new(Mutex::new(HashMap::new())),
                 ratio_paused: Arc::new(Mutex::new(HashSet::new())),
                 upload_store,
                 seeds: Arc::new(Mutex::new(HashMap::new())),
@@ -1105,6 +1219,7 @@ mod bittorrent_adapter {
                             sess.clone(),
                             self.seeds.clone(),
                             self.max_ratio.clone(),
+                            self.blob_max_ratio.clone(),
                             self.ratio_paused.clone(),
                             self.upload_store.clone(),
                         ));
@@ -1204,6 +1319,85 @@ mod bittorrent_adapter {
             self.max_ratio.store(max_ratio.to_bits(), Ordering::Relaxed);
         }
 
+        /// Set or clear a **per-blob** stop-at-ratio override. `Some(cap)` pins this
+        /// blob to `cap` (`0.0` = unlimited) regardless of the global default; `None`
+        /// drops the override so the blob follows the global cap again. The watcher
+        /// reads this live, so a change takes effect on the next 30s tick (and an
+        /// override that drops below the current ratio resumes a ratio-paused seed).
+        pub fn set_blob_max_ratio(&self, blake3: &str, cap: Option<f64>) {
+            let mut g = self.blob_max_ratio.lock().unwrap();
+            match cap {
+                Some(c) => {
+                    g.insert(blake3.to_string(), c);
+                }
+                None => {
+                    g.remove(blake3);
+                }
+            }
+        }
+
+        /// This blob's per-blob ratio override, if one is set (else the global applies).
+        pub fn blob_max_ratio(&self, blake3: &str) -> Option<f64> {
+            self.blob_max_ratio.lock().unwrap().get(blake3).copied()
+        }
+
+        /// Toggle sequential (in-order) downloading. Applies to future BT leeches via
+        /// the add options, and is pushed onto any in-flight leech immediately.
+        pub fn set_sequential(&self, sequential: bool) {
+            self.sequential.store(sequential, Ordering::Relaxed);
+            if let Some(session) = self.session.get().cloned() {
+                let ids: Vec<TorrentId> = self.active.lock().unwrap().values().copied().collect();
+                for id in ids {
+                    if let Some(handle) = session.get(id.into()) {
+                        handle.set_sequential(sequential);
+                    }
+                }
+            }
+        }
+
+        /// Whether sequential downloading is currently enabled.
+        pub fn is_sequential(&self) -> bool {
+            self.sequential.load(Ordering::Relaxed)
+        }
+
+        /// Force a full on-disk re-hash (recheck) of a blob's managed torrents — its
+        /// seed torrent(s) and any in-flight leech. Bypasses fastresume and rebuilds
+        /// the have/needed sets from what's actually on disk. No-op when the blob isn't
+        /// managed here or the session isn't up yet.
+        pub async fn force_recheck(&self, blake3: &str) -> Result<()> {
+            let Some(session) = self.session.get().cloned() else {
+                return Ok(());
+            };
+            let mut ids: Vec<TorrentId> = self
+                .seeds
+                .lock()
+                .unwrap()
+                .get(blake3)
+                .map(|e| e.torrent_ids.clone())
+                .unwrap_or_default();
+            if let Some(id) = self.active.lock().unwrap().get(blake3).copied() {
+                ids.push(id);
+            }
+            for id in ids {
+                if let Some(handle) = session.get(id.into()) {
+                    if let Err(e) = session.force_recheck(&handle).await {
+                        tracing::warn!(torrent_id = id, error = %e, "bittorrent: force_recheck failed");
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        /// Update the live session's per-direction rate caps (bytes/sec, `0` =
+        /// unlimited) at runtime — driven by the bandwidth scheduler. No-op until the
+        /// session is up (the next session init still uses the construction-time caps).
+        pub fn set_rate_limits(&self, up_bps: u64, down_bps: u64) {
+            if let Some(session) = self.session.get() {
+                session.ratelimits.set_upload_bps(bps_to_limit(up_bps));
+                session.ratelimits.set_download_bps(bps_to_limit(down_bps));
+            }
+        }
+
         /// Live per-peer snapshot for a blob's managed torrent — whichever of its
         /// seeded torrents or its in-flight leech is live. Empty when the blob isn't
         /// managed here, the session isn't up yet, or the torrent isn't live (no
@@ -1228,6 +1422,12 @@ mod bittorrent_adapter {
                 return Vec::new();
             }
             let api = Api::new(session, None);
+            let now = std::time::Instant::now();
+            // Hold the sample map for this blob across the whole poll so we can derive
+            // per-peer rates from the delta and refresh the baselines in one pass.
+            let mut samples = self.peer_samples.lock().unwrap();
+            let prev = samples.entry(blake3.to_string()).or_default();
+            let mut next: HashMap<String, PeerSample> = HashMap::new();
             let mut out = Vec::new();
             for id in ids {
                 // Default filter == live peers only. A non-live torrent yields an
@@ -1235,14 +1435,62 @@ mod bittorrent_adapter {
                 let Ok(snap) = api.api_peer_stats(id.into(), Default::default()) else {
                     continue;
                 };
-                out.extend(snap.peers.into_iter().map(|(addr, st)| BtPeer {
-                    addr,
-                    conn_kind: conn_kind_label(st.conn_kind),
-                    state: st.state.to_string(),
-                    downloaded: st.counters.fetched_bytes,
-                    uploaded: st.counters.uploaded_bytes,
-                }));
+                for (addr, st) in snap.peers {
+                    let downloaded = st.counters.fetched_bytes;
+                    let uploaded = st.counters.uploaded_bytes;
+                    // Per-peer bytes/sec from the rolling baseline (see PeerSample).
+                    let (down_bps, up_bps, sample) = match prev.get(&addr) {
+                        Some(p) => {
+                            let dt = now.duration_since(p.at).as_secs_f64();
+                            if now.duration_since(p.at) >= PEER_RATE_WINDOW && dt > 0.0 {
+                                let d = (downloaded.saturating_sub(p.base_down) as f64 / dt) as u64;
+                                let u = (uploaded.saturating_sub(p.base_up) as f64 / dt) as u64;
+                                (
+                                    d,
+                                    u,
+                                    PeerSample {
+                                        base_down: downloaded,
+                                        base_up: uploaded,
+                                        at: now,
+                                        last_down_bps: d,
+                                        last_up_bps: u,
+                                    },
+                                )
+                            } else {
+                                // Too soon for a fresh window: hold the last rate and
+                                // keep the baseline so the window keeps growing.
+                                (p.last_down_bps, p.last_up_bps, *p)
+                            }
+                        }
+                        None => (
+                            0,
+                            0,
+                            PeerSample {
+                                base_down: downloaded,
+                                base_up: uploaded,
+                                at: now,
+                                last_down_bps: 0,
+                                last_up_bps: 0,
+                            },
+                        ),
+                    };
+                    next.insert(addr.clone(), sample);
+                    out.push(BtPeer {
+                        addr,
+                        client: st
+                            .peer_id
+                            .map(decode_peer_client)
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        conn_kind: conn_kind_label(st.conn_kind),
+                        state: st.state.to_string(),
+                        downloaded,
+                        uploaded,
+                        down_bps,
+                        up_bps,
+                    });
+                }
             }
+            *prev = next;
             out
         }
 
@@ -1376,6 +1624,7 @@ mod bittorrent_adapter {
         session: Arc<Session>,
         seeds: Arc<Mutex<HashMap<String, SeedEntry>>>,
         max_ratio: Arc<AtomicU64>,
+        blob_max_ratio: Arc<Mutex<HashMap<String, f64>>>,
         ratio_paused: Arc<Mutex<HashSet<String>>>,
         upload_store: Option<Arc<dyn BtUploadStore>>,
     ) {
@@ -1384,7 +1633,7 @@ mod bittorrent_adapter {
         let mut baselines: HashMap<String, u64> = HashMap::new();
         loop {
             tick.tick().await;
-            let cap = f64::from_bits(max_ratio.load(Ordering::Relaxed));
+            let global_cap = f64::from_bits(max_ratio.load(Ordering::Relaxed));
             // Snapshot (blake3, ids) under the lock, then act without holding it.
             let blobs: Vec<(String, Vec<TorrentId>)> = {
                 let guard = seeds.lock().unwrap();
@@ -1424,6 +1673,13 @@ mod bittorrent_adapter {
                     store.store_uploaded(&blake3, lifetime);
                 }
                 let ratio = lifetime as f64 / size as f64;
+                // Per-blob override wins over the global default; absent ⇒ global.
+                let cap = blob_max_ratio
+                    .lock()
+                    .unwrap()
+                    .get(&blake3)
+                    .copied()
+                    .unwrap_or(global_cap);
                 let over_cap = cap > 0.0 && ratio >= cap;
                 if over_cap {
                     let mut paused_any = false;
@@ -1557,6 +1813,7 @@ mod bittorrent_adapter {
                         output_folder: Some(out_dir.to_string_lossy().into_owned()),
                         overwrite: true,
                         trackers: trackers.clone(),
+                        sequential: self.sequential.load(Ordering::Relaxed),
                         ..Default::default()
                     }),
                 )
@@ -1952,6 +2209,11 @@ pub struct Transports {
     hf: net::HuggingFaceAdapter,
     #[cfg(feature = "iroh")]
     iroh: iroh_adapter::IrohAdapter,
+    /// When false, Iroh is treated as unsupported for *fetching* (the planner
+    /// fails over to BitTorrent/HTTP). The worldwide *seeder* is a separate node
+    /// gated by its own caller path, so this never affects seeding.
+    #[cfg(feature = "iroh")]
+    iroh_enabled: bool,
     // `Arc` so the seed path can detach session init off the caller's critical path
     // (the launch re-seed must not stall the first transfer on a cold session).
     #[cfg(feature = "bittorrent")]
@@ -1961,6 +2223,11 @@ pub struct Transports {
     /// manifest-carried magnet source is skipped (it never joins a swarm).
     #[cfg(feature = "bittorrent")]
     bittorrent_enabled: bool,
+    /// Download sub-switch: when false (with the master still on so seeding can
+    /// continue), the BitTorrent *fetch* route is unsupported but the session
+    /// stays alive to keep seeding completed blobs.
+    #[cfg(feature = "bittorrent")]
+    bittorrent_download: bool,
 }
 
 /// Construction options for the transport registry.
@@ -1972,6 +2239,10 @@ pub struct TransportConfig {
     pub hf_endpoint: String,
     /// Directory for the Iroh blob store (used by the iroh fetch adapter).
     pub iroh_store_dir: std::path::PathBuf,
+    /// Master/download switch for the Iroh *fetch* route. On by default. When
+    /// false the planner fails over to BitTorrent/HTTP. The worldwide seeder is
+    /// independent (its own node + caller gate), so this never stops seeding.
+    pub iroh_enabled: bool,
     /// Optional proxy ("VPN tunnel") for all HTTP-family transports. Accepts
     /// `http://`, `https://`, or `socks5://` / `socks5h://`. `None` (or empty)
     /// means a direct connection (reqwest still honors system proxy env vars).
@@ -1984,6 +2255,9 @@ pub struct TransportConfig {
     pub bittorrent_cas_dir: std::path::PathBuf,
     /// Master switch for the BitTorrent transport (download + seed). On by default.
     pub bittorrent_enabled: bool,
+    /// Download sub-switch. On by default. When false (master still on), the BT
+    /// *fetch* route is disabled but the session stays alive so seeding continues.
+    pub bittorrent_download: bool,
     /// Whether to seed completed, publicly-redistributable blobs over BitTorrent.
     pub bittorrent_seed: bool,
     /// Inbound listen-port range (best-effort; falls back to outbound + DHT only
@@ -1998,8 +2272,12 @@ pub struct TransportConfig {
     /// magnet-only adds (leech path), for peer discovery beyond DHT. On by default.
     pub bittorrent_use_public_trackers: bool,
     /// Stop seeding a torrent once its upload/size ratio reaches this value
-    /// (`0.0` = unlimited / never stop on ratio).
+    /// (`0.0` = unlimited / never stop on ratio). Global default; per-blob overrides
+    /// are applied at runtime via [`Transports::set_bittorrent_blob_max_ratio`].
     pub bittorrent_max_ratio: f64,
+    /// Download BitTorrent pieces in order (sequential) instead of first/last/rarest.
+    /// Off by default; useful for streaming/early-preview, slightly slower overall.
+    pub bittorrent_sequential: bool,
 }
 
 impl Default for TransportConfig {
@@ -2008,10 +2286,12 @@ impl Default for TransportConfig {
             request_timeout: Duration::from_secs(300),
             hf_endpoint: "https://huggingface.co".to_string(),
             iroh_store_dir: std::env::temp_dir().join("noema-iroh-store"),
+            iroh_enabled: true,
             proxy: None,
             bittorrent_store_dir: std::env::temp_dir().join("noema-bittorrent-store"),
             bittorrent_cas_dir: std::env::temp_dir().join("noema-cas-blake3"),
             bittorrent_enabled: true,
+            bittorrent_download: true,
             bittorrent_seed: true,
             bittorrent_listen_port_range: Some(6881..6892),
             bittorrent_enable_upnp: true,
@@ -2019,6 +2299,7 @@ impl Default for TransportConfig {
             bittorrent_max_down_bps: 0,
             bittorrent_use_public_trackers: true,
             bittorrent_max_ratio: 0.0,
+            bittorrent_sequential: false,
         }
     }
 }
@@ -2047,6 +2328,8 @@ impl Transports {
             },
             #[cfg(feature = "iroh")]
             iroh: iroh_adapter::IrohAdapter::new(cfg.iroh_store_dir.clone()),
+            #[cfg(feature = "iroh")]
+            iroh_enabled: cfg.iroh_enabled,
             #[cfg(feature = "bittorrent")]
             bittorrent: std::sync::Arc::new(bittorrent_adapter::BittorrentAdapter::new(
                 cfg.bittorrent_store_dir.clone(),
@@ -2058,10 +2341,13 @@ impl Transports {
                 cfg.bittorrent_max_down_bps,
                 cfg.bittorrent_use_public_trackers,
                 cfg.bittorrent_max_ratio,
+                cfg.bittorrent_sequential,
                 bt_upload_store,
             )),
             #[cfg(feature = "bittorrent")]
             bittorrent_enabled: cfg.bittorrent_enabled,
+            #[cfg(feature = "bittorrent")]
+            bittorrent_download: cfg.bittorrent_download,
         })
     }
 
@@ -2082,18 +2368,26 @@ impl Transports {
             SourceClass::HttpsMirror | SourceClass::Huggingface => Err(Error::Unsupported(
                 "HTTP transports disabled (build without `http` feature)".into(),
             )),
+            // "Use Iroh" off (master, or its download sub-switch) makes the Iroh
+            // fetch route unsupported; the planner fails over to BitTorrent/HTTP.
+            // Seeding is a separate node, unaffected by this gate.
+            #[cfg(feature = "iroh")]
+            SourceClass::Iroh if !self.iroh_enabled => {
+                Err(Error::Unsupported("Iroh is disabled".into()))
+            }
             #[cfg(feature = "iroh")]
             SourceClass::Iroh => Ok(&self.iroh),
             #[cfg(not(feature = "iroh"))]
             SourceClass::Iroh => Err(Error::Unsupported(
                 "iroh adapter not enabled (build with `--features iroh`)".into(),
             )),
-            // The master switch gates the FETCH side too: with BitTorrent off, a
-            // BT source is unsupported, so the planner fails over to another route
-            // and a manifest-carried magnet never joins a swarm.
+            // The master switch (or its download sub-switch) gates the FETCH side:
+            // with BitTorrent download off, a BT source is unsupported, so the
+            // planner fails over to another route and a manifest-carried magnet
+            // never joins a swarm — while the session stays alive to keep seeding.
             #[cfg(feature = "bittorrent")]
-            SourceClass::BittorrentV2 if !self.bittorrent_enabled => {
-                Err(Error::Unsupported("BitTorrent is disabled".into()))
+            SourceClass::BittorrentV2 if !self.bittorrent_enabled || !self.bittorrent_download => {
+                Err(Error::Unsupported("BitTorrent download is disabled".into()))
             }
             #[cfg(feature = "bittorrent")]
             SourceClass::BittorrentV2 => Ok(self.bittorrent.as_ref()),
@@ -2179,6 +2473,100 @@ impl Transports {
         #[cfg(not(feature = "bittorrent"))]
         {
             let _ = max_ratio;
+        }
+    }
+
+    /// Set or clear a **per-blob** stop-at-ratio override (`Some(0.0)` = unlimited for
+    /// this blob, `None` = follow the global cap). No-op without the `bittorrent`
+    /// feature. The override is held in the live session and reconciled by the watcher.
+    pub fn set_bittorrent_blob_max_ratio(&self, blake3: &str, cap: Option<f64>) {
+        #[cfg(feature = "bittorrent")]
+        {
+            self.bittorrent.set_blob_max_ratio(blake3, cap);
+        }
+        #[cfg(not(feature = "bittorrent"))]
+        {
+            let _ = (blake3, cap);
+        }
+    }
+
+    /// This blob's per-blob ratio override, if one is set (else `None` ⇒ global cap).
+    pub fn bittorrent_blob_max_ratio(&self, blake3: &str) -> Option<f64> {
+        #[cfg(feature = "bittorrent")]
+        {
+            self.bittorrent.blob_max_ratio(blake3)
+        }
+        #[cfg(not(feature = "bittorrent"))]
+        {
+            let _ = blake3;
+            None
+        }
+    }
+
+    /// Toggle sequential (in-order) BitTorrent downloading at runtime. Applies to new
+    /// leeches and is pushed onto any in-flight leech immediately. No-op without BT.
+    pub fn set_bittorrent_sequential(&self, sequential: bool) {
+        #[cfg(feature = "bittorrent")]
+        {
+            self.bittorrent.set_sequential(sequential);
+        }
+        #[cfg(not(feature = "bittorrent"))]
+        {
+            let _ = sequential;
+        }
+    }
+
+    /// Whether sequential BitTorrent downloading is enabled (always false without BT).
+    pub fn bittorrent_sequential(&self) -> bool {
+        #[cfg(feature = "bittorrent")]
+        {
+            self.bittorrent.is_sequential()
+        }
+        #[cfg(not(feature = "bittorrent"))]
+        {
+            false
+        }
+    }
+
+    /// Force a full on-disk re-hash (recheck) of a blob's BitTorrent torrents. No-op
+    /// without the `bittorrent` feature or when the blob isn't managed here.
+    pub async fn bt_force_recheck(&self, blake3: &str) -> Result<()> {
+        #[cfg(feature = "bittorrent")]
+        {
+            self.bittorrent.force_recheck(blake3).await?;
+        }
+        #[cfg(not(feature = "bittorrent"))]
+        {
+            let _ = blake3;
+        }
+        Ok(())
+    }
+
+    /// Update the live BitTorrent session's per-direction rate caps (bytes/sec, `0` =
+    /// unlimited) at runtime. Used by the bandwidth scheduler. No-op without BT.
+    pub fn set_bittorrent_rate_limits(&self, up_bps: u64, down_bps: u64) {
+        #[cfg(feature = "bittorrent")]
+        {
+            self.bittorrent.set_rate_limits(up_bps, down_bps);
+        }
+        #[cfg(not(feature = "bittorrent"))]
+        {
+            let _ = (up_bps, down_bps);
+        }
+    }
+
+    /// A cloneable closure that applies BitTorrent up/down caps, for use from a
+    /// detached scheduler task (the adapter type is private to this module, so we hand
+    /// out a boxed applier rather than the adapter handle). A no-op closure without BT.
+    pub fn bt_rate_limit_applier(&self) -> std::sync::Arc<dyn Fn(u64, u64) + Send + Sync> {
+        #[cfg(feature = "bittorrent")]
+        {
+            let adapter = self.bittorrent.clone();
+            std::sync::Arc::new(move |up, down| adapter.set_rate_limits(up, down))
+        }
+        #[cfg(not(feature = "bittorrent"))]
+        {
+            std::sync::Arc::new(|_up, _down| {})
         }
     }
 

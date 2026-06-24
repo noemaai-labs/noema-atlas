@@ -531,8 +531,10 @@ pub struct NetworkModel {
     /// if any. Carried into the fetch's `ShareTarget` so the BT transport can join
     /// the swarm. Empty when no peer announced one.
     pub magnet: String,
-    /// Live worldwide peers currently sharing this file.
+    /// Live worldwide peers seeding this file over Iroh.
     pub peers: usize,
+    /// Live worldwide peers seeding this file over BitTorrent.
+    pub bt_seeders: usize,
     /// Human device names sharing it (for "from your devices").
     pub devices: Vec<String>,
     /// True when one of the querier's own devices is seeding this.
@@ -637,6 +639,228 @@ pub fn aggregate_results(
     results
 }
 
+/// Ordered, reorderable admission gate in front of the download-concurrency limit.
+///
+/// The `Semaphore` still caps how many transfers download at once; this adds a
+/// user-orderable waiting list so a slot-starved transfer is admitted in queue order
+/// (front first) rather than arrival order, and the order can be changed at runtime
+/// (move up/down/top/bottom). Only *waiting* (slot-starved) transfers sit in the
+/// queue — once a transfer holds a permit it is running and no longer reorderable.
+struct DownloadQueue {
+    sem: Arc<tokio::sync::Semaphore>,
+    /// Transfers parked waiting for a slot, in admission order (front = next to run).
+    waiting: std::sync::Mutex<Vec<crate::transfer::TransferId>>,
+    /// Pulsed whenever a slot frees or the order changes, so parked acquirers re-check.
+    notify: tokio::sync::Notify,
+}
+
+/// A held download slot. Dropping it frees the slot and wakes the next queued transfer.
+struct QueuePermit {
+    /// `Option` so we can release the semaphore permit *before* notifying — otherwise a
+    /// woken front-of-queue task would `try_acquire` against a slot we haven't freed yet
+    /// (the custom `Drop` body runs before fields are dropped).
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    queue: Arc<DownloadQueue>,
+}
+
+impl Drop for QueuePermit {
+    fn drop(&mut self) {
+        // Release the slot first, then wake the current front of the queue to take it.
+        self.permit.take();
+        self.queue.notify.notify_waiters();
+    }
+}
+
+/// Removes a transfer from the waiting list if its `acquire` future is dropped
+/// (cancel/early-return) before it gets a slot. Disarmed on successful acquisition.
+struct DequeueGuard {
+    queue: Arc<DownloadQueue>,
+    id: crate::transfer::TransferId,
+    armed: std::sync::atomic::AtomicBool,
+}
+
+impl Drop for DequeueGuard {
+    fn drop(&mut self) {
+        if self.armed.load(Ordering::Relaxed) {
+            self.queue.waiting.lock().unwrap().retain(|x| *x != self.id);
+            self.queue.notify.notify_waiters();
+        }
+    }
+}
+
+impl DownloadQueue {
+    fn new(slots: usize) -> Self {
+        DownloadQueue {
+            sem: Arc::new(tokio::sync::Semaphore::new(slots.max(1))),
+            waiting: std::sync::Mutex::new(Vec::new()),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Wait for a slot, admitted in queue order. Returns a permit held for the life of
+    /// the download. If the returned future is dropped before acquiring (the transfer
+    /// was cancelled while queued), the id is removed from the waiting list.
+    async fn acquire(self: &Arc<Self>, id: crate::transfer::TransferId) -> Result<QueuePermit> {
+        {
+            let mut q = self.waiting.lock().unwrap();
+            if !q.contains(&id) {
+                q.push(id.clone());
+            }
+        }
+        self.notify.notify_waiters();
+        let guard = DequeueGuard {
+            queue: self.clone(),
+            id: id.clone(),
+            armed: std::sync::atomic::AtomicBool::new(true),
+        };
+        loop {
+            // Register interest BEFORE checking, so a notify between the check and the
+            // await is not lost (notify_waiters has no stored permit).
+            let notified = self.notify.notified();
+            let at_front = self
+                .waiting
+                .lock()
+                .unwrap()
+                .first()
+                .is_some_and(|x| *x == id);
+            if at_front {
+                if let Ok(permit) = self.sem.clone().try_acquire_owned() {
+                    self.waiting.lock().unwrap().retain(|x| *x != id);
+                    // Disarm cleanup (we succeeded) and let the next front try too.
+                    guard.armed.store(false, Ordering::Relaxed);
+                    self.notify.notify_waiters();
+                    return Ok(QueuePermit {
+                        permit: Some(permit),
+                        queue: self.clone(),
+                    });
+                }
+            }
+            notified.await;
+        }
+    }
+
+    /// The current waiting order (front first), for the UI to render/reorder.
+    fn order(&self) -> Vec<crate::transfer::TransferId> {
+        self.waiting.lock().unwrap().clone()
+    }
+
+    /// Reposition a queued transfer. No-op if it isn't currently waiting.
+    fn reorder(&self, id: &crate::transfer::TransferId, mv: QueueMove) {
+        {
+            let mut q = self.waiting.lock().unwrap();
+            let Some(i) = q.iter().position(|x| x == id) else {
+                return;
+            };
+            match mv {
+                QueueMove::Up if i > 0 => q.swap(i, i - 1),
+                QueueMove::Down if i + 1 < q.len() => q.swap(i, i + 1),
+                QueueMove::Top if i > 0 => {
+                    let v = q.remove(i);
+                    q.insert(0, v);
+                }
+                QueueMove::Bottom if i + 1 < q.len() => {
+                    let v = q.remove(i);
+                    q.push(v);
+                }
+                _ => return,
+            }
+        }
+        self.notify.notify_waiters();
+    }
+}
+
+/// One reorder operation on the download queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueMove {
+    Up,
+    Down,
+    Top,
+    Bottom,
+}
+
+/// A daily time-window bandwidth schedule ("alternative speed limits"), qBittorrent-
+/// style. While the window is active on a matching weekday the *alternative* caps
+/// apply; outside it the *normal* caps apply. All caps are bytes/sec (`0` = unlimited).
+/// Times are minutes since local midnight (`0..=1439`); a window with `from > to`
+/// wraps past midnight (e.g. 22:00 → 06:00).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BandwidthSchedule {
+    pub enabled: bool,
+    pub from_min: u16,
+    pub to_min: u16,
+    /// Weekday bitmask: bit 0 = Monday … bit 6 = Sunday. `0` ⇒ every day.
+    pub days: u8,
+    /// Normal caps (outside the window).
+    pub bt_up_bps: u64,
+    pub bt_down_bps: u64,
+    pub http_down_bps: u64,
+    /// Alternative caps (inside the window).
+    pub alt_bt_up_bps: u64,
+    pub alt_bt_down_bps: u64,
+    pub alt_http_down_bps: u64,
+}
+
+impl BandwidthSchedule {
+    /// Whether the alternative window is active at the given local minute-of-day and
+    /// weekday (Mon = 0 … Sun = 6).
+    fn active_at(&self, minute: u16, weekday: u8) -> bool {
+        if !self.enabled || self.from_min == self.to_min {
+            return false;
+        }
+        if self.days != 0 && (self.days & (1 << weekday)) == 0 {
+            return false;
+        }
+        if self.from_min < self.to_min {
+            minute >= self.from_min && minute < self.to_min
+        } else {
+            minute >= self.from_min || minute < self.to_min
+        }
+    }
+
+    /// The (bt_up, bt_down, http_down) caps to apply right now given the local clock.
+    fn caps_now(&self) -> (u64, u64, u64) {
+        let (minute, weekday) = local_minute_weekday();
+        if self.active_at(minute, weekday) {
+            (
+                self.alt_bt_up_bps,
+                self.alt_bt_down_bps,
+                self.alt_http_down_bps,
+            )
+        } else {
+            (self.bt_up_bps, self.bt_down_bps, self.http_down_bps)
+        }
+    }
+}
+
+/// Local minutes-since-midnight and weekday (Mon = 0 … Sun = 6) from the wall clock.
+fn local_minute_weekday() -> (u16, u8) {
+    use chrono::{Datelike, Local, Timelike};
+    let now = Local::now();
+    let minute = (now.hour() * 60 + now.minute()) as u16;
+    let weekday = now.weekday().num_days_from_monday() as u8;
+    (minute, weekday)
+}
+
+/// Background ticker that re-applies the schedule's caps each minute. Cheap; only
+/// stores into the existing atomic rate-limit handles, so a no-op when nothing changed.
+async fn bandwidth_scheduler(
+    schedule: Arc<std::sync::Mutex<BandwidthSchedule>>,
+    rate_limit: RateLimit,
+    bt_applier: Arc<dyn Fn(u64, u64) + Send + Sync>,
+) {
+    let mut tick = tokio::time::interval(Duration::from_secs(30));
+    loop {
+        tick.tick().await;
+        let sched = *schedule.lock().unwrap();
+        if !sched.enabled {
+            continue;
+        }
+        let (bt_up, bt_down, http) = sched.caps_now();
+        bt_applier(bt_up, bt_down);
+        rate_limit.set_bps(http);
+    }
+}
+
 /// The engine.
 pub struct Engine {
     cas: Cas,
@@ -653,8 +877,9 @@ pub struct Engine {
     /// running transfer's control is also stashed in the `CURRENT_TRANSFER`
     /// task-local so the streaming/verify code can read it without an extra arg.
     transfers: Arc<crate::transfer::TransferManager>,
-    /// Caps how many transfers download at once; further runs queue on it.
-    download_slots: Arc<tokio::sync::Semaphore>,
+    /// Caps how many transfers download at once; further runs queue on it, admitted in
+    /// a user-reorderable order (move up/down/top/bottom).
+    download_queue: Arc<DownloadQueue>,
     /// Live override of `cfg.platform.huggingface_download` so the desktop's
     /// rebuilding the engine (i.e. without an app restart). Initialized from the
     /// platform profile; read into a per-plan profile copy in [`Engine::live_platform`].
@@ -678,6 +903,12 @@ pub struct Engine {
     /// per engine lifetime (on the first transfer), independent of whether the user
     /// ever turns on worldwide Iroh sharing.
     bt_launch_reseeded: Arc<std::sync::atomic::AtomicBool>,
+    /// Time-of-day bandwidth schedule and a one-shot guard for its ticker task.
+    schedule: Arc<std::sync::Mutex<BandwidthSchedule>>,
+    scheduler_started: Arc<std::sync::atomic::AtomicBool>,
+    /// Cloneable applier for BitTorrent up/down caps, captured at open so the detached
+    /// scheduler task can change them without reaching into the (private) BT adapter.
+    bt_rate_applier: Arc<dyn Fn(u64, u64) + Send + Sync>,
 }
 
 impl Engine {
@@ -690,6 +921,12 @@ impl Engine {
         // stop-at-ratio cap is a lifetime (cross-restart) ratio.
         let bt_upload_store: Arc<dyn crate::transport::BtUploadStore> = db.clone();
         let transports = Transports::new(&cfg.transport, Some(bt_upload_store))?;
+        // Re-apply any persisted per-blob ratio overrides up front so the seeding
+        // session honors them from the first watcher tick (they're additive to state).
+        for (blake3, cap) in db.all_bt_blob_ratios() {
+            transports.set_bittorrent_blob_max_ratio(&blake3, Some(cap));
+        }
+        let bt_rate_applier = transports.bt_rate_limit_applier();
         let policy = PolicyEngine::new(cfg.policy.clone());
         let secret = secret::default_store();
         let hf_download = Arc::new(std::sync::atomic::AtomicBool::new(
@@ -699,9 +936,7 @@ impl Engine {
         let download_pref = Arc::new(std::sync::atomic::AtomicU8::new(
             cfg.download_preference.as_u8(),
         ));
-        let download_slots = Arc::new(tokio::sync::Semaphore::new(
-            cfg.max_concurrent_downloads.max(1),
-        ));
+        let download_queue = Arc::new(DownloadQueue::new(cfg.max_concurrent_downloads));
         Ok(Engine {
             cas,
             db,
@@ -711,12 +946,15 @@ impl Engine {
             cfg,
             self_node_id: Arc::new(std::sync::Mutex::new(None)),
             transfers: Arc::new(crate::transfer::TransferManager::default()),
-            download_slots,
+            download_queue,
             hf_download,
             max_conns,
             download_pref,
             iroh_seeded: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             bt_launch_reseeded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            schedule: Arc::new(std::sync::Mutex::new(BandwidthSchedule::default())),
+            scheduler_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            bt_rate_applier,
         })
     }
 
@@ -790,6 +1028,118 @@ impl Engine {
     /// BitTorrent adapter isn't built in.
     pub fn set_bittorrent_max_ratio(&self, max_ratio: f64) {
         self.transports.set_bittorrent_max_ratio(max_ratio);
+    }
+
+    /// Set or clear a **per-model** BitTorrent stop-at-ratio override, keyed by the
+    /// blob blake3. `Some(0.0)` = unlimited for this blob, `None` = follow the global
+    /// cap. Persisted (survives restart) and applied live to the seeding session.
+    pub fn set_bittorrent_blob_max_ratio(&self, blake3: &str, cap: Option<f64>) {
+        self.db.set_bt_blob_ratio(blake3, cap);
+        self.transports.set_bittorrent_blob_max_ratio(blake3, cap);
+    }
+
+    /// This blob's per-blob ratio override, if any (else `None` ⇒ the global cap).
+    pub fn bittorrent_blob_max_ratio(&self, blake3: &str) -> Option<f64> {
+        self.transports.bittorrent_blob_max_ratio(blake3)
+    }
+
+    /// Toggle sequential (in-order) BitTorrent downloading at runtime; applies to new
+    /// and in-flight leeches. No-op without the BitTorrent adapter.
+    pub fn set_bittorrent_sequential(&self, sequential: bool) {
+        self.transports.set_bittorrent_sequential(sequential);
+    }
+
+    /// Whether sequential BitTorrent downloading is enabled.
+    pub fn bittorrent_sequential(&self) -> bool {
+        self.transports.bittorrent_sequential()
+    }
+
+    /// Force a full on-disk re-hash (recheck) of a blob's BitTorrent torrents.
+    pub async fn bt_force_recheck(&self, blake3: &str) -> Result<()> {
+        self.transports.bt_force_recheck(blake3).await
+    }
+
+    /// The current download-queue order (front = next to be admitted) among transfers
+    /// waiting on the concurrency limit. Running transfers are not in this list.
+    pub fn download_queue_order(&self) -> Vec<crate::transfer::TransferId> {
+        self.download_queue.order()
+    }
+
+    /// Reposition a queued transfer (move up/down/top/bottom). No-op if it isn't
+    /// currently waiting for a slot.
+    pub fn queue_reorder(&self, id: &crate::transfer::TransferId, mv: QueueMove) {
+        self.download_queue.reorder(id, mv);
+    }
+
+    /// Install the time-of-day bandwidth schedule, apply its caps for the current
+    /// instant immediately, and start the per-minute ticker (idempotent). Disabling it
+    /// (`enabled = false`) leaves the last-applied caps in place — callers that want to
+    /// restore manual caps should set them explicitly.
+    pub fn set_bandwidth_schedule(&self, schedule: BandwidthSchedule) {
+        *self.schedule.lock().unwrap() = schedule;
+        self.apply_schedule_now();
+        self.ensure_scheduler_started();
+    }
+
+    /// The current bandwidth schedule.
+    pub fn bandwidth_schedule(&self) -> BandwidthSchedule {
+        *self.schedule.lock().unwrap()
+    }
+
+    /// Apply the schedule's caps for the current clock immediately (best-effort; the BT
+    /// half is a no-op until the session is up). No-op when the schedule is disabled.
+    fn apply_schedule_now(&self) {
+        let sched = *self.schedule.lock().unwrap();
+        if !sched.enabled {
+            return;
+        }
+        let (bt_up, bt_down, http) = sched.caps_now();
+        (self.bt_rate_applier)(bt_up, bt_down);
+        self.rate_limit().set_bps(http);
+    }
+
+    /// Spawn the schedule ticker once, if a tokio runtime is available. Safe to call
+    /// repeatedly; only the first call (with a live runtime) spawns the task.
+    fn ensure_scheduler_started(&self) {
+        if self
+            .scheduler_started
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(bandwidth_scheduler(
+                    self.schedule.clone(),
+                    self.rate_limit(),
+                    self.bt_rate_applier.clone(),
+                ));
+            }
+            Err(_) => {
+                // No runtime yet; allow a later call (from async context) to spawn it.
+                self.scheduler_started
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Resume every paused/queued transfer that has a registered manifest. Symmetric
+    /// with [`Engine::request_pause`]; the caller re-drives each returned id with
+    /// [`Engine::run_download`] (the engine doesn't own the run loop). Returns the ids
+    /// it asked to resume.
+    pub fn resumable_transfers(&self) -> Vec<crate::transfer::TransferId> {
+        use crate::transfer::TransferState;
+        self.transfers
+            .all()
+            .into_iter()
+            .filter(|ctl| {
+                matches!(
+                    ctl.state(),
+                    TransferState::Paused | TransferState::Queued | TransferState::Failed
+                )
+            })
+            .map(|ctl| ctl.id.clone())
+            .collect()
     }
 
     /// Pause every active transfer (back-compat single-flight API). The streaming
@@ -1254,12 +1604,7 @@ impl Engine {
         // slot-starved transfer shows as "queued" in the UI rather than a stuck
         // Paused/0B card. Flips to Connecting once a slot frees.
         ctl.set_state(TransferState::Queued);
-        let _permit = self
-            .download_slots
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| Error::other("download scheduler closed"))?;
+        let _permit = self.download_queue.acquire(ctl.id.clone()).await?;
         ctl.set_state(TransferState::Connecting);
         let manifest_id = ctl.manifest_id.clone();
         let result = crate::transfer::CURRENT_TRANSFER
@@ -2981,6 +3326,7 @@ impl Engine {
                 license: r.license,
                 magnet: r.magnet,
                 peers: r.peers,
+                bt_seeders: r.bt_seeders,
                 devices: r.devices,
                 mine: r.mine,
             })
@@ -3988,6 +4334,82 @@ mod tests {
 
     fn hashes() -> Hashes {
         Hashes::new("6a4f".repeat(16), "c2de".repeat(16))
+    }
+
+    fn tid(s: &str) -> crate::transfer::TransferId {
+        crate::transfer::TransferId(s.to_string())
+    }
+
+    #[test]
+    fn download_queue_reorder_moves_within_waiting_set() {
+        let q = DownloadQueue::new(2);
+        for id in ["a", "b", "c"] {
+            q.waiting.lock().unwrap().push(tid(id));
+        }
+        q.reorder(&tid("c"), QueueMove::Top);
+        assert_eq!(q.order(), vec![tid("c"), tid("a"), tid("b")]);
+        q.reorder(&tid("c"), QueueMove::Down);
+        assert_eq!(q.order(), vec![tid("a"), tid("c"), tid("b")]);
+        q.reorder(&tid("a"), QueueMove::Bottom);
+        assert_eq!(q.order(), vec![tid("c"), tid("b"), tid("a")]);
+        // Up from the front and Down from the back are no-ops.
+        q.reorder(&tid("c"), QueueMove::Up);
+        assert_eq!(q.order(), vec![tid("c"), tid("b"), tid("a")]);
+        // Reordering an id that isn't queued does nothing.
+        q.reorder(&tid("zzz"), QueueMove::Top);
+        assert_eq!(q.order(), vec![tid("c"), tid("b"), tid("a")]);
+    }
+
+    #[tokio::test]
+    async fn download_queue_admits_in_order_up_to_limit() {
+        let q = Arc::new(DownloadQueue::new(1));
+        let p1 = q.acquire(tid("first")).await.unwrap();
+        // One slot, taken: a second acquire parks until the first permit drops.
+        let q2 = q.clone();
+        let waiter = tokio::spawn(async move { q2.acquire(tid("second")).await.map(|_| ()) });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !waiter.is_finished(),
+            "second should be parked while slot held"
+        );
+        assert_eq!(q.order(), vec![tid("second")]);
+        drop(p1);
+        waiter.await.unwrap().unwrap();
+        assert!(q.order().is_empty());
+    }
+
+    #[test]
+    fn bandwidth_schedule_active_window() {
+        let mut s = BandwidthSchedule {
+            enabled: true,
+            from_min: 9 * 60, // 09:00
+            to_min: 17 * 60,  // 17:00
+            ..Default::default()
+        };
+        assert!(s.active_at(10 * 60, 0)); // 10:00 Mon, inside
+        assert!(!s.active_at(8 * 60, 0)); // 08:00, before
+        assert!(!s.active_at(17 * 60, 0)); // 17:00 exclusive end
+                                           // Disabled ⇒ never active.
+        s.enabled = false;
+        assert!(!s.active_at(10 * 60, 0));
+        s.enabled = true;
+        // Day mask: only Saturday (bit 5).
+        s.days = 1 << 5;
+        assert!(!s.active_at(10 * 60, 0)); // Monday excluded
+        assert!(s.active_at(10 * 60, 5)); // Saturday included
+    }
+
+    #[test]
+    fn bandwidth_schedule_wraps_past_midnight() {
+        let s = BandwidthSchedule {
+            enabled: true,
+            from_min: 22 * 60, // 22:00
+            to_min: 6 * 60,    // 06:00
+            ..Default::default()
+        };
+        assert!(s.active_at(23 * 60, 2)); // 23:00 inside
+        assert!(s.active_at(2 * 60, 2)); // 02:00 inside (next day)
+        assert!(!s.active_at(12 * 60, 2)); // noon outside
     }
 
     #[test]

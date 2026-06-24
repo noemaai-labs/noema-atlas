@@ -1,6 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod transport_ui;
+mod updater;
 
 use eframe::egui;
 use noema_core::db::CacheBlobRow;
@@ -243,6 +244,8 @@ struct Palette {
     amber_dim: egui::Color32,
     red: egui::Color32,    // error / danger
     orange: egui::Color32, // stalled / partial
+    teal: egui::Color32,   // model-format accent (safetensors)
+    violet: egui::Color32, // model-format accent (mlx)
     // Status callout cards: fill, border, and text-on-card.
     green_bg: egui::Color32,
     green_bg_hi: egui::Color32,
@@ -279,6 +282,8 @@ impl Palette {
             amber_dim: rgb(0xd0, 0x9a, 0x3c),
             red: rgb(0xff, 0x6b, 0x6b),
             orange: rgb(0xd0, 0x6a, 0x3c),
+            teal: rgb(0x2d, 0xd4, 0xbf),
+            violet: rgb(0xa7, 0x8b, 0xfa),
             green_bg: rgb(0x12, 0x2e, 0x1c),
             green_bg_hi: rgb(0x18, 0x4a, 0x2a),
             on_green: rgb(0xff, 0xff, 0xff),
@@ -312,6 +317,8 @@ impl Palette {
             amber_dim: rgb(0x9a, 0x6f, 0x12),
             red: rgb(0xcf, 0x2f, 0x2f),
             orange: rgb(0xc2, 0x54, 0x1f),
+            teal: rgb(0x0f, 0x76, 0x6e),
+            violet: rgb(0x6d, 0x28, 0xd9),
             green_bg: rgb(0xe6, 0xf5, 0xec),
             green_bg_hi: rgb(0xd3, 0xef, 0xdc),
             on_green: rgb(0x10, 0x50, 0x2b),
@@ -366,7 +373,18 @@ struct Settings {
     /// Worldwide P2P content tracker URL.
     #[serde(default = "default_tracker")]
     tracker_url: String,
-    /// Share downloaded models worldwide (seed over Iroh + announce to tracker).
+    /// Master switch for the Iroh transport (download + seed). Off disables Iroh
+    /// entirely: the fetch route fails over to BitTorrent/Hugging Face and the
+    /// worldwide seeder won't run. Default on. The download side applies at startup;
+    /// the seed side (the worldwide seeder) toggles live.
+    #[serde(default = "default_true")]
+    iroh_enabled: bool,
+    /// Download sub-switch for Iroh. Off (master still on) stops using Iroh as a
+    /// *download* route while seeding can continue. Default on. Applied at startup.
+    #[serde(default = "default_true")]
+    iroh_download: bool,
+    /// Seed downloaded models worldwide over Iroh (announce to tracker). Iroh's seed
+    /// sub-switch; toggles the live worldwide seeder. Default on.
     #[serde(default)]
     share_worldwide: bool,
     /// Also auto-share gated/token-walled/licensed models (default off — only
@@ -409,11 +427,19 @@ struct Settings {
     /// installs whose settings file predates this field.
     #[serde(default)]
     theme: ThemeMode,
+    /// Check for app updates on launch and offer one-click install. Default on;
+    /// the check is anonymous and best-effort. Turn off to never phone home.
+    #[serde(default = "default_true")]
+    auto_update: bool,
     /// Master switch for the BitTorrent transport (download + seed). Off disables
     /// BT entirely; downloads fail over to Iroh/Hugging Face. Default on. Applied
     /// at startup (the session binds once), so editing it prompts a restart.
     #[serde(default = "default_true")]
     bt_enabled: bool,
+    /// Download sub-switch for BitTorrent. Off (master still on) stops using BT as a
+    /// *download* route while seeding can continue. Default on. Applied at startup.
+    #[serde(default = "default_true")]
+    bt_download: bool,
     /// Seed completed, openly-licensed blobs over BitTorrent (download stays on
     /// regardless). Default on.
     #[serde(default = "default_true")]
@@ -444,6 +470,33 @@ struct Settings {
     /// Max transfers downloading at once; further downloads queue.
     #[serde(default = "default_max_concurrent")]
     max_concurrent: u32,
+    /// Download BitTorrent pieces in order (streaming) rather than rarest-first.
+    /// Applied at startup and live.
+    #[serde(default)]
+    bt_sequential: bool,
+    /// Bandwidth schedule ("alternative speed limits"): on a matching weekday and
+    /// time window the alt caps below replace the normal ones.
+    #[serde(default)]
+    bt_schedule_enabled: bool,
+    /// Window start, minutes since local midnight (0..=1439).
+    #[serde(default)]
+    bt_schedule_from_min: u16,
+    /// Window end, minutes since local midnight (0..=1439).
+    #[serde(default)]
+    bt_schedule_to_min: u16,
+    /// Active weekdays, bit0=Mon..bit6=Sun; 0 = every day.
+    #[serde(default)]
+    bt_schedule_days: u8,
+    /// Alternative BitTorrent upload cap (Mbps, 0 = unlimited) during the window.
+    #[serde(default)]
+    bt_alt_up_cap_mbps: u32,
+    /// Alternative BitTorrent download cap (Mbps, 0 = unlimited) during the window.
+    #[serde(default)]
+    bt_alt_down_cap_mbps: u32,
+    /// Alternative Hugging Face / HTTPS download cap (Mbps, 0 = unlimited) during
+    /// the window.
+    #[serde(default)]
+    alt_download_cap_mbps: u32,
 }
 
 /// The subset of settings that only take effect at startup (the engine reads
@@ -549,6 +602,8 @@ impl Default for Settings {
             // you download are shared so others can find them in Explore;
             // gated/token-walled and privately-imported models stay private
             // unless you opt them in (see `share_gated`).
+            iroh_enabled: true,
+            iroh_download: true,
             share_worldwide: true,
             // Default OFF: gated/licensed models are only auto-shared if the
             // operator explicitly opts in (verify content, not licenses — but
@@ -567,7 +622,9 @@ impl Default for Settings {
             proxy_url: String::new(),
             seen_intro: false,
             theme: ThemeMode::Dark,
+            auto_update: true,
             bt_enabled: true,
+            bt_download: true,
             bt_seed: true,
             bt_port: default_bt_port(),
             bt_up_cap_mbps: 0,
@@ -579,11 +636,37 @@ impl Default for Settings {
             bt_use_public_trackers: false,
             download_preference: 0,
             max_concurrent: default_max_concurrent(),
+            bt_sequential: false,
+            bt_schedule_enabled: false,
+            bt_schedule_from_min: 0,
+            bt_schedule_to_min: 0,
+            bt_schedule_days: 0,
+            bt_alt_up_cap_mbps: 0,
+            bt_alt_down_cap_mbps: 0,
+            alt_download_cap_mbps: 0,
         }
     }
 }
 
 impl Settings {
+    /// Build the engine bandwidth schedule from the persisted fields: the normal
+    /// caps mirror the standard speed settings, the alt caps come from the
+    /// schedule's own inputs (all Mbps → bytes/sec).
+    fn bandwidth_schedule(&self) -> noema_core::BandwidthSchedule {
+        noema_core::BandwidthSchedule {
+            enabled: self.bt_schedule_enabled,
+            from_min: self.bt_schedule_from_min.min(1439),
+            to_min: self.bt_schedule_to_min.min(1439),
+            days: self.bt_schedule_days,
+            bt_up_bps: mbps_to_bps(self.bt_up_cap_mbps),
+            bt_down_bps: mbps_to_bps(self.bt_down_cap_mbps),
+            http_down_bps: mbps_to_bps(self.download_cap_mbps),
+            alt_bt_up_bps: mbps_to_bps(self.bt_alt_up_cap_mbps),
+            alt_bt_down_bps: mbps_to_bps(self.bt_alt_down_cap_mbps),
+            alt_http_down_bps: mbps_to_bps(self.alt_download_cap_mbps),
+        }
+    }
+
     /// The announce identity (device name) for the catalog.
     fn identity(&self) -> noema_core::tracker::Identity {
         noema_core::tracker::Identity {
@@ -650,6 +733,19 @@ enum Msg {
     /// Tracker state changed after a withdraw/refresh; visible peer counts and
     /// catalog rows should be rechecked now, not after the normal stale timer.
     PeerStateChanged,
+    /// A force-recheck finished — (model name, result message on error).
+    Rechecked(Result<String, String>),
+    /// An auto-update check finished: `Some` = a newer build is available for this
+    /// platform, `None` = up to date, `Err` = the check failed (only surfaced for a
+    /// manual check; the silent startup ping ignores errors).
+    UpdateChecked(Result<Option<updater::UpdateInfo>, String>),
+    /// Progress of the update download (bytes done, total).
+    UpdateProgress {
+        done: u64,
+        total: u64,
+    },
+    /// The update finished applying (or couldn't be applied).
+    UpdateApplied(Result<updater::ApplyOutcome, String>),
 }
 
 enum Action {
@@ -689,6 +785,9 @@ enum Action {
     RevealFile(PathBuf),
     SaveToken,
     ToggleWorldwide,
+    /// Toggle the Iroh master switch. On resumes the worldwide seeder (if the seed
+    /// sub-switch is on); off stops it now (the download route stops next launch).
+    SetIrohEnabled(bool),
     /// Confirm stopping worldwide sharing while peers are mid-transfer.
     ConfirmStopWorldwide,
     /// Keep sharing after the stop-while-active confirmation.
@@ -744,6 +843,15 @@ enum Action {
     ApplyIdentity,
     /// Apply the BitTorrent settings (seeding live; port/caps note next launch).
     ApplyBitTorrent,
+    /// Set (or clear, with `None`) a single model's BitTorrent seed-ratio override.
+    SetBlobRatio {
+        blake3: String,
+        cap: Option<f64>,
+    },
+    /// Force a full re-hash of a model's BitTorrent torrents (async).
+    BtForceRecheck(String),
+    /// Move a queued (waiting) transfer within the download queue.
+    QueueReorder(noema_core::transfer::TransferId, noema_core::QueueMove),
     ApplySpeedCap,
     /// Apply the parallel-connections setting to the running engine (live).
     ApplyDownloadConnections,
@@ -756,6 +864,16 @@ enum Action {
     SetDownloadPreference(noema_core::DownloadPreference),
     /// Switch the UI between light and dark, persist it, and re-apply the style.
     SetTheme(ThemeMode),
+    /// Toggle automatic update checks (persisted); on also re-checks now.
+    SetAutoUpdate(bool),
+    /// Manually check for an app update now.
+    CheckForUpdates,
+    /// Download + apply the available update (after the user's click).
+    ApplyUpdate,
+    /// Hide the update banner for the currently-available version.
+    DismissUpdate,
+    /// Open a URL in the user's browser (e.g. the release-notes page).
+    OpenUrl(String),
     Refresh,
     Evict(EvictPolicy),
 }
@@ -1197,6 +1315,8 @@ struct App {
     /// Transfers don't hammer the engine on every repaint frame. See
     /// [`App::blob_status`].
     bt_status: HashMap<String, BlobNetStatus>,
+    /// In-app auto-update state (banner, in-flight check/apply, progress).
+    update: updater::UpdateUi,
 }
 
 /// Cached live network status for a single blob — read by the Library/Transfers
@@ -1269,16 +1389,22 @@ impl App {
         cfg.platform.huggingface_download = settings.allow_hf_download;
         cfg.max_download_connections = settings.download_connections.max(1) as usize;
         cfg.share_gated = settings.share_gated;
+        // Iroh fetch route: master AND its download sub-switch. The worldwide seeder
+        // is a separate node started below, so "seed on / download off" still seeds.
+        cfg.transport.iroh_enabled = settings.iroh_enabled && settings.iroh_download;
         // BitTorrent: the master switch gates the whole transport (download +
-        // seed); seeding + caps + listen port follow the persisted UI settings
-        // (port `0` disables inbound listening).
+        // seed); the download sub-switch gates only the fetch route (seeding can
+        // continue); caps + listen port follow the persisted UI settings (port `0`
+        // disables inbound listening).
         cfg.transport.bittorrent_enabled = settings.bt_enabled;
+        cfg.transport.bittorrent_download = settings.bt_download;
         cfg.transport.bittorrent_seed = settings.bt_seed;
         cfg.transport.bittorrent_listen_port_range =
             (settings.bt_port != 0).then(|| settings.bt_port..settings.bt_port.saturating_add(11));
         cfg.transport.bittorrent_max_up_bps = mbps_to_bps(settings.bt_up_cap_mbps);
         cfg.transport.bittorrent_max_down_bps = mbps_to_bps(settings.bt_down_cap_mbps);
         cfg.transport.bittorrent_max_ratio = settings.bt_max_ratio.max(0.0);
+        cfg.transport.bittorrent_sequential = settings.bt_sequential;
         cfg.transport.bittorrent_use_public_trackers = settings.bt_use_public_trackers;
         // Download-routing preference: applied at startup; the live setter mirrors
         // it after `Engine::open` (the setter takes effect on the next download).
@@ -1350,6 +1476,7 @@ impl App {
             status: "Search for a model to get started.".into(),
             toasts: Vec::new(),
             bt_status: HashMap::new(),
+            update: updater::UpdateUi::default(),
         };
         if settings_dirty {
             app.save_settings();
@@ -1359,14 +1486,100 @@ impl App {
         // so they're resumable instead of orphaned.
         app.load_resumable_cards();
         app.apply_speed_cap();
+        if let Some(engine) = &app.engine {
+            engine.set_bittorrent_sequential(app.settings.bt_sequential);
+            engine.set_bandwidth_schedule(app.settings.bandwidth_schedule());
+        }
         if app.settings.share_worldwide {
             app.start_worldwide();
+        }
+        if app.settings.auto_update {
+            app.start_update_check(true);
         }
         app
     }
 
+    /// Ping the VPS for a newer release on a background thread. `silent` swallows
+    /// errors (the startup check) vs surfacing them in the status line (a manual
+    /// check). Cheap and best-effort: a failure never blocks the app.
+    fn start_update_check(&mut self, silent: bool) {
+        if self.update.checking || self.update.applying {
+            return;
+        }
+        self.update.checking = true;
+        self.update.silent = silent;
+        if !silent {
+            self.status = "Checking for updates…".into();
+        }
+        let tx = self.tx.clone();
+        let ctx = self.egui_ctx.clone();
+        let tracker = self.settings.tracker_url.clone();
+        let proxy = self.proxy_for_update();
+        let current = env!("CARGO_PKG_VERSION").to_string();
+        self.rt.spawn(async move {
+            let res = updater::check(&tracker, &current, proxy.as_deref()).await;
+            let _ = tx.send(Msg::UpdateChecked(res));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Download + verify + apply the available update on a background thread.
+    fn start_update_apply(&mut self) {
+        let Some(info) = self.update.available.clone() else {
+            return;
+        };
+        if self.update.applying {
+            return;
+        }
+        self.update.applying = true;
+        self.update.progress = Some(0.0);
+        self.status = format!("Downloading Atlas {}…", info.version);
+        let tx = self.tx.clone();
+        let ctx = self.egui_ctx.clone();
+        let proxy = self.proxy_for_update();
+        let dest = updater::stage_dir();
+        self.rt.spawn(async move {
+            let prog_tx = tx.clone();
+            let prog_ctx = ctx.clone();
+            let download = updater::download_verified(
+                &info.asset,
+                &dest,
+                proxy.as_deref(),
+                move |done, total| {
+                    let _ = prog_tx.send(Msg::UpdateProgress { done, total });
+                    prog_ctx.request_repaint();
+                },
+            )
+            .await;
+            let result = match download {
+                // apply() does blocking filesystem + process work — run it off the
+                // async worker pool rather than stalling a runtime thread.
+                Ok(path) => tokio::task::spawn_blocking(move || updater::apply(&info, &path))
+                    .await
+                    .unwrap_or_else(|e| Err(format!("apply task failed: {e}"))),
+                Err(e) => Err(e),
+            };
+            let _ = tx.send(Msg::UpdateApplied(result));
+            ctx.request_repaint();
+        });
+    }
+
+    /// The proxy URL to route update traffic through, matching the engine's config.
+    fn proxy_for_update(&self) -> Option<String> {
+        if self.settings.proxy_enabled && !self.settings.proxy_url.trim().is_empty() {
+            Some(self.settings.proxy_url.trim().to_string())
+        } else {
+            None
+        }
+    }
+
     fn start_worldwide(&mut self) {
         let Some(engine) = &self.engine else { return };
+        // The Iroh master gates seeding too: never start the worldwide seeder while
+        // Iroh is turned off, even if the seed sub-switch is on.
+        if !self.settings.iroh_enabled {
+            return;
+        }
         if self.worldwide.is_some() {
             return;
         }
@@ -1561,6 +1774,8 @@ impl App {
         // than only on the next launch (where Engine::open reads the config).
         if let Some(engine) = &self.engine {
             engine.set_bittorrent_max_ratio(self.settings.bt_max_ratio.max(0.0));
+            engine.set_bittorrent_sequential(self.settings.bt_sequential);
+            engine.set_bandwidth_schedule(self.settings.bandwidth_schedule());
         }
         self.save_settings();
         self.status = "BitTorrent settings saved — they take effect next time Atlas starts.".into();
@@ -2737,6 +2952,75 @@ impl App {
                     }
                 }
                 Msg::PeerStateChanged => self.refresh_after_peer_state_change(),
+                Msg::Rechecked(res) => match res {
+                    Ok(name) => self.push_toast(format!("Rechecked {name}"), ToastKind::Success),
+                    Err(e) => self.push_toast(format!("Recheck failed: {e}"), ToastKind::Error),
+                },
+                Msg::UpdateChecked(res) => {
+                    self.update.checking = false;
+                    match res {
+                        Ok(Some(info)) => {
+                            self.status = format!("Atlas {} is available.", info.version);
+                            // A freshly-offered version clears any earlier dismissal.
+                            if self.update.dismissed.as_deref() != Some(info.version.as_str()) {
+                                self.update.dismissed = None;
+                            }
+                            self.update.available = Some(info);
+                        }
+                        Ok(None) => {
+                            // Only chirp on an explicit check; the startup ping stays quiet.
+                            if !self.update.silent {
+                                self.status = "You're on the latest version.".into();
+                            }
+                        }
+                        Err(e) => {
+                            if !self.update.silent {
+                                self.status = format!("Update check failed: {e}");
+                            }
+                            tracing::debug!("update check failed: {e}");
+                        }
+                    }
+                }
+                Msg::UpdateProgress { done, total } => {
+                    if total > 0 {
+                        self.update.progress = Some((done as f32 / total as f32).clamp(0.0, 1.0));
+                    }
+                }
+                Msg::UpdateApplied(res) => {
+                    self.update.applying = false;
+                    self.update.progress = None;
+                    match res {
+                        Ok(updater::ApplyOutcome::Relaunching)
+                        | Ok(updater::ApplyOutcome::LaunchedInstaller) => {
+                            // The new copy is starting (or the installer is running);
+                            // exit so it can take over / unlock the binary.
+                            std::process::exit(0);
+                        }
+                        Ok(updater::ApplyOutcome::SwappedButRelaunchFailed { reason }) => {
+                            // The update IS installed but the new copy didn't start —
+                            // do NOT exit (that would leave nothing running).
+                            self.update.available = None;
+                            self.status = format!("{reason} — please reopen Atlas to finish.");
+                            self.push_toast(
+                                "Update installed — reopen Atlas to finish",
+                                ToastKind::Warning,
+                            );
+                        }
+                        Ok(updater::ApplyOutcome::Manual { path, reason }) => {
+                            self.update.available = None;
+                            self.status =
+                                format!("{reason} The update is downloaded at {}.", path.display());
+                            self.push_toast(
+                                "Update downloaded — finish installing from the release page",
+                                ToastKind::Warning,
+                            );
+                        }
+                        Err(e) => {
+                            self.status = format!("Update failed: {e}");
+                            self.push_toast(format!("Update failed: {e}"), ToastKind::Error);
+                        }
+                    }
+                }
             }
         }
     }
@@ -2974,6 +3258,32 @@ deleted: {}",
                     self.save_settings();
                 }
             }
+            Action::SetIrohEnabled(on) => {
+                self.settings.iroh_enabled = on;
+                if on {
+                    // Master back on: resume the worldwide seeder if the seed
+                    // sub-switch wants it. The download route re-enables next launch.
+                    if self.settings.share_worldwide {
+                        self.start_worldwide();
+                    }
+                    self.status = "Iroh on — download routing applies next launch.".into();
+                } else {
+                    // Master off: stop seeding now; the download route stops next
+                    // launch (the transport is gated at engine open).
+                    let active = self
+                        .worldwide
+                        .as_ref()
+                        .map(|w| w.active_uploads())
+                        .unwrap_or(0);
+                    self.stop_worldwide();
+                    self.clear_network_after_stop();
+                    if active > 0 {
+                        self.push_toast("Iroh off — peers disconnected", ToastKind::Warning);
+                    }
+                    self.status = "Iroh off — download routing stops next launch.".into();
+                }
+                self.save_settings();
+            }
             Action::ConfirmStopWorldwide => {
                 self.pending_share_off = None;
                 self.settings.share_worldwide = false;
@@ -3174,6 +3484,41 @@ deleted: {}",
                 }
             }
             Action::ApplyBitTorrent => self.apply_bittorrent(),
+            Action::SetBlobRatio { blake3, cap } => {
+                if let Some(engine) = &self.engine {
+                    engine.set_bittorrent_blob_max_ratio(&blake3, cap);
+                    self.status = match cap {
+                        Some(_) => "Per-model ratio limit set.".into(),
+                        None => "Per-model ratio limit cleared — using the global cap.".into(),
+                    };
+                }
+            }
+            Action::BtForceRecheck(blake3) => {
+                if let Some(engine) = self.engine.clone() {
+                    let name = self
+                        .installed
+                        .iter()
+                        .find(|m| m.blake3 == blake3)
+                        .map(|m| m.name.clone())
+                        .unwrap_or_else(|| "model".into());
+                    let (tx, ctx) = (self.tx.clone(), self.egui_ctx.clone());
+                    self.status = format!("Rechecking {name}…");
+                    self.rt.spawn(async move {
+                        let res = engine
+                            .bt_force_recheck(&blake3)
+                            .await
+                            .map(|()| name)
+                            .map_err(|e| e.to_string());
+                        let _ = tx.send(Msg::Rechecked(res));
+                        ctx.request_repaint();
+                    });
+                }
+            }
+            Action::QueueReorder(id, mv) => {
+                if let Some(engine) = &self.engine {
+                    engine.queue_reorder(&id, mv);
+                }
+            }
             Action::ApplySpeedCap => {
                 self.apply_speed_cap();
                 self.save_settings();
@@ -3279,6 +3624,25 @@ deleted: {}",
                     self.settings.theme = mode;
                     apply_theme(&self.egui_ctx, mode.is_dark());
                     self.save_settings();
+                }
+            }
+            Action::SetAutoUpdate(on) => {
+                self.settings.auto_update = on;
+                self.save_settings();
+                if on {
+                    self.start_update_check(false);
+                }
+            }
+            Action::CheckForUpdates => self.start_update_check(false),
+            Action::ApplyUpdate => self.start_update_apply(),
+            Action::DismissUpdate => {
+                if let Some(info) = &self.update.available {
+                    self.update.dismissed = Some(info.version.clone());
+                }
+            }
+            Action::OpenUrl(url) => {
+                if let Err(e) = open_url(&url) {
+                    self.status = format!("Couldn't open browser: {e}");
                 }
             }
             Action::Refresh => {
@@ -3520,6 +3884,51 @@ fn top_bar(app: &mut App, ctx: &egui::Context, actions: &mut Vec<Action>) {
                 );
             });
         });
+        if let Some(info) = app.update.banner() {
+            let version = info.version.clone();
+            let notes = info.notes_url.clone();
+            let forced = info.forced;
+            let applying = app.update.applying;
+            let progress = app.update.progress;
+            ui.add_space(4.0);
+            egui::Frame::none()
+                .fill(pal.amber_bg)
+                .stroke(egui::Stroke::new(1.0, pal.amber_border))
+                .rounding(6.0)
+                .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        let headline = if forced {
+                            format!("Atlas {version} is a required update")
+                        } else {
+                            format!("Atlas {version} is available")
+                        };
+                        ui.colored_label(pal.amber_text, egui::RichText::new(headline).strong());
+                        if applying {
+                            if let Some(p) = progress {
+                                ui.add(
+                                    egui::ProgressBar::new(p)
+                                        .desired_width(160.0)
+                                        .text("Installing…"),
+                                );
+                            } else {
+                                ui.label(egui::RichText::new("Installing…").small());
+                            }
+                        } else {
+                            if ui.button("Install & restart").clicked() {
+                                actions.push(Action::ApplyUpdate);
+                            }
+                            if !notes.is_empty() && ui.button("Release notes").clicked() {
+                                actions.push(Action::OpenUrl(notes));
+                            }
+                            // A forced (security-floor) update can't be dismissed.
+                            if !forced && ui.button("Dismiss").clicked() {
+                                actions.push(Action::DismissUpdate);
+                            }
+                        }
+                    });
+                });
+        }
         ui.add_space(6.0);
     });
 }
@@ -4949,10 +5358,20 @@ fn draw_model_row(ui: &mut egui::Ui, m: &HfModel, actions: &mut Vec<Action>) {
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label(egui::RichText::new(m.name()).strong().size(16.0));
-                        if m.has_gguf() {
-                            badge(ui, "GGUF", pal.blue_dl);
+                        // One color-coded chip per weight format the repo publishes
+                        // (GGUF, Safetensors, MLX, …), same set as the Studio card.
+                        for fmt in m.model_formats() {
+                            badge(
+                                ui,
+                                &noema_core::inspect::pretty_format(fmt),
+                                format_color(&pal, fmt),
+                            )
+                            .on_hover_text(format!(
+                                "This repo publishes weights in {} format",
+                                noema_core::inspect::pretty_format(fmt)
+                            ));
                         }
                         if m.gated {
                             badge(ui, "Gated", pal.amber);
@@ -5785,6 +6204,16 @@ fn network_row(ui: &mut egui::Ui, m: &NetworkModel, actions: &mut Vec<Action>) {
                             };
                             transport_badge(ui, &label, Some(TransportKind::Iroh));
                         }
+                        // BitTorrent seeders are counted independently of the Iroh
+                        // peers above, so a file shows both routes' live availability.
+                        if m.bt_seeders > 0 {
+                            let label = if m.bt_seeders == 1 {
+                                "1 BitTorrent seed".to_string()
+                            } else {
+                                format!("{} BitTorrent seeds", m.bt_seeders)
+                            };
+                            transport_badge(ui, &label, Some(TransportKind::BitTorrent));
+                        }
                         if !m.devices.is_empty() {
                             ui.label(
                                 egui::RichText::new(format!("from {}", m.devices.join(", ")))
@@ -6157,6 +6586,60 @@ fn transfer_card(ui: &mut egui::Ui, app: &App, a: &ActiveDownload, actions: &mut
                 .weak()
             };
             ui.label(caption);
+            // Queue reordering: only waiting (Queued, slot-starved) transfers appear
+            // in the engine's queue order, and only worth showing when more than one
+            // is waiting.
+            if a.queued {
+                if let Some(engine) = &app.engine {
+                    let order = engine.download_queue_order();
+                    if order.len() > 1 {
+                        if let Some(pos) = order.iter().position(|q| q == &a.id) {
+                            let at_top = pos == 0;
+                            let at_bottom = pos + 1 == order.len();
+                            ui.horizontal(|ui| {
+                                use noema_core::QueueMove;
+                                if ui
+                                    .add_enabled(!at_top, egui::Button::new("⤒").small())
+                                    .on_hover_text("Move to the front of the queue.")
+                                    .clicked()
+                                {
+                                    actions.push(Action::QueueReorder(a.id.clone(), QueueMove::Top));
+                                }
+                                if ui
+                                    .add_enabled(!at_top, egui::Button::new("▲").small())
+                                    .on_hover_text("Move up one place in the queue.")
+                                    .clicked()
+                                {
+                                    actions.push(Action::QueueReorder(a.id.clone(), QueueMove::Up));
+                                }
+                                if ui
+                                    .add_enabled(!at_bottom, egui::Button::new("▼").small())
+                                    .on_hover_text("Move down one place in the queue.")
+                                    .clicked()
+                                {
+                                    actions
+                                        .push(Action::QueueReorder(a.id.clone(), QueueMove::Down));
+                                }
+                                if ui
+                                    .add_enabled(!at_bottom, egui::Button::new("⤓").small())
+                                    .on_hover_text("Move to the back of the queue.")
+                                    .clicked()
+                                {
+                                    actions.push(Action::QueueReorder(
+                                        a.id.clone(),
+                                        QueueMove::Bottom,
+                                    ));
+                                }
+                                ui.label(
+                                    egui::RichText::new(format!("#{} of {}", pos + 1, order.len()))
+                                        .small()
+                                        .weak(),
+                                );
+                            });
+                        }
+                    }
+                }
+            }
             return;
         }
 
@@ -6382,20 +6865,21 @@ fn bt_peer_list(
                 return;
             }
             egui::Grid::new(("bt_peer_grid", id.as_str()))
-                .num_columns(4)
+                .num_columns(5)
                 .spacing([14.0, 2.0])
                 .striped(true)
                 .show(ui, |ui| {
                     for p in &peers {
                         ui.label(egui::RichText::new(&p.addr).small().monospace());
+                        ui.label(egui::RichText::new(&p.client).small().weak());
                         ui.label(egui::RichText::new(&p.conn_kind).small().weak());
                         ui.label(
-                            egui::RichText::new(format!("↓ {}", human(p.downloaded)))
+                            egui::RichText::new(format!("↓ {}/s", human(p.down_bps)))
                                 .small()
                                 .color(pal.blue_dl),
                         );
                         ui.label(
-                            egui::RichText::new(format!("↑ {}", human(p.uploaded)))
+                            egui::RichText::new(format!("↑ {}/s", human(p.up_bps)))
                                 .small()
                                 .color(pal.green),
                         );
@@ -6686,6 +7170,57 @@ fn draw_library(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) {
                                     actions.push(Action::EditModel(m.manifest_id.clone()));
                                 }
                             });
+                            // BitTorrent-managed models (a live magnet) get a per-model
+                            // seed-ratio override and a force-recheck.
+                            if !app.blob_status(&m.blake3).magnet.is_empty() {
+                                if let Some(engine) = &app.engine {
+                                    ui.horizontal(|ui| {
+                                        let override_cap = engine.bittorrent_blob_max_ratio(&m.blake3);
+                                        ui.label(
+                                            egui::RichText::new("Ratio limit (model)").small(),
+                                        )
+                                        .on_hover_text("Stop seeding this model over BitTorrent once you've uploaded this many times its size. 0 = unlimited (this model). Clear to follow the global cap.");
+                                        let mut r = override_cap.unwrap_or(0.0);
+                                        if ui
+                                            .add(
+                                                egui::DragValue::new(&mut r)
+                                                    .range(0.0..=100.0)
+                                                    .speed(0.1)
+                                                    .max_decimals(2),
+                                            )
+                                            .changed()
+                                        {
+                                            actions.push(Action::SetBlobRatio {
+                                                blake3: m.blake3.clone(),
+                                                cap: Some(r.max(0.0)),
+                                            });
+                                        }
+                                        if override_cap.is_some() {
+                                            if ui
+                                                .small_button("×")
+                                                .on_hover_text("Clear the per-model limit and follow the global cap.")
+                                                .clicked()
+                                            {
+                                                actions.push(Action::SetBlobRatio {
+                                                    blake3: m.blake3.clone(),
+                                                    cap: None,
+                                                });
+                                            }
+                                        } else {
+                                            ui.label(
+                                                egui::RichText::new("(global)").small().weak(),
+                                            );
+                                        }
+                                        if ui
+                                            .small_button("Recheck")
+                                            .on_hover_text("Force a full re-hash of this model's BitTorrent data to verify integrity.")
+                                            .clicked()
+                                        {
+                                            actions.push(Action::BtForceRecheck(m.blake3.clone()));
+                                        }
+                                    });
+                                }
+                            }
                             if m.shareable {
                                 // A model can be served over Iroh (this blob actively
                                 // seeded in the worldwide share) and/or BitTorrent (a
@@ -6761,15 +7296,16 @@ fn draw_library(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) {
     });
 }
 
-/// The BitTorrent Settings section. Download is always on; this controls seeding,
-/// the inbound listen port, per-direction caps, and the concurrency limit. The
-/// librqbit session is built once at startup, so these apply on the next launch.
+/// The BitTorrent Settings section. Download and seed are independent toggles under
+/// the "Use BitTorrent" master; this also controls the inbound listen port,
+/// per-direction caps, and the concurrency limit. The librqbit session is built
+/// once at startup, so these apply on the next launch.
 fn bittorrent_settings(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
     let pal = pal_of(ui);
     ui.add_space(14.0);
     ui.label(egui::RichText::new("BitTorrent").strong());
     ui.label(
-        egui::RichText::new("Atlas can download and seed models over BitTorrent (µTP + DHT) in addition to Iroh and Hugging Face. Downloading is always on; the options below take effect next time Atlas starts.")
+        egui::RichText::new("Connect to the BitTorrent swarm (µTP + DHT), alongside Iroh and Hugging Face. While connected, the options below choose whether Atlas downloads models from the swarm, seeds the open-licensed ones back, or both. The options take effect next time Atlas starts.")
             .small()
             .weak(),
     );
@@ -6780,8 +7316,8 @@ fn bittorrent_settings(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Actio
     );
     let mut changed = false;
     if ui
-        .checkbox(&mut app.settings.bt_enabled, "Enable BitTorrent")
-        .on_hover_text("Master switch for the whole BitTorrent transport (download and seed). When off, transfers use only Iroh and Hugging Face. Applied at startup — takes effect next time Atlas starts.")
+        .checkbox(&mut app.settings.bt_enabled, "Use BitTorrent")
+        .on_hover_text("Joins the BitTorrent swarm — binds the listen port and DHT — so the options below can take effect. When off, transfers use only Iroh and Hugging Face, and the options below are disabled. Applied at startup — takes effect next time Atlas starts.")
         .changed()
     {
         changed = true;
@@ -6796,10 +7332,19 @@ fn bittorrent_settings(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Actio
         );
     }
     // The BitTorrent-specific rows are greyed out while BT is disabled (they have
-    // no effect then); the seed setting + caps + port all live behind the switch.
+    // no effect then) and indent under "Use BitTorrent"; the download/seed switches
+    // + caps + port all read as that master's options rather than separate settings.
     let bt_changed = ui
         .add_enabled_ui(app.settings.bt_enabled, |ui| {
+          ui.indent("bt_sub", |ui| {
             let mut changed = false;
+            if ui
+                .checkbox(&mut app.settings.bt_download, "Download over BitTorrent")
+                .on_hover_text("Use BitTorrent as a download route (fetch model bytes from the swarm). Off still lets you seed over BitTorrent. Takes effect next time Atlas starts.")
+                .changed()
+            {
+                changed = true;
+            }
             if ui
                 .checkbox(&mut app.settings.bt_seed, "Seed openly-licensed models over BitTorrent")
                 .on_hover_text("Re-share the open-licensed models you download to the BitTorrent swarm. Uses upload bandwidth and binds your listen port.")
@@ -6869,6 +7414,16 @@ fn bittorrent_settings(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Actio
             });
             if ui
                 .checkbox(
+                    &mut app.settings.bt_sequential,
+                    "Download pieces in order (sequential)",
+                )
+                .on_hover_text("Fetch BitTorrent pieces front-to-back (useful for streaming) instead of the faster rarest-first order. Applied live.")
+                .changed()
+            {
+                changed = true;
+            }
+            if ui
+                .checkbox(
                     &mut app.settings.bt_use_public_trackers,
                     "Use public BitTorrent trackers",
                 )
@@ -6878,6 +7433,7 @@ fn bittorrent_settings(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Actio
                 changed = true;
             }
             changed
+          }).inner
         })
         .inner;
     changed |= bt_changed;
@@ -6895,9 +7451,138 @@ fn bittorrent_settings(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Actio
             changed = true;
         }
     });
+    // Bandwidth schedule ("alternative speed limits"): a daily window on selected
+    // weekdays where the alt caps below replace the normal ones above.
+    ui.add_space(6.0);
+    ui.label(egui::RichText::new("Bandwidth schedule").strong());
+    if ui
+        .checkbox(
+            &mut app.settings.bt_schedule_enabled,
+            "Enable scheduled limits",
+        )
+        .on_hover_text("Apply the alternative caps below during the chosen time window on the chosen days; the normal caps apply otherwise. Applied live.")
+        .changed()
+    {
+        changed = true;
+    }
+    ui.add_enabled_ui(app.settings.bt_schedule_enabled, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("From");
+            changed |= time_picker(ui, "bt_sched_from", &mut app.settings.bt_schedule_from_min);
+            ui.label("to");
+            changed |= time_picker(ui, "bt_sched_to", &mut app.settings.bt_schedule_to_min);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Days");
+            const DAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+            for (i, name) in DAYS.iter().enumerate() {
+                let bit = 1u8 << i;
+                let mut on = app.settings.bt_schedule_days & bit != 0;
+                if ui.toggle_value(&mut on, *name).changed() {
+                    if on {
+                        app.settings.bt_schedule_days |= bit;
+                    } else {
+                        app.settings.bt_schedule_days &= !bit;
+                    }
+                    changed = true;
+                }
+            }
+        });
+        ui.label(
+            egui::RichText::new("No day selected = every day.")
+                .small()
+                .weak(),
+        );
+        ui.horizontal(|ui| {
+            ui.label("Alt upload limit (Mbps, 0 = unlimited)");
+            let mut v = app.settings.bt_alt_up_cap_mbps as f64;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut v)
+                        .range(0.0..=10_000.0)
+                        .speed(1.0),
+                )
+                .changed()
+            {
+                app.settings.bt_alt_up_cap_mbps = v as u32;
+                changed = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Alt BitTorrent download limit (Mbps, 0 = unlimited)");
+            let mut v = app.settings.bt_alt_down_cap_mbps as f64;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut v)
+                        .range(0.0..=10_000.0)
+                        .speed(1.0),
+                )
+                .changed()
+            {
+                app.settings.bt_alt_down_cap_mbps = v as u32;
+                changed = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Alt download limit (Mbps, 0 = unlimited)")
+                .on_hover_text(
+                    "Alternative cap for Hugging Face / HTTPS downloads during the window.",
+                );
+            let mut v = app.settings.alt_download_cap_mbps as f64;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut v)
+                        .range(0.0..=10_000.0)
+                        .speed(1.0),
+                )
+                .changed()
+            {
+                app.settings.alt_download_cap_mbps = v as u32;
+                changed = true;
+            }
+        });
+    });
     if changed {
         actions.push(Action::ApplyBitTorrent);
     }
+}
+
+/// An HH:MM picker for a minutes-since-midnight value (`0..=1439`), as adjacent
+/// hour + minute DragValues. Returns whether the value changed.
+fn time_picker(ui: &mut egui::Ui, id: &str, mins: &mut u16) -> bool {
+    let mut changed = false;
+    let mut h = (*mins / 60) as i32;
+    let mut m = (*mins % 60) as i32;
+    if ui
+        .add(
+            egui::DragValue::new(&mut h)
+                .range(0..=23)
+                .speed(0.2)
+                .custom_formatter(|n, _| format!("{:02}", n as i32))
+                .clamp_to_range(true),
+        )
+        .on_hover_text(format!("Hour ({id})"))
+        .changed()
+    {
+        changed = true;
+    }
+    ui.label(":");
+    if ui
+        .add(
+            egui::DragValue::new(&mut m)
+                .range(0..=59)
+                .speed(0.5)
+                .custom_formatter(|n, _| format!("{:02}", n as i32))
+                .clamp_to_range(true),
+        )
+        .changed()
+    {
+        changed = true;
+    }
+    if changed {
+        *mins = (h.clamp(0, 23) * 60 + m.clamp(0, 59)) as u16;
+    }
+    changed
 }
 
 fn draw_settings(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
@@ -6937,66 +7622,109 @@ fn draw_settings(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
                     );
                 });
         }
-        ui.add_space(12.0);
-        ui.label(egui::RichText::new("Worldwide P2P").strong());
+        // Iroh and BitTorrent are presented as two parallel transports, each with a
+        // "Use <protocol>" master switch and independent Download / Seed sub-switches.
+        ui.add_space(14.0);
+        ui.label(egui::RichText::new("Iroh").strong());
         ui.label(
-            egui::RichText::new("Openly-licensed models you download are seeded to the open mesh by default, so anyone can find them in Explore and fetch them from you over Iroh (NAT-traversing, no ports to open). Privately-imported files stay local until you opt them in, and you can stop sharing any single model from the Library.")
+            egui::RichText::new("NAT-traversing peer-to-peer networking — no ports to open. Turn it off to disable Iroh entirely; while it's on, the options below choose whether Atlas downloads models from peers, seeds the open-licensed ones back to the mesh (where anyone can find them in Explore), or both.")
                 .small()
                 .weak(),
         );
-        let mut ww = app.settings.share_worldwide;
-        if ui.checkbox(&mut ww, "Seed my models to the world").changed() {
-            actions.push(Action::ToggleWorldwide);
-        }
-        // Opt-in: also auto-share gated/licensed models (off by default).
-        let mut sg = app.settings.share_gated;
+        // Master switch: enables the Iroh transport so the download / seed options
+        // below can take effect. The download side applies at startup; the seed side
+        // (the live worldwide seeder) toggles immediately.
+        let mut iroh_on = app.settings.iroh_enabled;
         if ui
-            .checkbox(&mut sg, "Also share gated / licensed models")
-            .on_hover_text("Off by default. When on, gated/token-walled and licensed models you download are seeded too — Atlas verifies content, not licenses, so redistribution compliance is your responsibility. Applies immediately. (Per-model sharing can still be toggled in the Library either way.)")
+            .checkbox(&mut iroh_on, "Use Iroh")
+            .on_hover_text("Turns the Iroh transport on or off. Off makes Atlas fetch over BitTorrent / Hugging Face only and stops Iroh seeding, and disables the options below. Download takes effect next time Atlas starts; seeding stops right away.")
             .changed()
         {
-            actions.push(Action::SetShareGated(sg));
+            actions.push(Action::SetIrohEnabled(iroh_on));
         }
-        ui.horizontal(|ui| {
-            ui.label("Tracker");
-            if ui
-                .add(egui::TextEdit::singleline(&mut app.settings.tracker_url).desired_width(320.0))
-                .on_hover_text("Restart the app after changing this")
-                .lost_focus()
-            {
-                actions.push(Action::SaveSettings);
-            }
-        });
-        if let Some(w) = &app.worldwide {
-            let shared = app.installed.iter().filter(|m| m.shareable).count();
-            if shared > 0 {
-                ui.colored_label(
-                    pal.green,
-                    format!(
-                        "Sharing {shared} model{} worldwide.",
-                        if shared == 1 { "" } else { "s" }
-                    ),
-                );
-            } else {
-                ui.colored_label(
-                    pal.amber_dim,
-                    "Seeding to the world — no models in your Library yet.",
-                );
-                ui.label(
-                    egui::RichText::new(
-                        "Download a model from Explore and it's instantly shared with everyone.",
-                    )
+        if !app.settings.iroh_enabled {
+            ui.label(
+                egui::RichText::new("Iroh is off — the options below apply once it's re-enabled.")
                     .small()
                     .weak(),
-                );
-            }
-            ui.label(
-                egui::RichText::new(format!("your node: {}…", &w.node_ticket()[..w.node_ticket().len().min(40)]))
-                    .small()
-                    .weak()
-                    .monospace(),
             );
         }
+        // Sub-switches grey out while the master is off (they have no effect then)
+        // and indent under it, so they read as the master's download / seed options
+        // rather than competing top-level settings.
+        ui.add_enabled_ui(app.settings.iroh_enabled, |ui| {
+          ui.indent("iroh_sub", |ui| {
+            let mut dl = app.settings.iroh_download;
+            if ui
+                .checkbox(&mut dl, "Download over Iroh")
+                .on_hover_text("Use Iroh as a download route (fetch model bytes from peers). Off still lets you seed over Iroh. Takes effect next time Atlas starts.")
+                .changed()
+            {
+                app.settings.iroh_download = dl;
+                actions.push(Action::SaveSettings);
+            }
+            let mut ww = app.settings.share_worldwide;
+            if ui
+                .checkbox(&mut ww, "Seed my models to the world over Iroh")
+                .on_hover_text("Seed the open-licensed models you download to the mesh so others can discover and fetch them in Explore. Applies immediately.")
+                .changed()
+            {
+                actions.push(Action::ToggleWorldwide);
+            }
+            // Opt-in: also auto-share gated/licensed models (off by default).
+            let mut sg = app.settings.share_gated;
+            if ui
+                .checkbox(&mut sg, "Also share gated / licensed models")
+                .on_hover_text("Off by default. When on, gated/token-walled and licensed models you download are seeded too — Atlas verifies content, not licenses, so redistribution compliance is your responsibility. Applies immediately. (Per-model sharing can still be toggled in the Library either way.)")
+                .changed()
+            {
+                actions.push(Action::SetShareGated(sg));
+            }
+            ui.horizontal(|ui| {
+                ui.label("Tracker");
+                if ui
+                    .add(egui::TextEdit::singleline(&mut app.settings.tracker_url).desired_width(320.0))
+                    .on_hover_text("Restart the app after changing this")
+                    .lost_focus()
+                {
+                    actions.push(Action::SaveSettings);
+                }
+            });
+            if let Some(w) = &app.worldwide {
+                let shared = app.installed.iter().filter(|m| m.shareable).count();
+                if shared > 0 {
+                    ui.colored_label(
+                        pal.green,
+                        format!(
+                            "Sharing {shared} model{} worldwide.",
+                            if shared == 1 { "" } else { "s" }
+                        ),
+                    );
+                } else {
+                    ui.colored_label(
+                        pal.amber_dim,
+                        "Seeding to the world — no models in your Library yet.",
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "Download a model from Explore and it's instantly shared with everyone.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                }
+                ui.label(
+                    egui::RichText::new(format!("your node: {}…", &w.node_ticket()[..w.node_ticket().len().min(40)]))
+                        .small()
+                        .weak()
+                        .monospace(),
+                );
+            }
+          });
+        });
+
+        // BitTorrent sits directly below Iroh so the two transports read as a pair.
+        bittorrent_settings(ui, app, actions);
         ui.add_space(14.0);
         ui.label(egui::RichText::new("Downloads").strong());
         ui.label(
@@ -7123,8 +7851,6 @@ fn draw_settings(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
             }
         });
 
-        bittorrent_settings(ui, app, actions);
-
         ui.add_space(14.0);
         ui.label(egui::RichText::new("Speed").strong());
         ui.horizontal(|ui| {
@@ -7218,6 +7944,42 @@ fn draw_settings(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
             }
         });
         ui.add_space(14.0);
+        ui.label(egui::RichText::new("Updates").strong());
+        let mut auto = app.settings.auto_update;
+        if ui
+            .checkbox(&mut auto, "Check for updates automatically")
+            .on_hover_text(
+                "On launch, anonymously ask the Atlas server whether a newer build is \
+                 available for your platform. Updates are verified against a key built \
+                 into the app before anything is installed.",
+            )
+            .changed()
+        {
+            actions.push(Action::SetAutoUpdate(auto));
+        }
+        ui.horizontal(|ui| {
+            let busy = app.update.checking || app.update.applying;
+            if ui.add_enabled(!busy, egui::Button::new("Check now")).clicked() {
+                actions.push(Action::CheckForUpdates);
+            }
+            if let Some(info) = app.update.available.as_ref() {
+                ui.label(
+                    egui::RichText::new(format!("v{} available", info.version))
+                        .small()
+                        .strong(),
+                );
+            } else if app.update.checking {
+                ui.label(egui::RichText::new("Checking…").small().weak());
+            } else {
+                ui.label(
+                    egui::RichText::new("You're up to date.")
+                        .small()
+                        .weak(),
+                );
+            }
+        });
+
+        ui.add_space(14.0);
         ui.label(egui::RichText::new("About").strong());
         ui.label(
             egui::RichText::new(format!(
@@ -7241,16 +8003,44 @@ fn badge(ui: &mut egui::Ui, text: &str, color: egui::Color32) -> egui::Response 
         .response
 }
 
+/// Theme-aware accent for a model-format chip, keyed by the canonical format id
+/// from [`noema_core::hf::HfModel::model_formats`]. Maps each format onto the
+/// semantic palette (so chips flip cleanly between light and dark); the lead
+/// formats Atlas runs — GGUF, MLX, Safetensors — each get a distinct hue, which
+/// approximates (it doesn't byte-match) Studio's per-format CSS accents. An
+/// unrecognized id reads neutral, matching Studio's fallback pill.
+fn format_color(pal: &Palette, fmt: &str) -> egui::Color32 {
+    match fmt {
+        "gguf" | "ggml" => pal.blue_dl,
+        "mlx" => pal.violet,
+        "safetensors" => pal.teal,
+        "tensorrt" => pal.green,
+        "flax" | "paddle" => pal.blue,
+        "onnx" | "tflite" => pal.orange,
+        "pytorch" | "keras" => pal.red,
+        "numpy" => pal.blue,
+        "coreml" => pal.muted,
+        _ => pal.muted,
+    }
+}
+
 /// A small pill showing a model's recognized weight format (GGUF, Safetensors,
-/// ONNX, MLX, …) via [`noema_core::inspect::pretty_format`]. No-op when the format
-/// is unknown, so rows for unrecognized files stay clean.
+/// ONNX, MLX, …) via [`noema_core::inspect::pretty_format`], color-coded per format
+/// by [`format_color`] so the badge reads the same everywhere it appears (Discover
+/// cards and variants, Library, Transfers). No-op when the format is unknown, so
+/// rows for unrecognized files stay clean.
 fn format_badge(ui: &mut egui::Ui, format: Option<&str>) {
     let Some(fmt) = format.map(str::trim).filter(|f| !f.is_empty()) else {
         return;
     };
     let pal = pal_of(ui);
-    badge(ui, &noema_core::inspect::pretty_format(fmt), pal.blue)
-        .on_hover_text("Recognized model weight format");
+    let id = fmt.to_ascii_lowercase();
+    badge(
+        ui,
+        &noema_core::inspect::pretty_format(fmt),
+        format_color(&pal, &id),
+    )
+    .on_hover_text("Recognized model weight format");
 }
 
 /// The recognized format tag for a model whose struct doesn't carry one, derived
@@ -7522,6 +8312,34 @@ fn reveal(path: &Path) {
     let _ = std::process::Command::new("explorer").arg(path).spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
     let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+}
+
+/// Open a URL in the user's default browser (release-notes page, etc.).
+///
+/// Only `http(s)://` URLs are opened. The release-notes URL comes from the signed
+/// update manifest, but refusing other schemes is cheap and keeps a stray `file://`
+/// or shell-metachar string from reaching the platform opener (notably Windows'
+/// `cmd /C start`).
+fn open_url(url: &str) -> std::io::Result<()> {
+    let u = url.trim();
+    if !(u.starts_with("https://") || u.starts_with("http://")) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing to open a non-http(s) URL",
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    let mut cmd = std::process::Command::new("open");
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        // FileProtocolHandler avoids the `cmd /C start` argument-parsing footguns.
+        let mut c = std::process::Command::new("rundll32");
+        c.arg("url.dll,FileProtocolHandler");
+        c
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = std::process::Command::new("xdg-open");
+    cmd.arg(u).spawn().map(|_| ())
 }
 
 /// Open the OS file browser with `file` selected (Finder/Explorer "reveal").

@@ -13,8 +13,15 @@ pub struct StudioSettings {
     pub download_connections: u32,
     /// Worldwide P2P tracker base URL.
     pub tracker_url: String,
-    /// Auto-share openly-licensed downloads to peers (ON by default, like
-    /// desktop — starts the worldwide seeder at launch).
+    /// Master switch for the Iroh transport. On by default. When off, Iroh is used
+    /// for neither downloading nor seeding (the worldwide seeder won't start and the
+    /// fetch route is disabled).
+    pub iroh_enabled: bool,
+    /// Download sub-switch for Iroh. On by default. When off (master still on), Iroh
+    /// is not used as a *download* route, but you can still seed over it.
+    pub iroh_download: bool,
+    /// Seed/share openly-licensed downloads worldwide over Iroh (ON by default, like
+    /// desktop — starts the worldwide seeder at launch). This is Iroh's seed sub-switch.
     pub share_worldwide: bool,
     /// Also auto-share gated/licensed public models (off by default).
     pub share_gated: bool,
@@ -36,6 +43,9 @@ pub struct StudioSettings {
     pub seen_intro: bool,
     /// Master switch for the BitTorrent transport (download + seed). On by default.
     pub bt_enabled: bool,
+    /// Download sub-switch for BitTorrent. On by default. When off (master still on),
+    /// BitTorrent is not used as a *download* route, but seeding can continue.
+    pub bt_download: bool,
     /// Add the public, well-known BitTorrent trackers (in addition to the DHT) so
     /// transfers find more peers. PRIVACY: this announces your IP and the model's
     /// info-hash to third-party trackers. On by default, matching the engine.
@@ -58,6 +68,37 @@ pub struct StudioSettings {
     /// Applied live via `set_download_preference`; the initial value is also fed
     /// into `EngineConfig` at launch.
     pub download_preference: u8,
+    /// Fetch BitTorrent pieces sequentially (front-to-back) rather than rarest-first.
+    /// Off by default; applies live via `set_bittorrent_sequential` + at launch.
+    #[serde(default)]
+    pub bt_sequential: bool,
+    /// Bandwidth schedule ("alternative speed limits"): when enabled, the alternative
+    /// caps below apply inside the daily window on matching weekdays.
+    #[serde(default)]
+    pub bt_schedule_enabled: bool,
+    /// Window start/end as minutes since local midnight (`0..=1439`).
+    #[serde(default)]
+    pub bt_schedule_from_min: u16,
+    #[serde(default)]
+    pub bt_schedule_to_min: u16,
+    /// Weekday bitmask: bit 0 = Mon … bit 6 = Sun. `0` = every day.
+    #[serde(default)]
+    pub bt_schedule_days: u8,
+    /// Alternative caps used inside the window (Mbps, `0` = unlimited).
+    #[serde(default)]
+    pub bt_alt_up_cap_mbps: u32,
+    #[serde(default)]
+    pub bt_alt_down_cap_mbps: u32,
+    #[serde(default)]
+    pub alt_download_cap_mbps: u32,
+    /// Check for app updates on launch and offer one-click install. On by default;
+    /// the check is anonymous. Mirrors the egui app's `auto_update`.
+    #[serde(default = "default_true")]
+    pub auto_update: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// `~/Noema Models` (or the platform home equivalent) — identical to the egui
@@ -83,6 +124,8 @@ impl Default for StudioSettings {
             download_cap_mbps: 0,
             download_connections: 4,
             tracker_url: noema_core::DEFAULT_TRACKER.to_string(),
+            iroh_enabled: true,
+            iroh_download: true,
             share_worldwide: true,
             share_gated: false,
             allow_hf_download: true,
@@ -95,6 +138,7 @@ impl Default for StudioSettings {
             device_name: String::new(),
             seen_intro: false,
             bt_enabled: true,
+            bt_download: true,
             bt_use_public_trackers: true,
             bt_seed: true,
             bt_port: 6881,
@@ -103,6 +147,15 @@ impl Default for StudioSettings {
             bt_max_concurrent: 3,
             bt_max_ratio: 0.0,
             download_preference: 0,
+            bt_sequential: false,
+            bt_schedule_enabled: false,
+            bt_schedule_from_min: 0,
+            bt_schedule_to_min: 0,
+            bt_schedule_days: 0,
+            bt_alt_up_cap_mbps: 0,
+            bt_alt_down_cap_mbps: 0,
+            alt_download_cap_mbps: 0,
+            auto_update: true,
         }
     }
 }
@@ -139,6 +192,23 @@ impl StudioSettings {
     /// BitTorrent download cap in bytes/sec; `0` = unlimited.
     pub fn bt_down_bps(&self) -> u64 {
         (self.bt_down_cap_mbps as u64) * 125_000
+    }
+
+    /// Build the time-of-day bandwidth schedule from the normal (existing) caps and
+    /// the alternative-cap fields.
+    pub fn bandwidth_schedule(&self) -> noema_core::BandwidthSchedule {
+        noema_core::BandwidthSchedule {
+            enabled: self.bt_schedule_enabled,
+            from_min: self.bt_schedule_from_min,
+            to_min: self.bt_schedule_to_min,
+            days: self.bt_schedule_days,
+            bt_up_bps: self.bt_up_bps(),
+            bt_down_bps: self.bt_down_bps(),
+            http_down_bps: self.cap_bps(),
+            alt_bt_up_bps: (self.bt_alt_up_cap_mbps as u64) * 125_000,
+            alt_bt_down_bps: (self.bt_alt_down_cap_mbps as u64) * 125_000,
+            alt_http_down_bps: (self.alt_download_cap_mbps as u64) * 125_000,
+        }
     }
 
     /// Inbound listen-port range derived from the preferred port (`[port, port+10)`).

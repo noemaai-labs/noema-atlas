@@ -349,6 +349,39 @@ select:focus {
   border-color: var(--warn);
   color: var(--warn);
 }
+/* Model-format chip (GGUF, Safetensors, MLX, …). Each format gets a per-id --fmt
+   accent (the `.f-<id>` rules below); it colors both the border and the label.
+   Light/dark variants are chosen to clear WCAG AA on each theme's card surface.
+   An unmapped format leaves --fmt unset and falls back to the neutral pill. */
+.pill.fmt {
+  border-color: var(--fmt, var(--border-2));
+  color: var(--fmt, var(--text-2));
+}
+.pill.f-gguf, .pill.f-ggml { --fmt: #1d4ed8; }
+.pill.f-safetensors { --fmt: #0f766e; }
+.pill.f-mlx { --fmt: #6d28d9; }
+.pill.f-onnx { --fmt: #b45309; }
+.pill.f-pytorch { --fmt: #c2410c; }
+.pill.f-coreml { --fmt: #475569; }
+.pill.f-tflite { --fmt: #a16207; }
+.pill.f-keras { --fmt: #b91c1c; }
+.pill.f-flax { --fmt: #0e7490; }
+.pill.f-paddle { --fmt: #1e40af; }
+.pill.f-tensorrt { --fmt: #4d7c0f; }
+.pill.f-numpy { --fmt: #4338ca; }
+:root[data-theme="dark"] .pill.f-gguf,
+:root[data-theme="dark"] .pill.f-ggml { --fmt: #60a5fa; }
+:root[data-theme="dark"] .pill.f-safetensors { --fmt: #2dd4bf; }
+:root[data-theme="dark"] .pill.f-mlx { --fmt: #a78bfa; }
+:root[data-theme="dark"] .pill.f-onnx { --fmt: #fbbf24; }
+:root[data-theme="dark"] .pill.f-pytorch { --fmt: #fb923c; }
+:root[data-theme="dark"] .pill.f-coreml { --fmt: #94a3b8; }
+:root[data-theme="dark"] .pill.f-tflite { --fmt: #facc15; }
+:root[data-theme="dark"] .pill.f-keras { --fmt: #f87171; }
+:root[data-theme="dark"] .pill.f-flax { --fmt: #22d3ee; }
+:root[data-theme="dark"] .pill.f-paddle { --fmt: #38bdf8; }
+:root[data-theme="dark"] .pill.f-tensorrt { --fmt: #84cc16; }
+:root[data-theme="dark"] .pill.f-numpy { --fmt: #a5b4fc; }
 .pills {
   display: flex;
   flex-wrap: wrap;
@@ -421,6 +454,9 @@ select:focus {
   transform: translateX(20px);
   background: #ffffff;
 }
+.switch input:disabled + span {
+  cursor: not-allowed;
+}
 .row {
   display: flex;
   align-items: center;
@@ -428,6 +464,22 @@ select:focus {
   gap: 16px;
   padding: 12px 0;
   border-bottom: 1px solid var(--border);
+}
+/* Sub-switches that belong to the protocol master above them (Use Iroh / Use
+   BitTorrent). The left rail makes the download/seed options read as children of
+   the master rather than as competing top-level settings. */
+.subgroup {
+  margin-left: 8px;
+  padding-left: 14px;
+  border-left: 2px solid var(--border-2);
+}
+.subgroup .row:last-child {
+  border-bottom: none;
+}
+/* A sub-switch row whose protocol master is off reads as inactive (label,
+   description, and toggle together), reinforcing that it depends on the master. */
+.subgroup .row:has(input:disabled) {
+  opacity: 0.5;
 }
 .field {
   margin: 16px 0;
@@ -486,6 +538,30 @@ select:focus {
 }
 .card-actions .spacer {
   flex: 1;
+}
+/* Per-model seed-ratio override, inline in the Library card actions. */
+.card-actions .ratio {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+}
+.card-actions .ratio input {
+  width: 64px;
+  height: 30px;
+  padding: 0 6px;
+  font-size: 11px;
+}
+/* Queue position pill + weekday toggles. */
+.qpos {
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+.days {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0;
 }
 .btn.sm {
   height: 30px;
@@ -758,4 +834,18 @@ textarea:focus {
   text-transform: uppercase;
   letter-spacing: 0.05em;
   color: var(--accent);
+}
+
+/* Auto-update banner shown at the top of the main column. */
+.update-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+  padding: 8px 12px;
+  border: 1px solid var(--warn);
+  background: var(--warn-bg);
+  border-radius: 8px;
+  font-size: 13px;
 }

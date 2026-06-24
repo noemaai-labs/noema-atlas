@@ -6,10 +6,10 @@ members = [
     "crates/registry",
     "crates/desktop",
 ]
-exclude = ["crates/studio"]
+exclude = ["crates/studio", "vendor/librqbit"]
 
 [workspace.package]
-version = "0.1.0"
+version = "2.0.0-alpha.2"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -30,6 +30,7 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 hex = "0.4"
 base64 = "0.22"
+semver = "1"
 
 rusqlite = { version = "0.32", features = ["bundled"] }
 
@@ -50,3 +51,11 @@ time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 reflink-copy = "0.1"
 
 tempfile = "3"
+
+# Vendored, locally-patched librqbit. The upstream 9.0.0-rc.0 public API does not
+# expose two things Atlas needs: a sequential (in-order piece) download mode, and
+# the remote peer's peer_id (for the peer-list "client" column). The patch in
+# vendor/librqbit adds both, surgically. Keep version == upstream so the `=9.0.0-rc.0`
+# requirement in crates/core still resolves; re-apply on any librqbit upgrade.
+[patch.crates-io]
+librqbit = { path = "vendor/librqbit" }
