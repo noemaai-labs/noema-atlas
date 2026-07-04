@@ -61,7 +61,8 @@ CREATE TABLE IF NOT EXISTS cache_blobs (
     sha256        TEXT NOT NULL,
     size_bytes    INTEGER NOT NULL,
     state         TEXT NOT NULL,
-    committed_at  TEXT NOT NULL
+    committed_at  TEXT NOT NULL,
+    git_blob_sha1 TEXT
 );
 
 CREATE TABLE IF NOT EXISTS install_views (
@@ -93,6 +94,7 @@ CREATE TABLE IF NOT EXISTS source_health (
     integrity_failures INTEGER NOT NULL DEFAULT 0,
     last_latency_ms    INTEGER,
     banned             INTEGER NOT NULL DEFAULT 0,
+    banned_at          TEXT,
     updated_at         TEXT NOT NULL
 );
 
@@ -162,6 +164,19 @@ fn migrate(conn: &Connection) {
         "ALTER TABLE share_overrides ADD COLUMN confirmed_gated INTEGER NOT NULL DEFAULT 0",
         [],
     );
+    // Cooldown timestamp for integrity bans. Older DBs banned permanently; backfill
+    // any existing ban with `now` so it, too, ages out of the cooldown instead of
+    // stranding the source (often the innocent one that merely *finished* a file over
+    // a corrupt inherited partial) forever.
+    let _ = conn.execute("ALTER TABLE source_health ADD COLUMN banned_at TEXT", []);
+    let _ = conn.execute(
+        "UPDATE source_health SET banned_at = ?1 WHERE banned = 1 AND banned_at IS NULL",
+        params![crate::util::now_rfc3339()],
+    );
+    // Git blob OID → blake3 mapping. Bundle sidecars (config/tokenizer) are
+    // declared git-blob-sha1-only in HF manifests, so this is the only key
+    // install / cache-hit can resolve their committed blobs by.
+    let _ = conn.execute("ALTER TABLE cache_blobs ADD COLUMN git_blob_sha1 TEXT", []);
 }
 
 pub struct Db {
@@ -237,6 +252,10 @@ pub struct SourceHealth {
     pub integrity_failures: i64,
     pub last_latency_ms: Option<i64>,
     pub banned: bool,
+    /// RFC3339 timestamp of the most recent integrity ban (`None` if never banned).
+    /// The planner treats a ban as active only within a cooldown window from this;
+    /// after it, the source is retried (and re-banned if it fails integrity again).
+    pub banned_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -783,6 +802,29 @@ impl Db {
         Ok(v)
     }
 
+    /// Record the git blob OID a blob was verified against (git-sha1-only bundle
+    /// sidecars carry no other digest to find them by later).
+    pub fn set_cache_blob_git_sha1(&self, blake3: &str, git_blob_sha1: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE cache_blobs SET git_blob_sha1 = ?2 WHERE blake3 = ?1",
+            params![blake3, git_blob_sha1],
+        )?;
+        Ok(())
+    }
+
+    pub fn blake3_for_git_sha1(&self, git_blob_sha1: &str) -> Result<Option<String>> {
+        let conn = self.lock();
+        let v: Option<String> = conn
+            .query_row(
+                "SELECT blake3 FROM cache_blobs WHERE git_blob_sha1 = ?1 LIMIT 1",
+                params![git_blob_sha1],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(v)
+    }
+
     /// Whether any cached blob has this sha256 (LAN seeder check by HF oid).
     pub fn has_blob_with_sha256(&self, sha256: &str) -> Result<bool> {
         Ok(self.blake3_for_sha256(sha256)?.is_some())
@@ -934,6 +976,31 @@ impl Db {
         Ok(())
     }
 
+    pub fn get_download(&self, download_id: &str) -> Result<Option<DownloadRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT download_id, manifest_id, artifact_path, state, bytes_total, bytes_done, source_id, started_at, updated_at
+             FROM downloads WHERE download_id = ?1",
+        )?;
+        let row = stmt
+            .query_map(params![download_id], |row| {
+                Ok(DownloadRow {
+                    download_id: row.get(0)?,
+                    manifest_id: row.get(1)?,
+                    artifact_path: row.get(2)?,
+                    state: row.get(3)?,
+                    bytes_total: row.get::<_, i64>(4)? as u64,
+                    bytes_done: row.get::<_, i64>(5)? as u64,
+                    source_id: row.get(6)?,
+                    started_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                })
+            })?
+            .next()
+            .transpose()?;
+        Ok(row)
+    }
+
     pub fn list_downloads(&self) -> Result<Vec<DownloadRow>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
@@ -960,7 +1027,7 @@ impl Db {
         let conn = self.lock();
         let h = conn
             .query_row(
-                "SELECT source_id, success_count, failure_count, integrity_failures, last_latency_ms, banned
+                "SELECT source_id, success_count, failure_count, integrity_failures, last_latency_ms, banned, banned_at
                  FROM source_health WHERE source_id = ?1",
                 params![source_id],
                 |row| {
@@ -971,6 +1038,7 @@ impl Db {
                         integrity_failures: row.get(3)?,
                         last_latency_ms: row.get(4)?,
                         banned: row.get::<_, i64>(5)? != 0,
+                        banned_at: row.get(6)?,
                     })
                 },
             )
@@ -989,24 +1057,39 @@ impl Db {
         latency_ms: Option<i64>,
     ) -> Result<()> {
         let conn = self.lock();
+        let now = crate::util::now_rfc3339();
+        let succ = success as i64;
+        let fail = (!success) as i64;
+        let integ = integrity_failure as i64;
+        // For a fresh row: an integrity failure bans it (stamping `banned_at`); a plain
+        // success/failure does not. For an existing row: a SUCCESS clears any ban (the
+        // source has proven itself), an integrity failure (re-)stamps the ban time, and
+        // an ordinary failure leaves the ban window untouched. The ban is thus a
+        // cooldown, not a life sentence — the planner retries after it elapses.
+        let ban_insert = if success { 0 } else { integ };
+        let ban_at_insert: Option<&str> = (!success && integrity_failure).then_some(now.as_str());
         conn.execute(
-            "INSERT INTO source_health (source_id, success_count, failure_count, integrity_failures, last_latency_ms, banned, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO source_health (source_id, success_count, failure_count, integrity_failures, last_latency_ms, banned, banned_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(source_id) DO UPDATE SET
                success_count = success_count + ?2,
                failure_count = failure_count + ?3,
                integrity_failures = integrity_failures + ?4,
                last_latency_ms = COALESCE(?5, last_latency_ms),
-               banned = banned | ?6,
-               updated_at = ?7",
+               banned = CASE WHEN ?9 = 1 THEN 0 ELSE banned | ?10 END,
+               banned_at = CASE WHEN ?9 = 1 THEN NULL WHEN ?10 = 1 THEN ?8 ELSE banned_at END,
+               updated_at = ?8",
             params![
                 source_id,
-                success as i64,
-                (!success) as i64,
-                integrity_failure as i64,
+                succ,
+                fail,
+                integ,
                 latency_ms,
-                integrity_failure as i64, // an integrity failure bans the source
-                crate::util::now_rfc3339(),
+                ban_insert,
+                ban_at_insert,
+                now,
+                succ,
+                integ,
             ],
         )?;
         Ok(())
@@ -1015,7 +1098,7 @@ impl Db {
     pub fn list_source_health(&self) -> Result<Vec<SourceHealth>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT source_id, success_count, failure_count, integrity_failures, last_latency_ms, banned
+            "SELECT source_id, success_count, failure_count, integrity_failures, last_latency_ms, banned, banned_at
              FROM source_health ORDER BY updated_at DESC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -1026,6 +1109,7 @@ impl Db {
                 integrity_failures: row.get(3)?,
                 last_latency_ms: row.get(4)?,
                 banned: row.get::<_, i64>(5)? != 0,
+                banned_at: row.get(6)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -1119,6 +1203,31 @@ mod tests {
         assert!(!h2.banned);
         assert_eq!(h2.success_count, 1);
         assert_eq!(h2.last_latency_ms, Some(42));
+    }
+
+    #[test]
+    fn integrity_ban_stamps_time_and_clears_on_success() {
+        let db = Db::open_in_memory().unwrap();
+        db.record_source_result("s", false, true, None).unwrap();
+        let h = db.get_source_health("s").unwrap();
+        assert!(h.banned);
+        assert!(
+            h.banned_at.is_some(),
+            "a ban should stamp banned_at for the cooldown"
+        );
+
+        // A later success proves the source good again: ban + timestamp cleared, so
+        // the planner stops excluding it (no permanent, unrecoverable ban).
+        db.record_source_result("s", true, false, None).unwrap();
+        let h = db.get_source_health("s").unwrap();
+        assert!(!h.banned);
+        assert!(h.banned_at.is_none());
+
+        // An ordinary (non-integrity) failure must NOT re-arm or extend a ban.
+        db.record_source_result("s", false, false, None).unwrap();
+        let h = db.get_source_health("s").unwrap();
+        assert!(!h.banned);
+        assert!(h.banned_at.is_none());
     }
 
     #[test]
@@ -1349,5 +1458,26 @@ mod tests {
         assert_eq!(db.list_cache_blobs().unwrap().len(), 1);
         db.delete_cache_blob(&meta.blake3).unwrap();
         assert!(!db.has_cache_blob(&meta.blake3).unwrap());
+    }
+
+    /// Bundle sidecars are findable only by their git blob OID — the mapping
+    /// recorded at finalize must resolve back to the committed blake3.
+    #[test]
+    fn git_blob_sha1_maps_to_blake3() {
+        let db = Db::open_in_memory().unwrap();
+        let meta = BlobMeta {
+            blake3: "cc".repeat(32),
+            sha256: String::new(),
+            size_bytes: 5,
+            committed_at: crate::util::now_rfc3339(),
+        };
+        db.upsert_cache_blob(&meta, "ready").unwrap();
+        let git = "dd".repeat(20);
+        assert_eq!(db.blake3_for_git_sha1(&git).unwrap(), None);
+        db.set_cache_blob_git_sha1(&meta.blake3, &git).unwrap();
+        assert_eq!(
+            db.blake3_for_git_sha1(&git).unwrap().as_deref(),
+            Some(meta.blake3.as_str())
+        );
     }
 }

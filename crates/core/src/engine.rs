@@ -24,6 +24,13 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 /// the extra connections; smaller files stream single-connection.
 const SEGMENT_MIN_BYTES: u64 = 32 * 1024 * 1024; // 32 MiB
 
+/// Headroom to leave free on the target filesystem when downloading a file whose
+/// size was not declared up front (a bare Content-ID add, where `total == 0`). The
+/// write is bounded to `(free space − this)`, so a hostile unknown-size source
+/// can't consume the last of the disk — while a genuinely large file that fits
+/// still downloads (no fixed byte ceiling to outgrow). ENOSPC is the hard backstop.
+const UNKNOWN_SIZE_DISK_MARGIN: u64 = 1 << 30; // keep 1 GiB free
+
 /// Whether a source class is range-capable for segmented downloads.
 fn http_range_class(class: SourceClass) -> bool {
     matches!(class, SourceClass::Huggingface | SourceClass::HttpsMirror)
@@ -1071,10 +1078,11 @@ impl Engine {
         self.download_queue.reorder(id, mv);
     }
 
-    /// Install the time-of-day bandwidth schedule, apply its caps for the current
-    /// instant immediately, and start the per-minute ticker (idempotent). Disabling it
-    /// (`enabled = false`) leaves the last-applied caps in place — callers that want to
-    /// restore manual caps should set them explicitly.
+    /// Install the time-of-day bandwidth schedule, apply the caps in effect now, and
+    /// start the ticker (idempotent). Disabling it (`enabled = false`) immediately
+    /// restores the normal (manual) caps via [`apply_schedule_now`](Self::apply_schedule_now)
+    /// — `caps_now()` yields them whenever the schedule is inactive — so the alternative
+    /// window caps are never left stranded until the next restart.
     pub fn set_bandwidth_schedule(&self, schedule: BandwidthSchedule) {
         *self.schedule.lock().unwrap() = schedule;
         self.apply_schedule_now();
@@ -1086,13 +1094,13 @@ impl Engine {
         *self.schedule.lock().unwrap()
     }
 
-    /// Apply the schedule's caps for the current clock immediately (best-effort; the BT
-    /// half is a no-op until the session is up). No-op when the schedule is disabled.
+    /// Apply the caps in effect for the current clock immediately (best-effort; the BT
+    /// half is a no-op until the session is up). NOT gated on `enabled`: when the
+    /// schedule is disabled, `caps_now()` returns the normal (manual) caps, so calling
+    /// this the moment the user turns the schedule off restores them right away instead
+    /// of leaving the last-applied window/alternative caps stuck until a restart.
     fn apply_schedule_now(&self) {
         let sched = *self.schedule.lock().unwrap();
-        if !sched.enabled {
-            return;
-        }
         let (bt_up, bt_down, http) = sched.caps_now();
         (self.bt_rate_applier)(bt_up, bt_down);
         self.rate_limit().set_bps(http);
@@ -1221,6 +1229,19 @@ impl Engine {
                 let download_id = artifact_download_id(&manifest.manifest_id, &art.path);
                 self.cas.remove_download_temps(&download_id);
                 self.db.delete_download(&download_id)?;
+                // The Iroh fetch keeps its (multi-GB) partial outside the CAS —
+                // a striped scratch file plus its resume journal. Removing the
+                // transfer must drop those too or they leak with nothing left
+                // pointing at them.
+                #[cfg(feature = "iroh")]
+                if art.hashes.has_blake3() {
+                    let tmp = crate::iroh_node::scratch_path(
+                        &self.cfg.transport.iroh_store_dir,
+                        &art.hashes.blake3,
+                    );
+                    let _ = std::fs::remove_file(crate::iroh_node::stripe_journal_path(&tmp));
+                    let _ = std::fs::remove_file(&tmp);
+                }
             }
         }
         self.transfers.remove(id);
@@ -1417,10 +1438,8 @@ impl Engine {
         if !resp.status().is_success() {
             return Err(Error::other(format!("registry returned {}", resp.status())));
         }
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| Error::other(format!("registry response: {e}")))?;
+        // The registry is untrusted: bound the response body (8 MiB).
+        let bytes = crate::util::read_body_capped(resp, 8 * 1024 * 1024).await?;
         serde_json::from_slice::<Vec<Manifest>>(&bytes).map_err(Error::from)
     }
 
@@ -1604,12 +1623,42 @@ impl Engine {
         // slot-starved transfer shows as "queued" in the UI rather than a stuck
         // Paused/0B card. Flips to Connecting once a slot frees.
         ctl.set_state(TransferState::Queued);
-        let _permit = self.download_queue.acquire(ctl.id.clone()).await?;
-        ctl.set_state(TransferState::Connecting);
-        let manifest_id = ctl.manifest_id.clone();
-        let result = crate::transfer::CURRENT_TRANSFER
-            .scope(ctl.clone(), self.download_inner(&manifest_id, progress))
-            .await;
+        // Wait for a slot while staying responsive to Pause/Stop: a queued
+        // transfer used to be un-interruptible — the flags were only noticed once
+        // a slot freed and the download body actually ran, so a Stop on a queued
+        // card could sit "stopping…" for as long as the downloads ahead of it
+        // took. Dropping the acquire future dequeues cleanly (see DequeueGuard).
+        let acquire = self.download_queue.acquire(ctl.id.clone());
+        tokio::pin!(acquire);
+        let interrupted = {
+            let ctl = ctl.clone();
+            async move {
+                loop {
+                    if ctl.is_cancelled() {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                }
+            }
+        };
+        let permit = tokio::select! {
+            p = &mut acquire => Some(p?),
+            _ = interrupted => None,
+        };
+        let result = match permit {
+            Some(_permit) => {
+                ctl.set_state(TransferState::Connecting);
+                let manifest_id = ctl.manifest_id.clone();
+                crate::transfer::CURRENT_TRANSFER
+                    .scope(ctl.clone(), self.download_inner(&manifest_id, progress))
+                    .await
+            }
+            None => Err(if ctl.discard_requested() {
+                Error::Stopped
+            } else {
+                Error::Cancelled
+            }),
+        };
         match &result {
             Ok(_) => ctl.set_state(TransferState::Complete),
             Err(Error::Cancelled) => ctl.set_state(TransferState::Paused),
@@ -1619,13 +1668,14 @@ impl Engine {
             }
             Err(_) => ctl.set_state(TransferState::Failed),
         }
-        // If a Stop/discard was latched (e.g. `discard_transfer` on a live transfer)
-        // but the task ended via Complete/Paused/Failed rather than the Stopped path,
-        // honor it now so the partial/row/slot don't leak. Drop the exec guard first
-        // so discard_transfer takes its non-executing cleanup branch.
+        // If a Stop/discard was latched (e.g. `discard_transfer` on a live transfer,
+        // or a Stop while queued), make sure the partial/row/slot don't leak. Drop
+        // the exec guard first so discard_transfer takes its non-executing cleanup
+        // branch; the live-stop path already cleaned up via finish_cancelled, for
+        // which this is an idempotent no-op.
         let discard = ctl.discard_requested();
         drop(_exec);
-        if discard && !matches!(result, Err(Error::Stopped)) {
+        if discard {
             let _ = self.discard_transfer(&ctl.id);
         }
         result
@@ -1672,6 +1722,11 @@ impl Engine {
                 Some(artifact.hashes.blake3.clone())
             } else if artifact.hashes.has_sha256() {
                 self.db.blake3_for_sha256(&artifact.hashes.sha256)?
+            } else if artifact.hashes.has_git_blob_sha1() {
+                // Bundle sidecars: git OID is their only declared digest — without
+                // this they re-download on every retry despite being cached.
+                self.db
+                    .blake3_for_git_sha1(&artifact.hashes.git_blob_sha1)?
             } else {
                 None
             };
@@ -1743,7 +1798,12 @@ impl Engine {
                 )
                 .await;
                 if let Ok(Ok(set)) = lookup {
-                    if !set.nodes.is_empty() && set.blake3.len() == 64 {
+                    // Require a real 64-hex blake3 from the (untrusted) tracker — a
+                    // 64-byte-but-non-hex value would later be byte-sliced.
+                    if !set.nodes.is_empty()
+                        && set.blake3.len() == 64
+                        && set.blake3.bytes().all(|b| b.is_ascii_hexdigit())
+                    {
                         tracing::info!(
                             peers = set.nodes.len(),
                             "tracker found worldwide P2P providers"
@@ -1842,17 +1902,35 @@ impl Engine {
         };
         let temp = self.cas.new_temp_path(&download_id, &short(art_key));
         let mut last_err: Option<Error> = None;
+        // Who wrote the surviving partial. A `.part` left by a previous run (pause,
+        // crash, retry) belongs to the source recorded on the downloads row — resuming
+        // it under a different source would blame THAT source for any corruption the
+        // original writer left behind (full-file hashes only fail at finish). Unknown
+        // writer → start clean.
         let mut partial_owner: Option<String> = None;
+        if chunk_tree.is_none() && tokio::fs::metadata(&temp).await.is_ok() {
+            partial_owner = self
+                .db
+                .get_download(&download_id)
+                .ok()
+                .flatten()
+                .and_then(|d| d.source_id);
+            if partial_owner.is_none() {
+                truncate_to(&temp, 0).await?;
+            }
+        }
         for scored in &plan.eligible {
             if self.is_cancelled() {
                 return Err(self.finish_cancelled(&download_id, &temp).await);
             }
             let source = &scored.source;
             let sid = source.source_id();
+            // Re-check bans mid-loop (another transfer may have banned this source
+            // after planning) — but honor the cooldown, or bans become permanent.
             if self
                 .db
                 .get_source_health(&sid)
-                .map(|h| h.banned)
+                .map(|h| crate::planner::ban_active(&h))
                 .unwrap_or(false)
             {
                 continue;
@@ -1921,6 +1999,49 @@ impl Engine {
         }
         self.db.set_download_state(&download_id, "failed")?;
         Err(last_err.unwrap_or_else(|| Error::NoEligibleSource(artifact.path.clone())))
+    }
+
+    /// Provider re-query hook for an Iroh fetch: re-asks the tracker for this
+    /// artifact's current providers, so the striped multi-peer fetch can add
+    /// peers that come online mid-transfer (and re-admit ones it dropped). The
+    /// swarm grows as the download goes instead of being fixed at resolve time.
+    #[cfg(feature = "http")]
+    fn peer_refresh_for(
+        &self,
+        artifact: &Artifact,
+        source: &Source,
+    ) -> Option<crate::transport::PeerRefresh> {
+        if !matches!(source.class(), crate::manifest::SourceClass::Iroh) {
+            return None;
+        }
+        let tracker = self.cfg.tracker_url.clone()?;
+        let key = if artifact.hashes.has_sha256() {
+            artifact.hashes.sha256.clone()
+        } else {
+            artifact.hashes.blake3.clone()
+        };
+        if key.is_empty() {
+            return None;
+        }
+        let proxy = self.proxy().map(str::to_string);
+        let self_id = self.self_node_id();
+        Some(crate::transport::PeerRefresh(Arc::new(move || {
+            let tracker = tracker.clone();
+            let key = key.clone();
+            let proxy = proxy.clone();
+            let self_id = self_id.clone();
+            Box::pin(async move {
+                match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    crate::tracker::providers(&tracker, proxy.as_deref(), &key, self_id.as_deref()),
+                )
+                .await
+                {
+                    Ok(Ok(set)) => set.nodes,
+                    _ => Vec::new(),
+                }
+            })
+        })))
     }
 
     /// Attempt to fetch an artifact from a single source, with transient retry
@@ -1995,6 +2116,10 @@ impl Engine {
                 });
             }))
         });
+        #[cfg(feature = "http")]
+        let peer_refresh = self.peer_refresh_for(artifact, source);
+        #[cfg(not(feature = "http"))]
+        let peer_refresh = None;
         let mut ctx = FetchCtx {
             timeout: Some(self.cfg.transport.request_timeout),
             token: None,
@@ -2006,6 +2131,7 @@ impl Engine {
             discard_partial: crate::transfer::current().map(|c| c.discard_partial.clone()),
             on_bytes,
             on_stats,
+            peer_refresh,
         };
         if let AuthRequirement::Token { service } = adapter.auth_requirements(source) {
             let token = secret::resolve_token(self.secret.as_ref(), &service, "default")?;
@@ -2243,6 +2369,19 @@ impl Engine {
             .map_err(|e| Error::fs(temp, e))?;
 
         let mut bytes_done = effective_start;
+        // When the size is unknown (total == 0) the declared-size guard below can't
+        // apply, so bound the write to what the disk can actually hold: free space
+        // (after the existing partial) minus a safety margin, expressed as an
+        // absolute ceiling on `bytes_done`. This never rejects a file that fits, and
+        // stops a hostile source before it exhausts the disk. If the free-space query
+        // fails, fall back to no byte ceiling and rely on ENOSPC as the backstop.
+        let unknown_size_ceiling: Option<u64> = (total == 0).then(|| {
+            let avail = temp
+                .parent()
+                .and_then(|d| fs4::available_space(d).ok())
+                .unwrap_or(u64::MAX);
+            bytes_done.saturating_add(avail.saturating_sub(UNKNOWN_SIZE_DISK_MARGIN))
+        });
         let mut stream = opened.stream;
         let mut last_emit = 0u64;
         let mut win_start = Instant::now();
@@ -2276,6 +2415,17 @@ impl Engine {
                         "source sent more bytes than declared size".into(),
                     ),
                 ));
+            }
+            // Unknown-size guard: stop before a hostile source exhausts the disk.
+            if let Some(ceiling) = unknown_size_ceiling {
+                if bytes_done.saturating_add(chunk.len() as u64) > ceiling {
+                    return Err(Error::transport(
+                        source.source_id(),
+                        TransportErrorKind::Integrity(
+                            "unknown-size source would exhaust free disk space".into(),
+                        ),
+                    ));
+                }
             }
             verifier.feed(&chunk)?; // per-leaf integrity (when chunk tree present)
             file.write_all(&chunk)
@@ -2879,6 +3029,13 @@ impl Engine {
     /// offloaded to a blocking thread.
     async fn finalize_blob(&self, artifact: &Artifact, meta: &BlobMeta) -> Result<()> {
         self.db.upsert_cache_blob(meta, "ready")?;
+        // Bundle sidecars are declared git-blob-sha1-only (no blake3/sha256 in the
+        // manifest), so persist the OID→blake3 mapping the verifier just proved —
+        // it's the only key install and cache-hit can resolve these blobs by.
+        if artifact.hashes.has_git_blob_sha1() {
+            self.db
+                .set_cache_blob_git_sha1(&meta.blake3, &artifact.hashes.git_blob_sha1)?;
+        }
         // The blob is already committed; the chunk-tree pass re-reads the whole
         // (multi-GB) file, so a Stop/Pause skips it instead of waiting it out.
         if self.is_cancelled() {
@@ -3213,17 +3370,32 @@ impl Engine {
     /// Prune the index so it reflects what's actually on disk: drop cache blobs
     /// whose files are gone and install views whose destinations were deleted
     /// Downloads a restart can pick up where it left off: non-complete rows whose
-    /// `.part` temp **and** manifest both still exist (so resume can re-read the
-    /// partial and re-validate it against the signed hashes). Returns
+    /// manifest still exists and that either left a `.part` temp or were
+    /// interrupted (`paused`, or `running` from a crashed session — the P2P
+    /// transports hold their partials outside the CAS: striped scratch+journal,
+    /// iroh blob store, librqbit fastresume, so the temp check alone would hide
+    /// every interrupted Iroh/BitTorrent transfer). Returns
     /// `(manifest_id, artifact_path, bytes_done, bytes_total)` per row, newest
     /// first. A UI calls this on launch to re-offer interrupted downloads.
     pub fn resumable_downloads(&self) -> Result<Vec<(String, String, u64, u64)>> {
+        // Ids with a live in-process transfer are already on screen — never
+        // re-offer those. (Launch-time callers have no live transfers yet; this
+        // only matters for a mid-session call.)
+        let live: std::collections::HashSet<String> = self
+            .transfers
+            .all()
+            .into_iter()
+            .filter(|c| c.is_executing())
+            .map(|c| c.manifest_id.clone())
+            .collect();
         let mut out = Vec::new();
         for d in self.db.list_downloads()? {
-            if d.state == "complete" {
+            if d.state == "complete" || live.contains(&d.manifest_id) {
                 continue;
             }
-            let resumable = self.cas.download_temp_exists(&d.download_id)
+            let resumable = (self.cas.download_temp_exists(&d.download_id)
+                || d.state == "paused"
+                || d.state == "running")
                 && self.db.get_manifest(&d.manifest_id)?.is_some();
             if resumable {
                 out.push((d.manifest_id, d.artifact_path, d.bytes_done, d.bytes_total));
@@ -3269,9 +3441,18 @@ impl Engine {
             if d.state == "complete" || live.contains(&d.manifest_id) {
                 continue;
             }
-            let resumable = self.cas.download_temp_exists(&d.download_id)
-                && self.db.get_manifest(&d.manifest_id)?.is_some();
-            if !resumable {
+            // Paused (or crashed-while-`running`) rows stay resumable even with no
+            // `.part`: Iroh and BitTorrent keep their partials outside the CAS
+            // (striped scratch+journal, iroh blob store, librqbit fastresume), so
+            // the temp check alone would reap every interrupted P2P transfer —
+            // deleting the row the UIs rebuild resume cards from and orphaning the
+            // transport-side partial. Only `failed` rows with nothing on disk (or
+            // any row whose manifest is gone) are dead weight.
+            let keep = self.db.get_manifest(&d.manifest_id)?.is_some()
+                && (self.cas.download_temp_exists(&d.download_id)
+                    || d.state == "paused"
+                    || d.state == "running");
+            if !keep {
                 self.cas.remove_download_temps(&d.download_id);
                 self.db.delete_download(&d.download_id)?;
                 report.removed_downloads += 1;
@@ -3363,24 +3544,30 @@ impl Engine {
             .await;
     }
 
-    /// Live count of worldwide peers currently sharing a given content hash
+    /// Live count of worldwide *Iroh* peers currently sharing a given content hash.
     #[cfg(feature = "http")]
     pub async fn worldwide_peers(&self, hash: &str) -> usize {
+        self.worldwide_availability(hash).await.0
+    }
+
+    /// Live worldwide availability for a content hash as `(iroh_peers, bt_seeders)`,
+    /// both excluding this node, from a single tracker round-trip. "N seeding
+    /// worldwide" should mean *other* peers, so a model only you seed reads as 0, not
+    /// 1 (you). Bounded (the detail view re-samples periodically) so a slow tracker
+    /// can't stall the refresh; an unknown/failed lookup reads as `(0, 0)`.
+    #[cfg(feature = "http")]
+    pub async fn worldwide_availability(&self, hash: &str) -> (usize, usize) {
         let Some(tracker) = self.cfg.tracker_url.clone() else {
-            return 0;
+            return (0, 0);
         };
-        // Exclude ourselves: "N seeding worldwide" should mean *other* peers, so a
-        // model only you seed reads as 0, not 1 (you). Bound the lookup (the model
-        // detail view re-samples this every ~15s) so a slow tracker can't stall the
-        // peer-count refresh; an unknown count reads as 0 rather than blocking.
         let lookup = tokio::time::timeout(
             Duration::from_secs(5),
             crate::tracker::providers(&tracker, self.proxy(), hash, self.self_node_id().as_deref()),
         )
         .await;
         match lookup {
-            Ok(Ok(set)) => set.nodes.len(),
-            _ => 0,
+            Ok(Ok(set)) => (set.nodes.len(), set.bt_seeders),
+            _ => (0, 0),
         }
     }
 
@@ -3810,6 +3997,15 @@ impl Engine {
                 .flatten()
             {
                 b
+            } else if let Some(b) = art
+                .hashes
+                .has_git_blob_sha1()
+                .then(|| self.db.blake3_for_git_sha1(&art.hashes.git_blob_sha1))
+                .transpose()?
+                .flatten()
+            {
+                // Bundle sidecars: git OID is their only declared digest.
+                b
             } else {
                 return Err(Error::other(format!(
                     "artifact `{}` not in cache; download it first",
@@ -4187,7 +4383,8 @@ fn content_manifest(target: &crate::share::ShareTarget) -> Manifest {
     } else {
         &target.blake3
     };
-    let manifest_id = format!("mdl_p2p_{}", &seed[..12.min(seed.len())]);
+    // `short` slices on char boundaries; never byte-index a possibly-non-ASCII id.
+    let manifest_id = format!("mdl_p2p_{}", short(seed));
     let file_name = sanitize_local_name(&target.name);
     let display_name = {
         let t = target.display_title();

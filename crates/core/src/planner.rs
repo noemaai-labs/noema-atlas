@@ -139,13 +139,13 @@ where
         }
 
         let h = health(&source_id);
-        if h.banned {
+        if ban_active(&h) {
             excluded.push(ScoredSource {
                 source: source.clone(),
                 source_id,
                 score: 0.0,
                 eligible: false,
-                reason: "source banned after integrity failure".into(),
+                reason: "source banned after integrity failure (cooling down)".into(),
             });
             continue;
         }
@@ -177,6 +177,38 @@ where
 /// *within* a tier. (Integrity-failed sources are still sunk by their own penalty —
 /// or excluded as `banned` — independent of the preference, by design.)
 const TIER_OFFSET: f64 = 200.0;
+
+/// How long an integrity ban keeps a source out of the plan. After this window the
+/// source is retried (its integrity penalty still sinks it far down the ranking, and
+/// the full-file hash gate still guards the CAS), so a transient — or mis-attributed
+/// — corruption is not a permanent exclusion. A later success clears the ban outright
+/// (see `Db::record_source_result`).
+const BAN_COOLDOWN_HOURS: i64 = 6;
+
+/// Whether `h` is banned AND still cooling down — the one predicate every ban check
+/// must use. The engine's mid-loop re-check goes through this too: a raw `banned`
+/// test would make integrity bans permanent once the cooldown has expired.
+pub(crate) fn ban_active(h: &SourceHealth) -> bool {
+    h.banned && ban_in_cooldown(h)
+}
+
+/// Whether a banned source is still within its cooldown window (→ keep excluding it).
+/// A ban with no timestamp is treated as active/still-banned to stay conservative;
+/// real DB rows always carry one (stamped on ban, backfilled on migration), so this
+/// only affects a synthetic in-memory [`SourceHealth`].
+fn ban_in_cooldown(h: &SourceHealth) -> bool {
+    let Some(ts) = h.banned_at.as_deref() else {
+        return true;
+    };
+    match chrono::DateTime::parse_from_rfc3339(ts) {
+        Ok(at) => {
+            chrono::Utc::now().signed_duration_since(at.with_timezone(&chrono::Utc))
+                < chrono::Duration::hours(BAN_COOLDOWN_HOURS)
+        }
+        // Unparseable timestamp → fail safe: treat as still banned.
+        Err(_) => true,
+    }
+}
 
 /// Compute a source's score. The user's download `preference` is applied as a
 /// decisive class-tier offset ([`preference_tier`] × [`TIER_OFFSET`]) so the
@@ -339,6 +371,49 @@ mod tests {
         );
         assert!(plan.is_empty());
         assert_eq!(plan.excluded.len(), 1);
+    }
+
+    #[test]
+    fn expired_integrity_ban_is_retried_but_fresh_ban_excluded() {
+        let mut m = sample_manifest();
+        m.access.allowed_source_classes.clear();
+        m.artifacts[0].sources = vec![Source::HttpsMirror {
+            url: "https://m/x".into(),
+            auth: AuthPolicy::None,
+        }];
+        let engine = PolicyEngine::new(PolicyConfig::default());
+
+        // A ban stamped far in the past is out of cooldown → the source is eligible
+        // again (the integrity penalty still ranks it low, but it is no longer barred).
+        let old_ban = |_: &str| SourceHealth {
+            banned: true,
+            banned_at: Some("2000-01-01T00:00:00Z".to_string()),
+            ..Default::default()
+        };
+        let plan = plan_artifact(
+            &m,
+            &m.artifacts[0],
+            &PlatformProfile::desktop(),
+            &engine,
+            old_ban,
+        );
+        assert_eq!(plan.eligible.len(), 1, "expired ban should be retried");
+
+        // A ban stamped now is within cooldown → still excluded.
+        let now = crate::util::now_rfc3339();
+        let fresh_ban = move |_: &str| SourceHealth {
+            banned: true,
+            banned_at: Some(now.clone()),
+            ..Default::default()
+        };
+        let plan = plan_artifact(
+            &m,
+            &m.artifacts[0],
+            &PlatformProfile::desktop(),
+            &engine,
+            fresh_ban,
+        );
+        assert!(plan.is_empty(), "a fresh ban should stay excluded");
     }
 
     #[test]

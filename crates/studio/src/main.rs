@@ -54,6 +54,13 @@ fn build_engine(root: &std::path::Path, s: &StudioSettings) -> anyhow::Result<En
     // Public trackers (in addition to the DHT). Privacy-relevant — see the Settings
     // disclosure. Takes effect on next launch (trackers are attached at add-time).
     cfg.transport.bittorrent_use_public_trackers = s.bt_use_public_trackers;
+    // Connection/discovery options — all bind at session init, so next launch.
+    cfg.transport.bittorrent_enable_upnp = s.bt_upnp;
+    cfg.transport.bittorrent_enable_dht = s.bt_dht;
+    cfg.transport.bittorrent_enable_lsd = s.bt_lsd;
+    cfg.transport.bittorrent_peer_protocol = noema_core::BtPeerProtocol::from_u8(s.bt_protocol);
+    cfg.transport.bittorrent_max_peers_per_torrent = s.bt_max_peers;
+    cfg.transport.bittorrent_anonymous = s.bt_anonymous;
     // Download-routing preference: applied live by `set_download_preference`, but
     // also seed the initial value so the first download honors it before any save.
     cfg.download_preference = noema_core::DownloadPreference::from_u8(s.download_preference);
@@ -131,6 +138,8 @@ fn main() {
             commands::list_cache,
             commands::source_health,
             commands::set_share,
+            commands::share_activity,
+            commands::transfer_routes,
             commands::share_needs_confirmation,
             commands::confirm_gated_share,
             commands::install_model,

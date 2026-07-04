@@ -1,6 +1,6 @@
 use axum::{
     body::Bytes,
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -24,6 +24,16 @@ use std::sync::{Arc, Mutex};
 /// never dropped for a single missed beat, while halving the stale-entry window
 /// from the original 30 min.
 const PROVIDER_TTL_MS: i64 = 15 * 60 * 1000;
+
+/// Hard cap on stored manifests. `/manifests` is unauthenticated and accepts any
+/// self-signed manifest, so without a ceiling an attacker could fill disk/heap with
+/// an unbounded stream of distinct ids. Updates to an existing id are still allowed
+/// past the cap; only *new* ids are refused once it is reached.
+const MAX_STORED_MANIFESTS: usize = 50_000;
+
+/// Per-request body cap for the publish/verify endpoints. Real manifests are a few
+/// KB; this bounds the largest single POST a client can force the registry to buffer.
+const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 
 /// Worldwide content index. Providers are keyed by the file's **blake3** (Iroh's
 /// content address); a `sha256 -> blake3` alias lets a client that only knows the
@@ -392,6 +402,11 @@ impl Store {
     }
 
     fn insert(&mut self, m: Manifest) -> anyhow::Result<()> {
+        if !self.manifests.contains_key(&m.manifest_id)
+            && self.manifests.len() >= MAX_STORED_MANIFESTS
+        {
+            anyhow::bail!("manifest store is full ({MAX_STORED_MANIFESTS} entries)");
+        }
         let path = self.dir.join(format!("{}.json", m.manifest_id));
         std::fs::write(&path, m.to_json_pretty()?)?;
         let slug = slugify(&m.model.name);
@@ -540,15 +555,27 @@ async fn main() -> anyhow::Result<()> {
         .route("/stats", get(stats))
         .route("/logo.png", get(logo))
         .route("/health", get(health))
-        .route("/manifests", post(publish))
+        .route(
+            "/manifests",
+            post(publish).layer(DefaultBodyLimit::max(MAX_MANIFEST_BYTES)),
+        )
         .route("/manifests/:id", get(get_manifest))
         .route("/search", get(search))
         .route("/publishers/:id/keys", get(publisher_keys))
         .route("/models/:slug/latest", get(model_latest))
-        .route("/signatures/verify", post(verify))
+        .route(
+            "/signatures/verify",
+            post(verify).layer(DefaultBodyLimit::max(MAX_MANIFEST_BYTES)),
+        )
         // Worldwide P2P content tracker:
-        .route("/announce", post(announce))
-        .route("/withdraw", post(withdraw))
+        .route(
+            "/announce",
+            post(announce).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route(
+            "/withdraw",
+            post(withdraw).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
         .route("/providers/:hash", get(providers))
         .route("/catalog", get(catalog))
         // In-app auto-update: Atlas gets the whole signed manifest (it does its own
@@ -737,6 +764,9 @@ async fn search(
 ) -> Response {
     let q = params.get("q").cloned().unwrap_or_default().to_lowercase();
     let store = state.store.lock().unwrap();
+    // Cap the response: an empty query would otherwise dump the entire store in one
+    // body (response amplification). Clients paginate/refine to see more.
+    const SEARCH_LIMIT: usize = 200;
     let results: Vec<Manifest> = store
         .manifests
         .values()
@@ -746,6 +776,7 @@ async fn search(
                     .to_lowercase()
                     .contains(&q)
         })
+        .take(SEARCH_LIMIT)
         .cloned()
         .collect();
     Json(results).into_response()
@@ -1054,9 +1085,14 @@ async fn providers(
         .filter(|s| !s.is_empty());
     let (blake3, ps) = state.tracker.lock().unwrap().get(&hash, exclude);
     let now = now_unix_millis();
+    // Peers actually BitTorrent-seeding this file (they announced a non-empty magnet),
+    // mirroring the /catalog `bt_seeders` derivation. Lets a client show worldwide BT
+    // availability per file — not just the Iroh provider count — without a second call.
+    let bt_seeders = ps.iter().filter(|p| !p.magnet.is_empty()).count();
     Json(serde_json::json!({
         "hash": hash,
         "blake3": blake3,
+        "bt_seeders": bt_seeders,
         "providers": ps.iter().map(|p| serde_json::json!({
             "node": p.node,
             "ttl_secs": ((p.expires_at - now) / 1000).max(0),

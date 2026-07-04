@@ -163,7 +163,20 @@ async fn check_with_trust(
     if !resp.status().is_success() {
         return Err(format!("update check: HTTP {}", resp.status()));
     }
-    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+    // Bound the manifest body: the endpoint is untrusted (and user-overridable),
+    // so a hostile/compromised server must not be able to stream an unbounded body.
+    // The real manifest is a few KB; 4 MiB is ample headroom.
+    let bytes = {
+        let mut resp = resp;
+        let mut buf = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+            if buf.len() + chunk.len() > 4 * 1024 * 1024 {
+                return Err("update manifest exceeds maximum size".to_string());
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        buf
+    };
     let manifest = ReleaseManifest::from_json(&bytes).map_err(|e| format!("bad manifest: {e}"))?;
 
     // Trust gate: the signature must be from a key compiled into THIS binary.
@@ -406,11 +419,114 @@ fn relaunched_or_failed(path: &Path) -> ApplyOutcome {
 }
 
 /// Swap the running binary in place (portable builds) and relaunch.
+///
+/// The portable/tarball assets are archives (`Noema-Atlas-windows-x86_64.zip`,
+/// `noema-atlas-linux-x86_64.tar.gz`) holding several binaries, so the one matching
+/// this executable is extracted first — swapping the raw archive bytes over the
+/// running exe would destroy the install.
 fn apply_self_replace(staged: &Path) -> Result<ApplyOutcome, String> {
-    self_replace::self_replace(staged).map_err(|e| format!("replace: {e}"))?;
-    let _ = std::fs::remove_file(staged);
+    // Resolve our own path BEFORE the swap: on Linux `/proc/self/exe` reads
+    // "<path> (deleted)" once the old inode is unlinked, which can never be spawned.
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+
+    let name = staged
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let work = staged
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("portable-extract");
+    let binary = if name.ends_with(".zip") || name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+        extract_archive(staged, &work)?;
+        let wanted = exe.file_name().ok_or("bad executable path")?;
+        let found = find_file_named(&work, wanted).ok_or_else(|| {
+            format!(
+                "the downloaded archive has no `{}` inside",
+                wanted.to_string_lossy()
+            )
+        })?;
+        set_executable(&found)?;
+        found
+    } else {
+        staged.to_path_buf()
+    };
+
+    let swapped = self_replace::self_replace(&binary).map_err(|e| format!("replace: {e}"));
+    let _ = std::fs::remove_dir_all(&work);
+    let _ = std::fs::remove_file(staged);
+    swapped?;
     Ok(relaunched_or_failed(&exe))
+}
+
+/// Unpack a verified `.zip` / `.tar.gz` into `dest` with the platform's own tools
+/// (mirrors how the macOS path shells out to `unzip`). Windows' `tar.exe` (bsdtar,
+/// present since Windows 10 1803) reads zips too; `Expand-Archive` is the fallback.
+fn extract_archive(archive: &Path, dest: &Path) -> Result<(), String> {
+    use std::process::Command;
+    let name = archive
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let tar_gz = name.ends_with(".tar.gz") || name.ends_with(".tgz");
+    let ran = if tar_gz {
+        Command::new("tar")
+            .arg("-xzf")
+            .arg(archive)
+            .arg("-C")
+            .arg(dest)
+            .status()
+            .map(|s| s.success())
+    } else if cfg!(windows) {
+        Command::new("tar")
+            .arg("-xf")
+            .arg(archive)
+            .arg("-C")
+            .arg(dest)
+            .status()
+            .map(|s| s.success())
+            .or_else(|_| {
+                Command::new("powershell")
+                    .args(["-NoProfile", "-NonInteractive", "-Command"])
+                    .arg(format!(
+                        "Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force",
+                        archive.display(),
+                        dest.display()
+                    ))
+                    .status()
+                    .map(|s| s.success())
+            })
+    } else {
+        Command::new("unzip")
+            .args(["-q", "-o"])
+            .arg(archive)
+            .arg("-d")
+            .arg(dest)
+            .status()
+            .map(|s| s.success())
+    };
+    match ran {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("couldn't unpack the downloaded archive".to_string()),
+        Err(e) => Err(format!("couldn't unpack the downloaded archive: {e}")),
+    }
+}
+
+/// Depth-first search for a file with exactly `name` under `dir`.
+fn find_file_named(dir: &Path, name: &std::ffi::OsStr) -> Option<PathBuf> {
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            if let Some(found) = find_file_named(&p, name) {
+                return Some(found);
+            }
+        } else if p.file_name() == Some(name) {
+            return Some(p);
+        }
+    }
+    None
 }
 
 #[cfg(target_os = "linux")]
@@ -511,8 +627,10 @@ fn apply_macos(staged: &Path) -> Result<ApplyOutcome, String> {
     let _ = std::fs::remove_file(staged);
     let _ = std::fs::remove_dir_all(&work);
     // Relaunch the bundle via LaunchServices; if that fails, don't let the caller
-    // exit into nothing.
+    // exit into nothing. `-n` forces a NEW instance — without it, `open` merely
+    // activates this still-running (about to exit) process and nothing restarts.
     let relaunched = Command::new("/usr/bin/open")
+        .arg("-n")
         .arg(&bundle)
         .status()
         .map(|s| s.success())

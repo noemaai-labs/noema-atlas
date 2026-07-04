@@ -73,7 +73,11 @@ jobs:
         run: npm --prefix ui ci
 
       - name: install tauri-cli
-        run: cargo install tauri-cli --version "^2" --locked
+        # Pin to an exact version (matches the tauri 2.11.x runtime). A floating
+        # "^2" would auto-pull any future 2.x — including a malicious crates.io
+        # release — and that binary runs `cargo tauri build` with the updater
+        # signing key in its environment. Bump this deliberately on a tauri upgrade.
+        run: cargo install tauri-cli --version =2.11.3 --locked
 
       # macOS builds are produced and notarized locally, not in CI.
       - name: build Studio (Linux / Windows)

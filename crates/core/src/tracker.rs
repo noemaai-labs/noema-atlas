@@ -9,6 +9,10 @@ const TRACKER_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Fail fast on an unroutable tracker host instead of hanging the full request
 /// budget on a stuck TCP connect (reqwest has no default connect timeout).
 const TRACKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+/// Cap on a tracker JSON response body. The tracker is untrusted, so without a
+/// limit a hostile one could stream an unbounded body and exhaust client memory.
+const TRACKER_MAX_BODY: usize = 8 * 1024 * 1024; // 8 MiB
+use crate::util::read_body_capped;
 
 /// Build the tracker HTTP client, routed through the optional app proxy ("VPN
 /// tunnel") so announce/catalog/providers traffic tunnels like everything else.
@@ -186,10 +190,7 @@ pub async fn catalog(
     if !resp.status().is_success() {
         return Err(Error::other(format!("catalog returned {}", resp.status())));
     }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| Error::other(format!("catalog response: {e}")))?;
+    let bytes = read_body_capped(resp, TRACKER_MAX_BODY).await?;
     let parsed: CatalogResp = serde_json::from_slice(&bytes)?;
     Ok(parsed.models)
 }
@@ -213,12 +214,17 @@ fn urlencode(s: &str) -> String {
 pub struct ProviderSet {
     pub blake3: String,
     pub nodes: Vec<String>,
+    /// Peers BitTorrent-seeding this file (announced a magnet), excluding self.
+    /// `0` against an older registry that doesn't report the field.
+    pub bt_seeders: usize,
 }
 
 #[derive(Deserialize)]
 struct ProvidersResp {
     #[serde(default)]
     blake3: String,
+    #[serde(default)]
+    bt_seeders: usize,
     #[serde(default)]
     providers: Vec<ProviderEntry>,
 }
@@ -253,14 +259,12 @@ pub async fn providers(
             resp.status()
         )));
     }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| Error::other(format!("providers response: {e}")))?;
+    let bytes = read_body_capped(resp, TRACKER_MAX_BODY).await?;
     let parsed: ProvidersResp = serde_json::from_slice(&bytes)?;
     Ok(ProviderSet {
         blake3: parsed.blake3,
         nodes: parsed.providers.into_iter().map(|p| p.node).collect(),
+        bt_seeders: parsed.bt_seeders,
     })
 }
 

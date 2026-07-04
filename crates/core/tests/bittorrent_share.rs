@@ -9,7 +9,7 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use noema_core::hash::hash_bytes;
 use noema_core::manifest::{Artifact, AuthPolicy, Source};
-use noema_core::transport::{BittorrentAdapter, FetchCtx, TransportAdapter};
+use noema_core::transport::{BittorrentAdapter, FetchCtx, TransportAdapter, TransportConfig};
 
 fn sample(seed: u8, len: usize) -> Vec<u8> {
     (0..len)
@@ -17,21 +17,30 @@ fn sample(seed: u8, len: usize) -> Vec<u8> {
         .collect()
 }
 
-/// A leeching adapter: outbound + DHT only, no inbound listener. Uncapped (0,0).
-/// Public trackers off (this is a private two-node swarm), ratio unlimited.
-fn leecher(store_dir: std::path::PathBuf) -> BittorrentAdapter {
-    BittorrentAdapter::new(
-        store_dir, None, false, None, false, 0, 0, false, 0.0, false, None,
-    )
+/// Adapter config for one test instance: outbound + DHT only (no inbound
+/// listener, no UPnP), uncapped, public trackers off (this is a private
+/// two-node swarm), ratio unlimited.
+fn bt_cfg(store_dir: std::path::PathBuf, seed: bool) -> TransportConfig {
+    TransportConfig {
+        bittorrent_store_dir: store_dir,
+        bittorrent_seed: seed,
+        bittorrent_listen_port_range: None,
+        bittorrent_enable_upnp: false,
+        bittorrent_use_public_trackers: false,
+        ..TransportConfig::default()
+    }
 }
 
-/// A seeding adapter: binds an inbound listener so peers can pull from it. Returned
-/// as an `Arc` because `seed_blob` takes `self: &Arc<Self>` (it detaches the seed
-/// work, including the cold session init, onto a spawned task).
+/// A leeching adapter.
+fn leecher(store_dir: std::path::PathBuf) -> BittorrentAdapter {
+    BittorrentAdapter::new(&bt_cfg(store_dir, false), None)
+}
+
+/// A seeding adapter. Returned as an `Arc` because `seed_blob` takes
+/// `self: &Arc<Self>` (it detaches the seed work, including the cold session
+/// init, onto a spawned task).
 fn seeder(store_dir: std::path::PathBuf) -> Arc<BittorrentAdapter> {
-    Arc::new(BittorrentAdapter::new(
-        store_dir, None, true, None, false, 0, 0, false, 0.0, false, None,
-    ))
+    Arc::new(BittorrentAdapter::new(&bt_cfg(store_dir, true), None))
 }
 
 /// Build the manifest artifact a leecher passes to `open()` so the adapter can pick

@@ -105,8 +105,83 @@ const MULTIPEER_MIN_BYTES: u64 = 2 * STRIPE_PIECE_BYTES;
 
 const MAX_STRIPE_PEERS: usize = 16;
 
+/// Pieces one peer keeps in flight at once (each on its own QUIC stream over the
+/// peer's one connection). A single in-flight request leaves the link idle for a
+/// full round-trip between pieces — on a relayed/high-latency path that gap alone
+/// caps throughput well below the link rate. Three lanes keep the pipe full
+/// without starving the work-stealing queue for faster peers.
+const PIPELINE_PER_PEER: usize = 3;
+
+/// Consecutive failed pieces before a peer is dropped from the swarm. One bad
+/// stream shouldn't evict an otherwise-healthy peer (its piece just requeues for
+/// another lane/peer), but a peer failing repeatedly is dead weight.
+const PEER_FAIL_BUDGET: u64 = 3;
+
+/// How often the striped driver re-asks the caller for providers, so peers that
+/// come online mid-download join the swarm and previously-dropped ones get a
+/// fresh chance — the swarm grows as it goes instead of being fixed at start.
+const PEER_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Callback handing the striped fetch a fresh provider-ticket list mid-transfer
+/// (typically a tracker `/providers` re-query). Returns raw node tickets; the
+/// fetch parses, de-duplicates, and self-filters them.
+pub type MoreNodes =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Vec<String>> + Send>> + Send + Sync>;
+
 /// blake3 leaf chunk size; `ChunkNum`/`RangeSpec` count in these units.
 const BLAKE3_CHUNK: u64 = 1024;
+
+/// Scratch file a fetch writes a blob into before the engine verifies it. One
+/// place derives the name — the adapter creating it and the engine discarding a
+/// removed transfer's leftovers must agree. `blob_hash` is externally supplied
+/// and not guaranteed ASCII, so take chars, never byte-index (panics mid-codepoint).
+pub(crate) fn scratch_path(store_dir: &Path, blob_hash: &str) -> std::path::PathBuf {
+    store_dir.join("scratch").join(format!(
+        "iroh-{}.tmp",
+        blob_hash.chars().take(16).collect::<String>()
+    ))
+}
+
+/// Sidecar journal recording a striped fetch's completed pieces, so Pause/Stop,
+/// a crash, or a failed attempt resumes where it left off instead of re-fetching
+/// a multi-GB blob from byte 0. Lives next to the scratch file; its presence is
+/// also what tells the adapter a scratch leftover is a resumable partial.
+pub(crate) fn stripe_journal_path(dest: &Path) -> std::path::PathBuf {
+    let mut os = dest.as_os_str().to_os_string();
+    os.push(".stripes");
+    std::path::PathBuf::from(os)
+}
+
+/// Load the completed-piece set from a stripe journal. Empty (→ fresh start)
+/// unless the journal's header matches this exact blob + size AND the scratch
+/// file still exists at its full pre-sized length. A torn trailing line (killed
+/// mid-append) just drops that piece — it re-downloads.
+fn load_stripe_journal(
+    journal: &Path,
+    hash: &Hash,
+    size: u64,
+    dest: &Path,
+) -> std::collections::HashSet<(u64, u64)> {
+    let empty = std::collections::HashSet::new;
+    match std::fs::metadata(dest) {
+        Ok(m) if m.len() == size => {}
+        _ => return empty(),
+    }
+    let Ok(text) = std::fs::read_to_string(journal) else {
+        return empty();
+    };
+    let mut lines = text.lines();
+    let expected = format!("v1 {size} {}", hex::encode(hash.as_bytes()));
+    if lines.next() != Some(expected.as_str()) {
+        return empty();
+    }
+    lines
+        .filter_map(|l| {
+            let (s, e) = l.split_once(' ')?;
+            Some((s.parse().ok()?, e.parse().ok()?))
+        })
+        .collect()
+}
 
 /// Split a blob into contiguous `[start_chunk, end_chunk)` stripe pieces. Pure for
 /// unit testing.
@@ -158,6 +233,159 @@ async fn get_blob_range(
     };
     closing.next().await.map_err(|e| ierr("stripe close", e))?;
     Ok(())
+}
+
+/// State shared by every lane of a striped fetch.
+struct StripeShared {
+    endpoint: Endpoint,
+    hash: Hash,
+    dest: std::path::PathBuf,
+    size: u64,
+    /// (start_chunk, end_chunk, attempts)
+    queue: Mutex<std::collections::VecDeque<(u64, u64, u64)>>,
+    pieces_left: AtomicU64,
+    bytes_done: AtomicU64,
+    last_emit: AtomicU64,
+    /// Set when a piece has failed too many times: striping can't finish.
+    fatal: AtomicBool,
+    /// Attempt ceiling per piece; grows as peers join so a late-arriving healthy
+    /// peer still gets a shot at a piece the early swarm kept dropping.
+    max_attempts: AtomicU64,
+    cancel: Option<Arc<AtomicBool>>,
+    on_bytes: Option<BytesProgress>,
+    /// NodeIds currently in the swarm, so a provider refresh doesn't re-dial a
+    /// connected peer (a dropped peer leaves the set and may be re-added later).
+    active: Mutex<std::collections::HashSet<iroh::net::NodeId>>,
+    /// Resume journal (append-only): one `start end` line per completed piece.
+    journal: Option<std::sync::Mutex<std::fs::File>>,
+}
+
+impl StripeShared {
+    fn stopped(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .map(|f| f.load(Ordering::SeqCst))
+            .unwrap_or(false)
+    }
+
+    fn complete_piece(&self, start: u64, end: u64) {
+        let nbytes = (end * BLAKE3_CHUNK).min(self.size) - (start * BLAKE3_CHUNK).min(self.size);
+        let done = self.bytes_done.fetch_add(nbytes, Ordering::SeqCst) + nbytes;
+        self.pieces_left.fetch_sub(1, Ordering::SeqCst);
+        if let Some(j) = self.journal.as_ref() {
+            use std::io::Write;
+            let _ = writeln!(j.lock().unwrap(), "{start} {end}");
+        }
+        if let Some(sink) = self.on_bytes.as_deref() {
+            let prev = self.last_emit.load(Ordering::SeqCst);
+            if done.saturating_sub(prev) >= (1 << 20) || done >= self.size {
+                self.last_emit.store(done, Ordering::SeqCst);
+                sink(done.min(self.size), self.size);
+            }
+        }
+    }
+
+    fn requeue_piece(&self, start: u64, end: u64, attempts: u64) {
+        if attempts >= self.max_attempts.load(Ordering::SeqCst) {
+            self.fatal.store(true, Ordering::SeqCst);
+        } else {
+            self.queue.lock().unwrap().push_back((start, end, attempts));
+        }
+    }
+}
+
+/// Add one peer to a striped fetch: dial it once, then run [`PIPELINE_PER_PEER`]
+/// lanes over that connection, each pulling pieces from the shared queue on its
+/// own QUIC stream. Pipelining keeps the link busy across piece boundaries — with
+/// a single in-flight request the peer idles a full round-trip between pieces. A
+/// lane failure requeues its piece; [`PEER_FAIL_BUDGET`] consecutive failures
+/// retire the whole peer (transient errors don't, so one bad stream can't evict a
+/// healthy peer the way the old one-shot workers did).
+fn spawn_stripe_peer(
+    workers: &mut tokio::task::JoinSet<()>,
+    shared: Arc<StripeShared>,
+    node: iroh::net::NodeAddr,
+) {
+    let id = node.node_id;
+    if !shared.active.lock().unwrap().insert(id) {
+        return;
+    }
+    workers.spawn(async move {
+        // Remove this peer from the swarm set on any exit (including abort), so a
+        // later provider refresh may re-admit it with a fresh connection.
+        struct ActiveGuard(Arc<StripeShared>, iroh::net::NodeId);
+        impl Drop for ActiveGuard {
+            fn drop(&mut self) {
+                self.0.active.lock().unwrap().remove(&self.1);
+            }
+        }
+        let _guard = ActiveGuard(shared.clone(), id);
+        let conn = match tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            shared.endpoint.connect(node, iroh_blobs::protocol::ALPN),
+        )
+        .await
+        {
+            Ok(Ok(c)) => c,
+            _ => return,
+        };
+        let fails = Arc::new(AtomicU64::new(0));
+        let mut lanes: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        for _ in 0..PIPELINE_PER_PEER {
+            let shared = shared.clone();
+            let conn = conn.clone();
+            let fails = fails.clone();
+            lanes.spawn(async move {
+                // Per-lane handle: positioned writes to disjoint offsets are safe
+                // across independent handles to the same file.
+                let mut file = match std::fs::OpenOptions::new().write(true).open(&shared.dest) {
+                    Ok(f) => iroh_io::File::from_std(f),
+                    Err(_) => return,
+                };
+                let mut idle_polls = 0u32;
+                loop {
+                    if shared.fatal.load(Ordering::SeqCst)
+                        || shared.stopped()
+                        || fails.load(Ordering::SeqCst) >= PEER_FAIL_BUDGET
+                    {
+                        return;
+                    }
+                    let next = { shared.queue.lock().unwrap().pop_front() };
+                    let Some((start, end, attempts)) = next else {
+                        if shared.pieces_left.load(Ordering::SeqCst) == 0 {
+                            return;
+                        }
+                        // Empty for now but not done: another lane may re-queue a
+                        // failed piece. Back off and re-check, bounded so a wedged
+                        // swarm can't spin forever.
+                        idle_polls += 1;
+                        if idle_polls > 200 {
+                            return;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    };
+                    idle_polls = 0;
+                    let outcome = tokio::time::timeout(
+                        STALL_TIMEOUT,
+                        get_blob_range(&conn, shared.hash, start, end, &mut file),
+                    )
+                    .await;
+                    match outcome {
+                        Ok(Ok(())) => {
+                            fails.store(0, Ordering::SeqCst);
+                            shared.complete_piece(start, end);
+                        }
+                        _ => {
+                            fails.fetch_add(1, Ordering::SeqCst);
+                            shared.requeue_piece(start, end, attempts + 1);
+                        }
+                    }
+                }
+            });
+        }
+        while lanes.join_next().await.is_some() {}
+    });
 }
 
 /// Live provider-side counters for the worldwide Iroh seeder.
@@ -670,7 +898,11 @@ impl IrohNode {
         let mut transport = TransportConfig::default();
         transport
             .stream_receive_window(VarInt::from_u32(STREAM_RECEIVE_WINDOW)) // how fast a peer may send to us
-            .send_window(STREAM_RECEIVE_WINDOW as u64); // match our serve side (quinn default is only 10 MB)
+            .send_window(4 * STREAM_RECEIVE_WINDOW as u64) // serve side: cover several concurrent streams
+            // Connection-level window must cover the per-stream windows of every
+            // pipelined lane (PIPELINE_PER_PEER streams per peer), or it becomes
+            // the new ~10 MB/s-style ceiling the stream window fix lifted.
+            .receive_window(VarInt::from_u32(4 * STREAM_RECEIVE_WINDOW));
         let endpoint = Endpoint::builder()
             .secret_key(secret_key)
             .transport_config(transport)
@@ -880,6 +1112,7 @@ impl IrohNode {
     /// returned by the tracker), exporting it to `dest`. With several peers and a
     /// large file this stripes the blob across all of them ([`fetch_striped`]);
     /// otherwise, or on failure, it falls back to a single-peer download.
+    #[allow(clippy::too_many_arguments)]
     pub async fn fetch_from_providers(
         &self,
         blake3_hex: &str,
@@ -888,26 +1121,17 @@ impl IrohNode {
         size: u64,
         cancel: Option<Arc<AtomicBool>>,
         on_bytes: Option<BytesProgress>,
+        more_nodes: Option<MoreNodes>,
     ) -> Result<()> {
         let hash = Hash::from(crate::hash::parse_hex32(blake3_hex)?);
-        // Parse every provider into a NodeAddr, de-duplicating by stable NodeId so
-        // a peer that re-announced under changed addresses isn't dialed twice.
-        let mut nodes: Vec<iroh::net::NodeAddr> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for nt in node_tickets {
-            if let Ok(node) = nt.trim().parse::<NodeTicket>() {
-                let addr = node.node_addr().clone();
-                if seen.insert(addr.node_id) {
-                    nodes.push(addr);
-                }
-            }
-        }
+        let nodes =
+            self.parse_provider_tickets(node_tickets, &mut std::collections::HashSet::new());
         if nodes.is_empty() {
             return Err(Error::other(
                 "no reachable peers are online for this file right now",
             ));
         }
-        if nodes.len() >= 2 && size >= MULTIPEER_MIN_BYTES {
+        if size >= MULTIPEER_MIN_BYTES {
             match self
                 .fetch_striped(
                     hash,
@@ -916,6 +1140,7 @@ impl IrohNode {
                     size,
                     cancel.clone(),
                     on_bytes.clone(),
+                    more_nodes,
                 )
                 .await
             {
@@ -933,10 +1158,40 @@ impl IrohNode {
             .await
     }
 
+    /// Parse tracker tickets into dialable addresses, de-duplicating by stable
+    /// NodeId (a peer that re-announced under changed addresses isn't dialed
+    /// twice) and dropping this node itself. The tracker is asked to exclude the
+    /// querier, but an older deployed registry ignores that parameter — and a
+    /// stale self-entry (e.g. right after deleting the local copy) would make the
+    /// fetch dial its own store, burn a connect window on a blob it knows it
+    /// doesn't have, and look "stuck resolving".
+    fn parse_provider_tickets(
+        &self,
+        node_tickets: &[String],
+        seen: &mut std::collections::HashSet<iroh::net::NodeId>,
+    ) -> Vec<iroh::net::NodeAddr> {
+        let me = self.endpoint.node_id();
+        let mut nodes = Vec::new();
+        for nt in node_tickets {
+            if let Ok(node) = nt.trim().parse::<NodeTicket>() {
+                let addr = node.node_addr().clone();
+                if addr.node_id != me && seen.insert(addr.node_id) {
+                    nodes.push(addr);
+                }
+            }
+        }
+        nodes
+    }
+
     /// Pull one blob from many peers at once. The blob is split into pieces in a
-    /// shared queue; one worker per peer pulls pieces (work-stealing, so fast peers
-    /// do more and a piece a dead peer drops is re-queued) and fetches each as a
-    /// bao-verified range written straight to `dest` at its absolute offset.
+    /// shared queue; each peer runs [`PIPELINE_PER_PEER`] lanes pulling pieces
+    /// (work-stealing, so fast peers do more and a piece a dead peer drops is
+    /// re-queued), each fetched as a bao-verified range written straight to
+    /// `dest` at its absolute offset. `more_nodes`, when given, is polled every
+    /// [`PEER_REFRESH_INTERVAL`] so providers that appear mid-transfer join the
+    /// swarm — the download starts with whoever is reachable now and gathers
+    /// peers as it goes rather than resolving everyone up front.
+    #[allow(clippy::too_many_arguments)]
     pub async fn fetch_striped(
         &self,
         hash: Hash,
@@ -945,123 +1200,95 @@ impl IrohNode {
         size: u64,
         cancel: Option<Arc<AtomicBool>>,
         on_bytes: Option<BytesProgress>,
+        more_nodes: Option<MoreNodes>,
     ) -> Result<()> {
-        use std::collections::VecDeque;
-        use std::sync::Mutex as StdMutex;
-
-        // Pre-size so workers can write their stripes at absolute offsets.
-        {
+        // Resume: the journal names the pieces already bao-verified into `dest` by
+        // a previous attempt of this exact blob+size — only the rest is fetched.
+        // Anything stale (missing/mismatched header, wrong file length, unknown
+        // piece bounds) falls back to a fresh start.
+        let journal_path = stripe_journal_path(dest);
+        let all = stripe_pieces(size);
+        let mut done = load_stripe_journal(&journal_path, &hash, size, dest);
+        if !done.is_empty() {
+            let grid: std::collections::HashSet<(u64, u64)> = all.iter().copied().collect();
+            if !done.iter().all(|p| grid.contains(p)) {
+                done.clear();
+            }
+        }
+        if done.is_empty() {
+            // Pre-size so lanes can write their stripes at absolute offsets.
             let f = std::fs::File::create(dest).map_err(|e| Error::fs(dest, e))?;
             f.set_len(size).map_err(|e| Error::fs(dest, e))?;
+            let _ = std::fs::write(
+                &journal_path,
+                format!("v1 {size} {}\n", hex::encode(hash.as_bytes())),
+            );
         }
+        let resumed: u64 = done
+            .iter()
+            .map(|&(s, e)| (e * BLAKE3_CHUNK).min(size) - (s * BLAKE3_CHUNK).min(size))
+            .sum();
+        let pieces: std::collections::VecDeque<(u64, u64, u64)> = all
+            .into_iter()
+            .filter(|p| !done.contains(p))
+            .map(|(s, e)| (s, e, 0))
+            .collect();
+        if pieces.is_empty() {
+            let _ = std::fs::remove_file(&journal_path);
+            if let Some(sink) = on_bytes.as_deref() {
+                sink(size, size);
+            }
+            return Ok(());
+        }
+        if resumed > 0 {
+            tracing::info!(resumed, size, "striped fetch: resuming from piece journal");
+            if let Some(sink) = on_bytes.as_deref() {
+                sink(resumed, size);
+            }
+        }
+        let journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal_path)
+            .ok()
+            .map(std::sync::Mutex::new);
 
-        let total_pieces = stripe_pieces(size).len() as u64;
-        // (start_chunk, end_chunk, attempts)
-        let queue: Arc<StdMutex<VecDeque<(u64, u64, u32)>>> = Arc::new(StdMutex::new(
-            stripe_pieces(size)
-                .into_iter()
-                .map(|(s, e)| (s, e, 0))
-                .collect(),
-        ));
-        let pieces_left = Arc::new(AtomicU64::new(total_pieces));
-        let bytes_done = Arc::new(AtomicU64::new(0));
-        let last_emit = Arc::new(AtomicU64::new(0));
-        // Set when a piece has failed on every peer: striping can't finish.
-        let fatal = Arc::new(AtomicBool::new(false));
-        let max_attempts = nodes.len() as u32 + 2;
+        let shared = Arc::new(StripeShared {
+            endpoint: self.endpoint.clone(),
+            hash,
+            dest: dest.to_path_buf(),
+            size,
+            pieces_left: AtomicU64::new(pieces.len() as u64),
+            queue: Mutex::new(pieces),
+            bytes_done: AtomicU64::new(resumed),
+            last_emit: AtomicU64::new(resumed),
+            fatal: AtomicBool::new(false),
+            max_attempts: AtomicU64::new((nodes.len() as u64 + 2).max(6)),
+            cancel,
+            on_bytes,
+            active: Mutex::new(std::collections::HashSet::new()),
+            journal,
+        });
 
-        let n_workers = nodes.len().min(MAX_STRIPE_PEERS);
         let mut workers: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-        for node in nodes.into_iter().take(n_workers) {
-            let endpoint = self.endpoint.clone();
-            let dest = dest.to_path_buf();
-            let queue = queue.clone();
-            let pieces_left = pieces_left.clone();
-            let bytes_done = bytes_done.clone();
-            let last_emit = last_emit.clone();
-            let fatal = fatal.clone();
-            let cancel = cancel.clone();
-            let on_bytes = on_bytes.clone();
-            workers.spawn(async move {
-                let stopped = |c: &Option<Arc<AtomicBool>>| {
-                    c.as_ref()
-                        .map(|f| f.load(Ordering::SeqCst))
-                        .unwrap_or(false)
-                };
-                // One QUIC connection per peer, reused for every piece it serves.
-                let conn = match tokio::time::timeout(
-                    CONNECT_TIMEOUT,
-                    endpoint.connect(node, iroh_blobs::protocol::ALPN),
-                )
-                .await
-                {
-                    Ok(Ok(c)) => c,
-                    _ => return,
-                };
-                // Per-worker handle: positioned writes to disjoint offsets are safe
-                // across independent handles to the same file.
-                let mut file = match std::fs::OpenOptions::new().write(true).open(&dest) {
-                    Ok(f) => iroh_io::File::from_std(f),
-                    Err(_) => return,
-                };
-                let mut idle_polls = 0u32;
-                loop {
-                    if fatal.load(Ordering::SeqCst) || stopped(&cancel) {
-                        return;
-                    }
-                    let next = { queue.lock().unwrap().pop_front() };
-                    let Some((start, end, attempts)) = next else {
-                        if pieces_left.load(Ordering::SeqCst) == 0 {
-                            return;
-                        }
-                        // Empty for now but not done: another worker may re-queue a
-                        // failed piece. Back off and re-check, bounded so a wedged
-                        // peer set can't spin forever.
-                        idle_polls += 1;
-                        if idle_polls > 200 {
-                            return;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        continue;
-                    };
-                    idle_polls = 0;
-                    let outcome = tokio::time::timeout(
-                        STALL_TIMEOUT,
-                        get_blob_range(&conn, hash, start, end, &mut file),
-                    )
-                    .await;
-                    match outcome {
-                        Ok(Ok(())) => {
-                            let nbytes =
-                                (end * BLAKE3_CHUNK).min(size) - (start * BLAKE3_CHUNK).min(size);
-                            let done = bytes_done.fetch_add(nbytes, Ordering::SeqCst) + nbytes;
-                            pieces_left.fetch_sub(1, Ordering::SeqCst);
-                            if let Some(sink) = on_bytes.as_deref() {
-                                let prev = last_emit.load(Ordering::SeqCst);
-                                if done.saturating_sub(prev) >= (1 << 20) || done >= size {
-                                    last_emit.store(done, Ordering::SeqCst);
-                                    sink(done.min(size), size);
-                                }
-                            }
-                        }
-                        _ => {
-                            // Re-queue for another peer, then drop this connection.
-                            let attempts = attempts + 1;
-                            if attempts >= max_attempts {
-                                fatal.store(true, Ordering::SeqCst);
-                            } else {
-                                queue.lock().unwrap().push_back((start, end, attempts));
-                            }
-                            return;
-                        }
-                    }
-                }
-            });
+        for node in nodes {
+            spawn_stripe_peer(&mut workers, shared.clone(), node);
         }
 
-        // Drive the workers, applying the connect/stall watchdog over aggregate bytes.
+        // Drive the workers: cancel + aggregate connect/stall watchdog every tick,
+        // and a periodic provider re-query feeding new peers into the swarm.
+        let (fresh_tx, mut fresh_rx) = tokio::sync::mpsc::channel::<Vec<String>>(2);
+        let mut last_refresh = std::time::Instant::now();
+        let mut refresh_inflight = false;
         let started = std::time::Instant::now();
-        let mut last_bytes = 0u64;
+        // The connect window restarts (bounded) when new peers join a still-silent
+        // swarm, so a refresh that surfaces a live peer isn't killed by a deadline
+        // the dead starters already burned.
+        let mut connect_anchor = started;
+        let mut connect_extensions = 0u32;
+        // Resumed bytes don't count as live progress: the connect window / stall
+        // watchdog and the refresh extension must judge THIS attempt's peers.
+        let baseline = resumed;
+        let mut last_bytes = baseline;
         let mut last_advance = started;
         loop {
             tokio::select! {
@@ -1070,32 +1297,72 @@ impl IrohNode {
                         break;
                     }
                 }
+                Some(tickets) = fresh_rx.recv() => {
+                    refresh_inflight = false;
+                    let mut seen: std::collections::HashSet<iroh::net::NodeId> =
+                        shared.active.lock().unwrap().clone();
+                    let fresh = self.parse_provider_tickets(&tickets, &mut seen);
+                    if !fresh.is_empty() {
+                        let active = shared.active.lock().unwrap().len() as u64;
+                        shared
+                            .max_attempts
+                            .fetch_max(active + fresh.len() as u64 + 2, Ordering::SeqCst);
+                        if last_bytes == baseline && connect_extensions < 2 {
+                            connect_anchor = std::time::Instant::now();
+                            connect_extensions += 1;
+                        }
+                        for node in fresh {
+                            if shared.active.lock().unwrap().len() >= MAX_STRIPE_PEERS {
+                                break;
+                            }
+                            tracing::info!(node = %node.node_id, "provider joined mid-transfer");
+                            spawn_stripe_peer(&mut workers, shared.clone(), node);
+                        }
+                    }
+                }
                 _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
-                    if cancel.as_ref().map(|f| f.load(Ordering::SeqCst)).unwrap_or(false) {
+                    if shared.stopped() {
                         workers.abort_all();
                         return Err(Error::Cancelled);
                     }
-                    let now = bytes_done.load(Ordering::SeqCst);
+                    let now = shared.bytes_done.load(Ordering::SeqCst);
                     if now > last_bytes {
                         last_bytes = now;
                         last_advance = std::time::Instant::now();
                     }
-                    if fetch_stalled(started.elapsed(), last_bytes > 0, last_advance.elapsed()) {
+                    if fetch_stalled(connect_anchor.elapsed(), last_bytes > baseline, last_advance.elapsed()) {
                         tracing::warn!("striped fetch watchdog: no aggregate progress, aborting");
-                        fatal.store(true, Ordering::SeqCst);
+                        shared.fatal.store(true, Ordering::SeqCst);
                         workers.abort_all();
                         return Err(Error::transport("iroh", TransportErrorKind::NotFound));
+                    }
+                    if let Some(refresh) = more_nodes.as_ref() {
+                        if !refresh_inflight
+                            && last_refresh.elapsed() >= PEER_REFRESH_INTERVAL
+                            && shared.pieces_left.load(Ordering::SeqCst) > 0
+                        {
+                            refresh_inflight = true;
+                            last_refresh = std::time::Instant::now();
+                            let fut = refresh();
+                            let tx = fresh_tx.clone();
+                            tokio::spawn(async move {
+                                let _ = tx.send(fut.await).await;
+                            });
+                        }
                     }
                 }
             }
         }
 
-        if pieces_left.load(Ordering::SeqCst) == 0 {
-            if let Some(sink) = on_bytes.as_deref() {
+        if shared.pieces_left.load(Ordering::SeqCst) == 0 {
+            let _ = std::fs::remove_file(&journal_path);
+            if let Some(sink) = shared.on_bytes.as_deref() {
                 sink(size, size);
             }
             Ok(())
         } else {
+            // Keep the journal: a retry (or an explicit Resume) picks up the
+            // completed pieces instead of starting over.
             Err(Error::transport("iroh", TransportErrorKind::NotFound))
         }
     }
@@ -1155,15 +1422,30 @@ impl IrohNode {
             // verifies the scratch bytes and commits them to the CAS, so the model
             // is written to disk twice (iroh's download + the CAS) rather than
             // three times (download + this export copy + the CAS).
-            store
+            if let Err(e) = store
                 .export(
                     hash,
-                    dest_pb,
+                    dest_pb.clone(),
                     ExportMode::TryReference,
                     Box::new(|_| Ok(())),
                 )
                 .await
-                .map_err(|e| format!("export: {e}"))?;
+            {
+                // The remove above can race a leftover being recreated (or fail
+                // silently), which surfaces as "export: File exists (os error 17)"
+                // and used to kill the retry a user just clicked. Clear the
+                // destination and try once more before giving up.
+                let _ = tokio::fs::remove_file(&dest_pb).await;
+                store
+                    .export(
+                        hash,
+                        dest_pb,
+                        ExportMode::TryReference,
+                        Box::new(|_| Ok(())),
+                    )
+                    .await
+                    .map_err(|e2| format!("export: {e2} (first attempt: {e})"))?;
+            }
             // Drop the now-redundant store entry. After the move it references the
             // scratch file, which the engine deletes once it has streamed it into
             // the CAS — left in place that would dangle, and (worse) the iroh store
@@ -1370,6 +1652,44 @@ mod tests {
                 "the last piece must reach the end of the blob"
             );
         }
+    }
+
+    /// Journal round-trip: completed pieces load back for the exact blob+size
+    /// (a torn trailing line is dropped, not fatal), and anything stale — wrong
+    /// hash, wrong size, missing scratch file — yields a fresh start.
+    #[test]
+    fn stripe_journal_roundtrip_and_staleness() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("iroh-abc.tmp");
+        let size = 3 * STRIPE_PIECE_BYTES + 123;
+        let hash = Hash::from([7u8; 32]);
+        std::fs::File::create(&dest).unwrap().set_len(size).unwrap();
+
+        let journal = stripe_journal_path(&dest);
+        let done: Vec<(u64, u64)> = stripe_pieces(size).iter().take(2).copied().collect();
+        let mut text = format!("v1 {size} {}\n", hex::encode(hash.as_bytes()));
+        for (s, e) in &done {
+            text.push_str(&format!("{s} {e}\n"));
+        }
+        text.push_str("torn-li"); // killed mid-append
+        std::fs::write(&journal, &text).unwrap();
+
+        let loaded = load_stripe_journal(&journal, &hash, size, &dest);
+        assert_eq!(loaded, done.iter().copied().collect());
+
+        assert!(
+            load_stripe_journal(&journal, &Hash::from([8u8; 32]), size, &dest).is_empty(),
+            "wrong hash must not resume"
+        );
+        assert!(
+            load_stripe_journal(&journal, &hash, size + 1, &dest).is_empty(),
+            "wrong size must not resume"
+        );
+        std::fs::remove_file(&dest).unwrap();
+        assert!(
+            load_stripe_journal(&journal, &hash, size, &dest).is_empty(),
+            "missing scratch must not resume"
+        );
     }
 
     /// A full transfer (peer starts from zero) must count exactly the blob size.

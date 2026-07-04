@@ -51,7 +51,7 @@ pub use secret::{SecretStore, SERVICE_PREFIX};
 pub use share::{is_bundle_link, ShareBundle, ShareTarget};
 pub use sign::{verify_manifest, KeyPair, VerificationReport};
 pub use transfer::{TransferControl, TransferId, TransferManager, TransferState};
-pub use transport::{BtPeer, TransportAdapter, TransportConfig, Transports};
+pub use transport::{BtPeer, BtPeerProtocol, TransportAdapter, TransportConfig, Transports};
 pub use update::{
     AppRelease, PlatformAsset, ReleaseManifest, UpdateSignature, UPDATE_RELEASE_PUBKEYS,
 };
