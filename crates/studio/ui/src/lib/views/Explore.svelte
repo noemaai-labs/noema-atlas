@@ -2,6 +2,7 @@
   import { onMount, onDestroy } from "svelte";
   import { api } from "../api.js";
   import { fmtSize, rowFormat, formatId } from "../format.js";
+  import RouteDetail from "../RouteDetail.svelte";
   export let startLink = () => {};
   export let startMesh = () => {};
   export let goTransfers = () => {};
@@ -14,6 +15,26 @@
   let timer = null;
   let started = new Set();
   let linkStarted = false;
+  // The mesh row whose routes & peers popup is open.
+  let detailItem = null;
+  function openDetail(m) {
+    detailItem = m;
+  }
+  function detailProps(m) {
+    return {
+      title: m.name,
+      subtitle:
+        fmtSize(m.size) +
+        (m.quant ? " · " + m.quant : "") +
+        (m.license ? " · " + m.license : ""),
+      sha256: m.sha256,
+      blake3: m.blake3,
+      magnet: m.magnet,
+      iroh: m.peers,
+      bt: m.bt_seeders,
+      hfSource: false,
+    };
+  }
 
   $: mine = results.filter((m) => m.mine);
   $: others = results.filter((m) => !m.mine);
@@ -103,7 +124,15 @@
     {#each mine as m (m.blake3 + m.sha256)}
       <div class="card">
         <div class="card-head" style="cursor:default">
-          <div class="grow">
+          <div
+            class="grow clickable"
+            role="button"
+            tabindex="0"
+            title="Show routes & peers"
+            on:click={() => openDetail(m)}
+            on:keydown={(e) =>
+              (e.key === "Enter" || e.key === " ") && (e.preventDefault(), openDetail(m))}
+          >
             <div class="title">
               {m.name}
               {#if rowFormat(null, m.name)}<span class="pill fmt f-{formatId(null, m.name)}">{rowFormat(null, m.name)}</span>{/if}
@@ -131,7 +160,15 @@
     {#each others as m (m.blake3 + m.sha256)}
       <div class="card">
         <div class="card-head" style="cursor:default">
-          <div class="grow">
+          <div
+            class="grow clickable"
+            role="button"
+            tabindex="0"
+            title="Show routes & peers"
+            on:click={() => openDetail(m)}
+            on:keydown={(e) =>
+              (e.key === "Enter" || e.key === " ") && (e.preventDefault(), openDetail(m))}
+          >
             <div class="title">
               {m.name}
               {#if rowFormat(null, m.name)}<span class="pill fmt f-{formatId(null, m.name)}">{rowFormat(null, m.name)}</span>{/if}
@@ -161,3 +198,18 @@
     </p>
   {/if}
 </div>
+
+{#if detailItem}
+  <RouteDetail
+    item={detailProps(detailItem)}
+    onClose={() => (detailItem = null)}
+    onGet={detailItem.in_library || started.has(detailItem.blake3)
+      ? null
+      : () => {
+          const m = detailItem;
+          detailItem = null;
+          get(m);
+        }}
+    getLabel="Get"
+  />
+{/if}

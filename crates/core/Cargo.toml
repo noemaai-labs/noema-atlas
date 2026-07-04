@@ -50,6 +50,9 @@ time.workspace = true
 # unreliable on worker threads (returns Err on Linux); chrono::Local is safe there.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 reflink-copy.workspace = true
+# Cross-platform free-disk-space query, used to bound an unknown-size download to
+# what the filesystem can actually hold (rather than a guessed byte ceiling).
+fs4 = { version = "0.13", default-features = false, features = ["sync"] }
 
 keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "linux-native"], optional = true }
 

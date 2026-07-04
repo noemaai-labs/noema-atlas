@@ -150,8 +150,23 @@ pub fn verify_manifest(manifest: &Manifest) -> Result<VerificationReport> {
 }
 
 fn verify_one(bytes: &[u8], pk: &PublicKey, sig: &Signature) -> Result<()> {
+    // The trust decision keys off `key_id` (see `is_trusted_by`), so the verifying
+    // key MUST be the one *named* by `key_id` — `ed25519:<hex32>` — never the
+    // separately-supplied `public_key` field. Otherwise an attacker could label
+    // their own key with a victim's trusted `key_id`, sign with their own key, and
+    // have the manifest verify as trusted. Bind the two: derive the key from the id
+    // and reject any descriptor whose `public_key` disagrees with it.
+    let key_hex = sig
+        .key_id
+        .strip_prefix("ed25519:")
+        .ok_or_else(|| Error::Key("key_id must be of the form ed25519:<hex>".into()))?;
+    if !pk.public_key.eq_ignore_ascii_case(key_hex) {
+        return Err(Error::Key(
+            "key_id does not match its public_key material".into(),
+        ));
+    }
     let pk_bytes =
-        hex::decode(&pk.public_key).map_err(|e| Error::Key(format!("bad public key hex: {e}")))?;
+        hex::decode(key_hex).map_err(|e| Error::Key(format!("bad public key hex: {e}")))?;
     let pk_arr: [u8; 32] = pk_bytes
         .as_slice()
         .try_into()
@@ -209,6 +224,37 @@ mod tests {
         let hex = kp.secret_hex();
         let kp2 = KeyPair::from_secret_hex(&hex).unwrap();
         assert_eq!(kp.public_hex(), kp2.public_hex());
+    }
+
+    #[test]
+    fn forged_key_id_label_is_not_trusted() {
+        // An attacker embeds their OWN public key but labels it (and the signature)
+        // with a victim's trusted key_id. The signature math is valid for the
+        // attacker's key, but it must NOT verify as the victim's key.
+        let victim = KeyPair::generate();
+        let attacker = KeyPair::generate();
+        let victim_id = victim.key_id();
+
+        let mut m = sample_manifest();
+        attacker.sign_manifest(&mut m).unwrap();
+        // Relabel the attacker's embedded key + signature with the victim's id,
+        // keeping the attacker's actual public_key material.
+        for k in &mut m.publisher.public_keys {
+            k.key_id = victim_id.clone();
+        }
+        for s in &mut m.signatures {
+            s.key_id = victim_id.clone();
+        }
+
+        let report = verify_manifest(&m).unwrap();
+        assert!(
+            !report.is_signed(),
+            "manifest with mismatched key_id/public_key must not verify"
+        );
+
+        let mut trusted = HashSet::new();
+        trusted.insert(victim_id);
+        assert!(!report.is_trusted_by(&trusted));
     }
 
     #[test]

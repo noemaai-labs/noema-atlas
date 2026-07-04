@@ -349,6 +349,65 @@ select:focus {
   border-color: var(--warn);
   color: var(--warn);
 }
+/* A route that isn't carrying bytes right now but stands ready for failover. */
+.pill.standby {
+  opacity: 0.55;
+}
+/* Row areas that open the routes & peers popup. */
+.clickable {
+  cursor: pointer;
+}
+.clickable:hover .title,
+.clickable:hover .vlabel {
+  text-decoration: underline;
+}
+/* Transfer paths row: every route a download can use, active one lit. */
+.paths {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+  flex-wrap: wrap;
+}
+/* Route rows in the quant detail popup: one card per transport, tinted when the
+   route is usable right now. */
+.route {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  margin-bottom: 6px;
+  border: 1px solid var(--border-2);
+  opacity: 0.7;
+}
+.route.live {
+  opacity: 1;
+  border-color: var(--ok, #2f9e44);
+  background: color-mix(in srgb, var(--ok, #2f9e44) 7%, transparent);
+}
+.route .rname {
+  font-weight: 600;
+  font-size: 13px;
+}
+.route .rstat {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.route.live .rstat {
+  color: var(--ok, #2f9e44);
+}
+.live-now {
+  color: var(--ok, #2f9e44);
+  font-weight: 600;
+  margin: 6px 0 0;
+}
+.cid {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
 /* Model-format chip (GGUF, Safetensors, MLX, …). Each format gets a per-id --fmt
    accent (the `.f-<id>` rules below); it colors both the border and the label.
    Light/dark variants are chosen to clear WCAG AA on each theme's card surface.

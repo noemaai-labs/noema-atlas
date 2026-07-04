@@ -62,6 +62,10 @@
     s.bt_schedule_days ^= 1 << i;
     saveSchedule();
   }
+  function randomPort() {
+    s.bt_port = 1024 + Math.floor(Math.random() * 64512);
+    save();
+  }
   async function saveSchedule() {
     try {
       await api.saveSettings(s);
@@ -223,7 +227,7 @@
     <div class="row">
       <div>
         <div>Use BitTorrent</div>
-        <div class="muted">Connect to the BitTorrent swarm (µTP + DHT). While connected, the switches below choose whether you download from the swarm, seed back to it, or both.</div>
+        <div class="muted">Connect to the BitTorrent swarm. While connected, the switches below choose whether you download from the swarm, seed back to it, or both — and how it finds and connects to peers.</div>
       </div>
       <label class="switch"><input type="checkbox" bind:checked={s.bt_enabled} on:change={save} /><span></span></label>
     </div>
@@ -246,6 +250,34 @@
         </div>
         <label class="switch"><input type="checkbox" bind:checked={s.bt_use_public_trackers} on:change={save} disabled={!s.bt_enabled} /><span></span></label>
       </div>
+      <div class="row">
+        <div>
+          <div>Enable DHT (decentralized network)</div>
+          <div class="muted">Find peers without any tracker via the mainline DHT. Off leaves trackers and Peer Exchange only — magnet fetches then need a reachable tracker. Applies on next launch.</div>
+        </div>
+        <label class="switch"><input type="checkbox" bind:checked={s.bt_dht} on:change={save} disabled={!s.bt_enabled} /><span></span></label>
+      </div>
+      <div class="row">
+        <div>
+          <div>Enable Local Peer Discovery</div>
+          <div class="muted">Find peers on your LAN via multicast. Peer Exchange (PeX) with connected peers is always on for public torrents. Applies on next launch.</div>
+        </div>
+        <label class="switch"><input type="checkbox" bind:checked={s.bt_lsd} on:change={save} disabled={!s.bt_enabled} /><span></span></label>
+      </div>
+      <div class="row">
+        <div>
+          <div>Use UPnP port forwarding</div>
+          <div class="muted">Ask the router to map the listen port so peers can reach you behind NAT (UPnP/IGD; NAT-PMP isn't supported). Applies on next launch.</div>
+        </div>
+        <label class="switch"><input type="checkbox" bind:checked={s.bt_upnp} on:change={save} disabled={!s.bt_enabled} /><span></span></label>
+      </div>
+      <div class="row">
+        <div>
+          <div>Anonymous mode</div>
+          <div class="muted">Hide the client identity: peers and trackers see a blank client name and an unbranded peer id. Your IP address stays visible to the swarm — only a SOCKS5 proxy hides that. Applies on next launch.</div>
+        </div>
+        <label class="switch"><input type="checkbox" bind:checked={s.bt_anonymous} on:change={save} disabled={!s.bt_enabled} /><span></span></label>
+      </div>
     </div>
     <p class="muted" style="margin-top:6px">
       Privacy: BitTorrent announces your IP address and the model's info-hash to the DHT
@@ -253,7 +285,22 @@
       that your IP is downloading or sharing that file. A SOCKS5 proxy routes this through
       the proxy; any other proxy still exposes your real IP to BitTorrent peers.
     </p>
-    <label class="field"><span>Preferred listen port (0 = default range)</span><input type="number" min="0" max="65535" bind:value={s.bt_port} on:change={save} disabled={!s.bt_enabled} /></label>
+    <div class="field">
+      <span>Preferred listen port (0 = default range)</span>
+      <div style="display:flex; gap:8px; align-items:center">
+        <input type="number" min="0" max="65535" bind:value={s.bt_port} on:change={save} disabled={!s.bt_enabled} style="flex:1" />
+        <button class="btn sm" type="button" on:click={randomPort} disabled={!s.bt_enabled}>Random</button>
+      </div>
+    </div>
+    <label class="field">
+      <span>Peer connection protocol</span>
+      <select bind:value={s.bt_protocol} on:change={save} disabled={!s.bt_enabled}>
+        <option value={0}>TCP and µTP</option>
+        <option value={1}>TCP</option>
+        <option value={2}>µTP</option>
+      </select>
+    </label>
+    <label class="field"><span>Max connections per torrent (0 = unlimited)</span><input type="number" min="0" max="10000" bind:value={s.bt_max_peers} on:change={save} disabled={!s.bt_enabled} /></label>
     <label class="field"><span>Upload cap (Mbps, 0 = unlimited)</span><input type="number" min="0" bind:value={s.bt_up_cap_mbps} on:change={save} disabled={!s.bt_enabled} /></label>
     <label class="field"><span>Download cap (Mbps, 0 = unlimited)</span><input type="number" min="0" bind:value={s.bt_down_cap_mbps} on:change={save} disabled={!s.bt_enabled} /></label>
     <label class="field"><span>Max concurrent transfers (applies on next launch)</span><input type="number" min="1" max="32" bind:value={s.bt_max_concurrent} on:change={save} /></label>
@@ -328,19 +375,19 @@
     <div class="section">Network</div>
     <div class="row">
       <div><div>Use a Hugging Face mirror</div></div>
-      <label class="switch"><input type="checkbox" bind:checked={s.hf_mirror_enabled} /><span></span></label>
+      <label class="switch"><input type="checkbox" bind:checked={s.hf_mirror_enabled} on:change={save} /><span></span></label>
     </div>
     {#if s.hf_mirror_enabled}
-      <label class="field"><span>Mirror URL</span><input bind:value={s.hf_mirror_url} placeholder="https://hf-mirror.com" /></label>
+      <label class="field"><span>Mirror URL</span><input bind:value={s.hf_mirror_url} on:change={save} placeholder="https://hf-mirror.com" /></label>
     {/if}
     <div class="row">
       <div><div>Route traffic through a proxy</div></div>
-      <label class="switch"><input type="checkbox" bind:checked={s.proxy_enabled} /><span></span></label>
+      <label class="switch"><input type="checkbox" bind:checked={s.proxy_enabled} on:change={save} /><span></span></label>
     </div>
     {#if s.proxy_enabled}
-      <label class="field"><span>Proxy URL</span><input bind:value={s.proxy_url} placeholder="socks5://127.0.0.1:1080" /></label>
+      <label class="field"><span>Proxy URL</span><input bind:value={s.proxy_url} on:change={save} placeholder="socks5://127.0.0.1:1080" /></label>
     {/if}
-    <label class="field"><span>Tracker URL</span><input bind:value={s.tracker_url} /></label>
+    <label class="field"><span>Tracker URL</span><input bind:value={s.tracker_url} on:change={save} /></label>
 
     <div class="section">Storage</div>
     <div class="row">

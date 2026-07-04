@@ -11,6 +11,7 @@
   let composer = null;
   let confirmDelete = null;
   let confirmShare = null;
+  let confirmStopShare = null;
   let toast = "";
 
   async function load() {
@@ -72,13 +73,36 @@
         }
       } catch (e) {}
     }
+    // Turning sharing OFF while peers are mid-download hard-disconnects them —
+    // confirm first instead of silently cutting the cord.
+    if (m.shareable) {
+      try {
+        const peers = await api.shareActivity(m.blake3);
+        if (peers > 0) {
+          confirmStopShare = { model: m, peers };
+          // Snap the checkbox back to on until the user confirms.
+          items = items;
+          return;
+        }
+      } catch (e) {}
+    }
+    await applyShare(m, !m.shareable);
+  }
+  async function applyShare(m, on) {
     try {
-      await api.setShare(m.blake3, m.sha256, !m.shareable);
-      m.shareable = !m.shareable;
+      await api.setShare(m.blake3, m.sha256, on);
+      m.shareable = on;
       items = items;
     } catch (e) {
       error = String(e);
     }
+  }
+  async function acceptStopShare() {
+    const c = confirmStopShare;
+    confirmStopShare = null;
+    if (!c) return;
+    await applyShare(c.model, false);
+    flash("Sharing stopped — peers disconnected");
   }
   async function acceptGatedShare() {
     const m = confirmShare;
@@ -307,6 +331,24 @@
       <div class="actions">
         <button class="btn" on:click={() => (confirmShare = null)}>Cancel</button>
         <button class="btn primary" on:click={acceptGatedShare}>Share it</button>
+      </div>
+    </div>
+  </div>
+{/if}
+{#if confirmStopShare}
+  <div class="modal-backdrop">
+    <div class="modal" style="max-width:440px">
+      <div class="modal-head"><h3>Stop sharing this model?</h3></div>
+      <p class="muted">
+        <strong>{confirmStopShare.peers}</strong>
+        {confirmStopShare.peers === 1 ? "peer is" : "peers are"} downloading
+        <strong> {confirmStopShare.model.name}</strong> from you right now.
+        Stopping cuts them off immediately — their downloads will fail over to
+        other peers if any exist.
+      </p>
+      <div class="actions">
+        <button class="btn" on:click={() => (confirmStopShare = null)}>Keep sharing</button>
+        <button class="btn danger" on:click={acceptStopShare}>Stop &amp; disconnect</button>
       </div>
     </div>
   </div>

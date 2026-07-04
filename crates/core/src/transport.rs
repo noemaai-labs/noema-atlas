@@ -78,6 +78,21 @@ impl std::fmt::Debug for StatsSink {
     }
 }
 
+/// The boxed future a [`PeerRefresh`] call returns.
+pub type PeerRefreshFut = std::pin::Pin<Box<dyn std::future::Future<Output = Vec<String>> + Send>>;
+
+/// Async provider re-query hook for swarm transports: returns the current node
+/// tickets for the artifact (typically a tracker `/providers` call), so an
+/// in-flight multi-peer fetch can add peers that come online mid-transfer.
+#[derive(Clone)]
+pub struct PeerRefresh(pub std::sync::Arc<dyn Fn() -> PeerRefreshFut + Send + Sync>);
+
+impl std::fmt::Debug for PeerRefresh {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PeerRefresh")
+    }
+}
+
 /// Persistence hook for a blob's *lifetime* BitTorrent upload, so the stop-at-ratio
 /// cap survives restarts (librqbit's own upload counter resets each session).
 /// Implemented by the engine's `Db`; kept as a narrow trait so the transport layer
@@ -114,6 +129,9 @@ pub struct FetchCtx {
     /// Rich live-stats sink (peers, upload) for swarm transports (BitTorrent).
     /// `None` for transports that only report bytes via `on_bytes`.
     pub on_stats: Option<StatsSink>,
+    /// Provider re-query hook so a multi-peer fetch can grow its swarm
+    /// mid-transfer. `None` for single-source transports.
+    pub peer_refresh: Option<PeerRefresh>,
 }
 
 /// An opened transfer: a byte stream plus where it actually starts (servers may
@@ -301,10 +319,15 @@ mod net {
 
     impl HttpClient {
         pub fn new(timeout: Duration, proxy: Option<&str>) -> Result<Self> {
+            // `read_timeout` (idle timeout between body reads), NOT `timeout` (a total
+            // request deadline). A multi-GB model download can legitimately run for
+            // longer than any fixed total deadline; bounding it by a *total* timeout
+            // kills healthy in-progress transfers. An idle timeout instead aborts only
+            // when no bytes arrive for `timeout`, which is what we actually want.
             let builder = Client::builder()
                 .user_agent(concat!("noema-atlas/", env!("CARGO_PKG_VERSION")))
                 .connect_timeout(Duration::from_secs(15))
-                .timeout(timeout);
+                .read_timeout(timeout);
             let client = super::apply_proxy(builder, proxy)?
                 .build()
                 .map_err(|e| Error::other(format!("http client: {e}")))?;
@@ -573,6 +596,10 @@ mod iroh_adapter {
     pub struct IrohAdapter {
         node: Mutex<Option<Arc<crate::iroh_node::IrohNode>>>,
         store_dir: std::path::PathBuf,
+        /// Fetches currently inside `open()` on the shared node. A cancelled fetch
+        /// may only tear that node down when it's the sole user — the endpoint is
+        /// shared, and closing it severs every other in-flight download.
+        in_flight: std::sync::atomic::AtomicUsize,
     }
 
     impl IrohAdapter {
@@ -580,6 +607,7 @@ mod iroh_adapter {
             IrohAdapter {
                 node: Mutex::new(None),
                 store_dir,
+                in_flight: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
@@ -642,16 +670,18 @@ mod iroh_adapter {
                 ));
             }
             let node = self.node().await?;
-            let scratch = self.store_dir.join("scratch");
-            std::fs::create_dir_all(&scratch).ok();
-            let tmp = scratch.join(format!(
-                "iroh-{}.tmp",
-                &blob_hash[..16.min(blob_hash.len())]
-            ));
-            // Clear any leftover from a prior aborted attempt: the export step
-            // refuses to overwrite, so a stale scratch file is what surfaced as
-            // "iroh transfer: export: File exists (os error 17)" on retry.
-            if tokio::fs::metadata(&tmp).await.is_ok() {
+            std::fs::create_dir_all(self.store_dir.join("scratch")).ok();
+            let tmp = crate::iroh_node::scratch_path(&self.store_dir, blob_hash);
+            // A stripe journal next to the scratch marks it as a resumable striped
+            // partial — keep both so Pause→Resume (or a retry) continues from the
+            // completed pieces. Any journal-less leftover is from a prior aborted
+            // single-peer attempt: clear it, since the export step refuses to
+            // overwrite (that stale file is what surfaced as "iroh transfer:
+            // export: File exists (os error 17)" on retry).
+            let journal = crate::iroh_node::stripe_journal_path(&tmp);
+            if tokio::fs::metadata(&tmp).await.is_ok()
+                && tokio::fs::metadata(&journal).await.is_err()
+            {
                 let _ = tokio::fs::remove_file(&tmp).await;
             }
             let cancel = ctx.cancel.clone();
@@ -661,7 +691,16 @@ mod iroh_adapter {
             let on_bytes = ctx.on_bytes.as_ref().map(|s| s.0.clone());
             // A full BlobTicket string also works; otherwise treat entries as
             // node tickets and fetch the blob by its blake3 hash.
+            self.in_flight
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let result = if blob_hash.len() == 64 {
+                // Provider re-query hook: lets the striped fetch add peers that
+                // appear mid-transfer (qBittorrent-style swarm growth).
+                let more_nodes: Option<crate::iroh_node::MoreNodes> =
+                    ctx.peer_refresh.as_ref().map(|r| {
+                        let r = r.0.clone();
+                        std::sync::Arc::new(move || r()) as crate::iroh_node::MoreNodes
+                    });
                 node.fetch_from_providers(
                     blob_hash,
                     tickets,
@@ -669,12 +708,15 @@ mod iroh_adapter {
                     artifact.size_bytes,
                     cancel,
                     on_bytes,
+                    more_nodes,
                 )
                 .await
             } else {
                 node.fetch_to_file(&tickets[0], &tmp, cancel, on_bytes)
                     .await
             };
+            self.in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             if matches!(result, Err(Error::Cancelled)) {
                 // Make Stop/Pause near-instant: hand *all* cleanup to a background
                 // task and return the moment the fetch aborts. Two steps would
@@ -693,30 +735,39 @@ mod iroh_adapter {
                     .as_ref()
                     .map(|d| d.load(std::sync::atomic::Ordering::SeqCst))
                     .unwrap_or(false);
+                // Only the sole user may take the shared node down: the endpoint is
+                // one QUIC socket serving every in-flight Iroh download, so pausing
+                // one transfer must not sever the others. When other fetches remain,
+                // the half-open-connection reset is skipped — the striped fetch's
+                // per-peer connect timeout and fail budget absorb a stale pooled
+                // connection on a later attempt.
+                let solo = self.in_flight.load(std::sync::atomic::Ordering::SeqCst) == 0;
+                let unseed_node = if discard { Some(node.clone()) } else { None };
                 drop(node); // release this call's handle; the cached one is taken next
-                let cached = self.take_node().await;
+                let cached = if solo { self.take_node().await } else { None };
                 let tmp = tmp.clone();
                 let blob_hash = blob_hash.clone();
                 let tickets = tickets.clone();
                 tokio::spawn(async move {
-                    if let Some(node) = &cached {
-                        if discard {
-                            let hex = if blob_hash.len() == 64 {
-                                Some(blob_hash)
-                            } else {
-                                crate::iroh_node::IrohNode::ticket_hash(tickets[0].as_str()).ok()
-                            };
-                            if let Some(hex) = hex {
-                                let _ = node.unseed(&hex).await;
-                            }
+                    if discard {
+                        let hex = if blob_hash.len() == 64 {
+                            Some(blob_hash)
+                        } else {
+                            crate::iroh_node::IrohNode::ticket_hash(tickets[0].as_str()).ok()
+                        };
+                        if let (Some(hex), Some(node)) = (hex, unseed_node.as_ref()) {
+                            let _ = node.unseed(&hex).await;
                         }
+                        let _ = tokio::fs::remove_file(&tmp).await;
+                        let _ = tokio::fs::remove_file(crate::iroh_node::stripe_journal_path(&tmp))
+                            .await;
+                    }
+                    drop(unseed_node);
+                    if let Some(node) = cached {
                         // Bounded close so a wedged endpoint can't pin this task.
                         node.shutdown_handle().await;
+                        drop(node);
                     }
-                    if discard {
-                        let _ = tokio::fs::remove_file(&tmp).await;
-                    }
-                    drop(cached);
                 });
             }
             // Preserve a user-cancel as `Cancelled` so the engine stops the whole
@@ -749,6 +800,10 @@ mod iroh_adapter {
                     match f.read(&mut buf).await {
                         Ok(0) => {
                             let _ = tokio::fs::remove_file(&cleanup).await;
+                            let _ = tokio::fs::remove_file(crate::iroh_node::stripe_journal_path(
+                                &cleanup,
+                            ))
+                            .await;
                             None
                         }
                         Ok(n) => {
@@ -784,6 +839,34 @@ pub use iroh_adapter::IrohAdapter;
 // ===========================================================================
 // BitTorrent adapter (librqbit) — magnet → one verified file → CAS
 // ===========================================================================
+
+/// Remove the announce (`tr=`) parameters from an untrusted magnet URI, keeping the
+/// info-hash (`xt`) and descriptive params. A hostile magnet (from a share link or
+/// an Explore catalog row) could otherwise list attacker-controlled trackers and
+/// make us announce our IP + the model's info-hash to them — and a `udp://` tracker
+/// bypasses any configured socks5 proxy. Discovery still works via DHT and our own
+/// proxy-aware tracker list, attached separately as an `AddTorrentOptions` field.
+#[cfg(feature = "bittorrent")]
+fn strip_magnet_trackers(magnet: &str) -> String {
+    let Some((base, query)) = magnet.split_once('?') else {
+        return magnet.to_string();
+    };
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|kv| {
+            let key = kv.split('=').next().unwrap_or("").to_ascii_lowercase();
+            // `tr` (and the older `tr.N` form) are announce URLs; `ws`/`as`/`xs` are
+            // alternate web-seed/source URLs — all peer-controlled fetch targets we
+            // refuse to honor from an untrusted magnet.
+            !(key == "tr" || key.starts_with("tr.") || key == "ws" || key == "as" || key == "xs")
+        })
+        .collect();
+    if kept.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{}", kept.join("&"))
+    }
+}
 
 /// Choose which file in a (possibly multi-file) torrent matches the artifact we
 /// want. Exact basename+size first; then a size-only fallback *only* when exactly
@@ -823,8 +906,8 @@ mod bittorrent_adapter {
     use super::*;
     use librqbit::api::Api;
     use librqbit::{
-        AddTorrent, AddTorrentOptions, ConnectionOptions, ListenerMode, ListenerOptions, Session,
-        SessionOptions, SessionPersistenceConfig,
+        AddTorrent, AddTorrentOptions, ConnectionOptions, DhtSessionConfig, ListenerMode,
+        ListenerOptions, Session, SessionOptions, SessionPersistenceConfig,
     };
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -877,6 +960,15 @@ mod bittorrent_adapter {
     /// value past `u32::MAX`, clamped) means unlimited → `None`.
     fn bps_to_limit(bps: u64) -> Option<std::num::NonZeroU32> {
         std::num::NonZeroU32::new(bps.min(u32::MAX as u64) as u32)
+    }
+
+    /// A fully random peer id with no Azureus-style client prefix, so peers and
+    /// trackers can't fingerprint the client from it (anonymous mode).
+    fn random_peer_id() -> librqbit::dht::Id20 {
+        use rand_core::{OsRng, RngCore};
+        let mut b = [0u8; 20];
+        OsRng.fill_bytes(&mut b);
+        librqbit::dht::Id20::new(b)
     }
 
     /// Normalize librqbit's `ConnectionKind` (not nameable outside the crate, but it
@@ -1027,6 +1119,16 @@ mod bittorrent_adapter {
         listen_ports: Option<std::ops::Range<u16>>,
         /// Whether to attempt UPnP/NAT-PMP port mapping when `seed`.
         enable_upnp: bool,
+        /// Join the mainline DHT for peer discovery (see `TransportConfig`).
+        enable_dht: bool,
+        /// Multicast Local Service Discovery (BEP-14) for LAN peers.
+        enable_lsd: bool,
+        /// Transports peer connections may use (TCP / µTP / both).
+        peer_protocol: BtPeerProtocol,
+        /// Max concurrent connected peers per torrent (`0` = unlimited).
+        max_peers_per_torrent: u32,
+        /// Hide the client identity (blank client string + unbranded peer id).
+        anonymous: bool,
         /// Per-direction rate caps in bytes/sec applied to the librqbit session
         /// (`0` = unlimited). Bytes/sec, clamped to `u32` for librqbit's limiter.
         up_bps: u64,
@@ -1089,33 +1191,28 @@ mod bittorrent_adapter {
     }
 
     impl BittorrentAdapter {
-        #[allow(clippy::too_many_arguments)]
-        pub fn new(
-            store_dir: std::path::PathBuf,
-            proxy: Option<String>,
-            seed: bool,
-            listen_ports: Option<std::ops::Range<u16>>,
-            enable_upnp: bool,
-            up_bps: u64,
-            down_bps: u64,
-            use_public_trackers: bool,
-            max_ratio: f64,
-            sequential: bool,
-            upload_store: Option<Arc<dyn BtUploadStore>>,
-        ) -> Self {
+        /// Build from the `bittorrent_*` (and app `proxy`) fields of the transport
+        /// config. `upload_store` persists lifetime upload for the stop-at-ratio
+        /// cap; `None` degrades the cap to per-session.
+        pub fn new(cfg: &TransportConfig, upload_store: Option<Arc<dyn BtUploadStore>>) -> Self {
             BittorrentAdapter {
                 session: OnceCell::new(),
-                store_dir,
-                proxy,
-                seed,
-                listen_ports,
-                enable_upnp,
-                up_bps,
-                down_bps,
-                use_public_trackers,
-                max_ratio: Arc::new(AtomicU64::new(max_ratio.to_bits())),
+                store_dir: cfg.bittorrent_store_dir.clone(),
+                proxy: cfg.proxy.clone(),
+                seed: cfg.bittorrent_seed,
+                listen_ports: cfg.bittorrent_listen_port_range.clone(),
+                enable_upnp: cfg.bittorrent_enable_upnp,
+                enable_dht: cfg.bittorrent_enable_dht,
+                enable_lsd: cfg.bittorrent_enable_lsd,
+                peer_protocol: cfg.bittorrent_peer_protocol,
+                max_peers_per_torrent: cfg.bittorrent_max_peers_per_torrent,
+                anonymous: cfg.bittorrent_anonymous,
+                up_bps: cfg.bittorrent_max_up_bps,
+                down_bps: cfg.bittorrent_max_down_bps,
+                use_public_trackers: cfg.bittorrent_use_public_trackers,
+                max_ratio: Arc::new(AtomicU64::new(cfg.bittorrent_max_ratio.to_bits())),
                 blob_max_ratio: Arc::new(Mutex::new(HashMap::new())),
-                sequential: Arc::new(AtomicBool::new(sequential)),
+                sequential: Arc::new(AtomicBool::new(cfg.bittorrent_sequential)),
                 peer_samples: Arc::new(Mutex::new(HashMap::new())),
                 ratio_paused: Arc::new(Mutex::new(HashSet::new())),
                 upload_store,
@@ -1154,53 +1251,124 @@ mod bittorrent_adapter {
                         .filter(|p| p.starts_with("socks5"))
                         .map(|p| p.to_string());
                     let session_dir = self.store_dir.join("session");
-                    // A TCP+uTP listener (BEP-29): uTP lets us reach peers that only
-                    // speak uTP (and accept inbound), TCP covers the rest. UPnP port
-                    // mapping only when we intend to seed. Honor a configured port.
-                    let mut listener = ListenerOptions {
-                        mode: ListenerMode::TcpAndUtp,
-                        enable_upnp_port_forwarding: self.seed && self.enable_upnp,
-                        ..Default::default()
-                    };
-                    if let Some(range) = &self.listen_ports {
-                        listener.listen_addr =
-                            (std::net::Ipv6Addr::UNSPECIFIED, range.start).into();
-                    }
                     // User-configured speed caps (bytes/sec; `0` = unlimited). librqbit's
                     // limiter is a `NonZeroU32`, so clamp to u32 and map 0 → None.
                     let ratelimits = librqbit::limits::LimitsConfig {
                         upload_bps: bps_to_limit(self.up_bps),
                         download_bps: bps_to_limit(self.down_bps),
                     };
-                    let mk_opts = |listen: Option<ListenerOptions>| SessionOptions {
-                        listen,
-                        // Only a socks5 proxy can carry peer traffic (filtered above).
-                        connect: socks_proxy_url.clone().map(|p| ConnectionOptions {
-                            proxy_url: Some(p),
+                    let mk_opts = |listen: Option<ListenerOptions>| {
+                        // µTP dials out from the inbound listener's socket, so with
+                        // no listener bound "µTP only" would leave no way to reach
+                        // peers at all — outbound TCP stays on in that case.
+                        let enable_tcp = self.peer_protocol != BtPeerProtocol::UtpOnly
+                            || listen.is_none();
+                        SessionOptions {
+                            listen,
+                            connect: Some(ConnectionOptions {
+                                enable_tcp,
+                                // Only a socks5 proxy can carry peer traffic (filtered above).
+                                proxy_url: socks_proxy_url.clone(),
+                                ..Default::default()
+                            }),
+                            // Decentralized peer discovery: mainline DHT + LAN
+                            // multicast (LSD), each behind its user toggle. PeX has
+                            // no librqbit toggle (always on for public torrents).
+                            dht: self.enable_dht.then(DhtSessionConfig::default),
+                            disable_local_service_discovery: !self.enable_lsd,
+                            // Session-wide default cap on concurrent connected peers
+                            // per torrent; librqbit has no global-across-torrents cap.
+                            peer_limit: (self.max_peers_per_torrent > 0)
+                                .then_some(self.max_peers_per_torrent as usize),
+                            // Anonymous mode: blank client string (peer extended
+                            // handshake + tracker user-agent, like libtorrent's
+                            // anonymous_mode) and an unbranded random peer id,
+                            // instead of advertising "rqbit <version>".
+                            peer_id: self.anonymous.then(random_peer_id),
+                            client_name_and_version: self.anonymous.then(String::new),
+                            ratelimits,
+                            // Persistent: re-attach in-progress torrents + restore piece
+                            // state quickly, so pause/restart resumes rather than restarts.
+                            persistence: Some(SessionPersistenceConfig::Json {
+                                folder: Some(session_dir.clone()),
+                            }),
+                            fastresume: true,
                             ..Default::default()
-                        }),
-                        ratelimits,
-                        // Persistent: re-attach in-progress torrents + restore piece
-                        // state quickly, so pause/restart resumes rather than restarts.
-                        persistence: Some(SessionPersistenceConfig::Json {
-                            folder: Some(session_dir.clone()),
-                        }),
-                        fastresume: true,
+                        }
+                    };
+                    // A fresh listener in the configured mode (TCP / µTP BEP-29 /
+                    // both) bound to `port`; UPnP mapping only when we intend to
+                    // seed. Rebuilt per attempt so we can walk the configured range
+                    // instead of giving up after the first port.
+                    let mk_listener = |port: u16| ListenerOptions {
+                        mode: match self.peer_protocol {
+                            BtPeerProtocol::TcpAndUtp => ListenerMode::TcpAndUtp,
+                            BtPeerProtocol::TcpOnly => ListenerMode::TcpOnly,
+                            BtPeerProtocol::UtpOnly => ListenerMode::UtpOnly,
+                        },
+                        listen_addr: (std::net::Ipv6Addr::UNSPECIFIED, port).into(),
+                        enable_upnp_port_forwarding: self.seed && self.enable_upnp,
                         ..Default::default()
                     };
-                    // Best-effort: if binding the listener fails (e.g. the port is
-                    // taken), retry with none — DHT + outbound TCP/uTP still work.
-                    let mut sess =
-                        Session::new_with_opts(scratch.clone(), mk_opts(Some(listener))).await;
-                    if sess.is_err() {
-                        sess = Session::new_with_opts(scratch.clone(), mk_opts(None)).await;
-                    }
+                    // `listen_ports == None` means "inbound listening disabled" (DHT +
+                    // outbound only) — honor it literally. Otherwise walk the range and
+                    // bind the FIRST free port; only if every port is taken do we fall
+                    // back to no inbound listener. (Previously only `range.start` was
+                    // tried, so one busy port silently dropped inbound TCP *and* uTP for
+                    // the whole run even when the rest of the user's range was free.)
+                    let sess = match &self.listen_ports {
+                        None => Session::new_with_opts(scratch.clone(), mk_opts(None)).await,
+                        Some(range) => {
+                            let mut last = None;
+                            for port in range.clone() {
+                                match Session::new_with_opts(
+                                    scratch.clone(),
+                                    mk_opts(Some(mk_listener(port))),
+                                )
+                                .await
+                                {
+                                    Ok(s) => {
+                                        last = Some(Ok(s));
+                                        break;
+                                    }
+                                    Err(e) => last = Some(Err(e)),
+                                }
+                            }
+                            match last {
+                                Some(Ok(s)) => Ok(s),
+                                // Whole range busy (or empty range): DHT + outbound only.
+                                _ => Session::new_with_opts(scratch.clone(), mk_opts(None)).await,
+                            }
+                        }
+                    };
                     let sess = sess.map_err(|e| {
                         Error::transport(
                             "bittorrent",
                             TransportErrorKind::Other(format!("session init: {e}")),
                         )
                     })?;
+                    // Consent: if seeding is disabled, tear down any *completed* seed
+                    // torrents that librqbit auto-revived from persistence at init.
+                    // Persistence is all-or-nothing per session folder, so it re-attaches
+                    // finished seeds (which would upload to peers — and *uncapped*, since
+                    // the ratio watcher below only runs when `self.seed`) alongside the
+                    // incomplete downloads we DO want to resume. Drop only the finished
+                    // ones; `delete_files: false` keeps the bytes on disk so re-enabling
+                    // seeding (the engine's launch re-seed) can re-add them. Without this,
+                    // turning "Seed over BitTorrent" off does not actually stop seeding.
+                    if !self.seed {
+                        let finished: Vec<TorrentId> = sess.with_torrents(|torrents| {
+                            torrents
+                                .filter(|(_, h)| h.stats().finished)
+                                .map(|(id, _)| id)
+                                .collect()
+                        });
+                        for id in finished {
+                            if let Err(e) = sess.delete(id.into(), false).await {
+                                tracing::warn!(id, error = %e, "bittorrent: failed to drop revived seed torrent");
+                            }
+                        }
+                    }
                     // Sweep orphaned per-fetch scratch dirs left by a crash or an
                     // early-dropped stream from a *prior* run. Only delete a `dl-*`
                     // dir that no current torrent points at — a paused/in-progress BT
@@ -1743,6 +1911,28 @@ mod bittorrent_adapter {
             let Source::BittorrentV2 { magnet_uri, .. } = source else {
                 return Err(adapter_mismatch());
             };
+            // Trust boundary: reject anything that isn't a real magnet URI (or a bare
+            // 40-hex v1 info-hash) BEFORE handing it to librqbit. Its add path treats an
+            // `http(s)://` "magnet" as a .torrent URL and GETs it — SSRF to attacker- or
+            // internal/metadata hosts plus unbounded response buffering — which the
+            // tracker-stripping below (a query-param filter) does not prevent.
+            let trimmed = magnet_uri.trim_start();
+            let is_magnet = trimmed.to_ascii_lowercase().starts_with("magnet:")
+                || (trimmed.len() == 40 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()));
+            if !is_magnet {
+                return Err(transport(
+                    source,
+                    TransportErrorKind::Other("refusing non-magnet BitTorrent URI".into()),
+                ));
+            }
+            // The magnet comes from a fully untrusted source (a pasted share link or
+            // an Explore catalog row any peer can announce). Strip its embedded `tr=`
+            // announce URLs so we never announce our IP + the info-hash to an
+            // attacker-chosen tracker — especially udp://, which would leak the real
+            // IP even with a socks5 proxy set. DHT plus our own proxy-filtered tracker
+            // list (below) remain as discovery.
+            let magnet_uri = strip_magnet_trackers(magnet_uri);
+            let magnet_uri = magnet_uri.as_str();
             let session = self.session().await?;
             // Layer the public trackers onto a magnet-only add (gated), so a magnet
             // that carries no announce-list still joins them beyond DHT. With a proxy
@@ -1762,18 +1952,25 @@ mod bittorrent_adapter {
                 .unwrap_or(METADATA_TIMEOUT);
 
             // --- 1. Resolve metadata (list_only) to choose the right file. -------
-            let listed = tokio::time::timeout(
-                meta_timeout,
-                session.add_torrent(
-                    AddTorrent::from_url(magnet_uri.as_str()),
-                    Some(AddTorrentOptions {
-                        list_only: true,
-                        trackers: trackers.clone(),
-                        ..Default::default()
-                    }),
+            // Raced against the user's Stop: metadata on a dead swarm can sit for
+            // the full minute, and librqbit's add has no cancellation of its own —
+            // without the race this was the longest window where a Stop appeared
+            // to do nothing.
+            let listed = race_cancel(
+                &ctx.cancel,
+                tokio::time::timeout(
+                    meta_timeout,
+                    session.add_torrent(
+                        AddTorrent::from_url(magnet_uri),
+                        Some(AddTorrentOptions {
+                            list_only: true,
+                            trackers: trackers.clone(),
+                            ..Default::default()
+                        }),
+                    ),
                 ),
             )
-            .await
+            .await?
             .map_err(|_| transport(source, TransportErrorKind::Timeout))?
             .map_err(|e| transport(source, TransportErrorKind::Other(e.to_string())))?;
             let info = match listed {
@@ -1805,20 +2002,29 @@ mod bittorrent_adapter {
                 file_idx
             ));
             std::fs::create_dir_all(&out_dir).map_err(|e| Error::fs(&out_dir, e))?;
-            let added = session
-                .add_torrent(
-                    AddTorrent::from_url(magnet_uri.as_str()),
-                    Some(AddTorrentOptions {
-                        only_files: Some(vec![file_idx]),
-                        output_folder: Some(out_dir.to_string_lossy().into_owned()),
-                        overwrite: true,
-                        trackers: trackers.clone(),
-                        sequential: self.sequential.load(Ordering::Relaxed),
-                        ..Default::default()
-                    }),
-                )
-                .await
-                .map_err(|e| transport(source, TransportErrorKind::Other(e.to_string())))?;
+            // Bounded + cancel-raced like the metadata step: this add normally
+            // returns fast (metadata is already resolved), but a wedged session
+            // would otherwise block a Stop indefinitely.
+            let added = race_cancel(
+                &ctx.cancel,
+                tokio::time::timeout(
+                    meta_timeout,
+                    session.add_torrent(
+                        AddTorrent::from_url(magnet_uri),
+                        Some(AddTorrentOptions {
+                            only_files: Some(vec![file_idx]),
+                            output_folder: Some(out_dir.to_string_lossy().into_owned()),
+                            overwrite: true,
+                            trackers: trackers.clone(),
+                            sequential: self.sequential.load(Ordering::Relaxed),
+                            ..Default::default()
+                        }),
+                    ),
+                ),
+            )
+            .await?
+            .map_err(|_| transport(source, TransportErrorKind::Timeout))?
+            .map_err(|e| transport(source, TransportErrorKind::Other(e.to_string())))?;
             let handle = added.into_handle().ok_or_else(|| {
                 transport(
                     source,
@@ -2016,6 +2222,31 @@ mod bittorrent_adapter {
     /// abort the promotion before the torrent is added (a race the detached spawn
     /// would otherwise lose, leaking a seed for a model the user just stopped). If we
     /// do add it, its id is recorded in `seeds` so a *later* unseed can delete it.
+    /// Removes this promotion from the blob's `seeds` entry when the promotion task
+    /// ends, so a *failed* promotion (reflink/create/serialize error, or a lost
+    /// `wanted` race) leaves no phantom "Seeding" state behind — `is_seeding` reads
+    /// the map's presence, and a stuck entry also blocks every later re-seed attempt.
+    /// On the success path the promotion has already been moved into `torrent_ids`, so
+    /// the retain is a no-op and the (non-empty) entry is kept.
+    struct PromotionGuard {
+        seeds: Arc<Mutex<HashMap<String, SeedEntry>>>,
+        blake3: String,
+        wanted: Arc<AtomicBool>,
+    }
+    impl Drop for PromotionGuard {
+        fn drop(&mut self) {
+            let mut guard = self.seeds.lock().unwrap();
+            if let Some(entry) = guard.get_mut(&self.blake3) {
+                entry
+                    .promotions
+                    .retain(|p| !Arc::ptr_eq(&p.wanted, &self.wanted));
+                if entry.promotions.is_empty() && entry.torrent_ids.is_empty() {
+                    guard.remove(&self.blake3);
+                }
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn seed_promote(
         session: Arc<Session>,
@@ -2031,6 +2262,14 @@ mod bittorrent_adapter {
         ratio_paused: Arc<Mutex<HashSet<String>>>,
         upload_store: Option<Arc<dyn BtUploadStore>>,
     ) {
+        // Ensures this promotion is removed from `seeds` on every early return below;
+        // the success path's own bookkeeping (moving it into `torrent_ids`) makes the
+        // guard a no-op there.
+        let _prom_guard = PromotionGuard {
+            seeds: seeds.clone(),
+            blake3: blake3.clone(),
+            wanted: wanted.clone(),
+        };
         let fname = {
             let b = super::basename(&name);
             if b.is_empty() {
@@ -2233,6 +2472,9 @@ pub struct Transports {
 /// Construction options for the transport registry.
 #[derive(Debug, Clone)]
 pub struct TransportConfig {
+    /// Idle timeout for HTTP-family transports: a request is aborted only when no
+    /// bytes arrive for this long (reqwest `read_timeout`), NOT a total deadline —
+    /// a multi-GB download can legitimately run longer than any fixed total.
     pub request_timeout: Duration,
     /// Hugging Face Hub origin used for *downloads* (resolve URLs). Set this to an
     /// HF mirror (e.g. `https://hf-mirror.com`) to fetch weights through it.
@@ -2263,7 +2505,8 @@ pub struct TransportConfig {
     /// Inbound listen-port range (best-effort; falls back to outbound + DHT only
     /// when none are free). `None` disables inbound listening.
     pub bittorrent_listen_port_range: Option<std::ops::Range<u16>>,
-    /// Enable UPnP / NAT-PMP port mapping for inbound BitTorrent connectivity.
+    /// Enable UPnP port mapping for inbound BitTorrent connectivity (UPnP/IGD only;
+    /// librqbit has no NAT-PMP/PCP support).
     pub bittorrent_enable_upnp: bool,
     /// Per-direction BitTorrent rate caps in bytes/sec (`0` = unlimited).
     pub bittorrent_max_up_bps: u64,
@@ -2278,6 +2521,53 @@ pub struct TransportConfig {
     /// Download BitTorrent pieces in order (sequential) instead of first/last/rarest.
     /// Off by default; useful for streaming/early-preview, slightly slower overall.
     pub bittorrent_sequential: bool,
+    /// Join the mainline DHT for decentralized peer discovery. On by default. Off
+    /// leaves only trackers + PeX, so magnet-only fetches need a reachable tracker.
+    pub bittorrent_enable_dht: bool,
+    /// Multicast Local Service Discovery (BEP-14) to find peers on the same LAN.
+    pub bittorrent_enable_lsd: bool,
+    /// Which transports BitTorrent peer connections may use (TCP / µTP / both),
+    /// applied to the inbound listener and outbound dialing.
+    pub bittorrent_peer_protocol: BtPeerProtocol,
+    /// Max concurrent connected peers per torrent (`0` = unlimited, librqbit's
+    /// default). There is no librqbit knob for a *global* connection cap.
+    pub bittorrent_max_peers_per_torrent: u32,
+    /// Anonymous mode: blank the client name/version peers and trackers see and use
+    /// an unbranded (fully random) peer id, instead of advertising rqbit. The IP
+    /// address is still visible to the swarm — only a proxy hides that.
+    pub bittorrent_anonymous: bool,
+}
+
+/// Which transports BitTorrent uses for peer connections — the inbound listener
+/// mode and outbound dialing. µTP requires the inbound listener (outbound µTP
+/// dials from the same socket); with inbound listening disabled, outbound falls
+/// back to TCP regardless, since µTP-only would otherwise mean no connectivity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BtPeerProtocol {
+    #[default]
+    TcpAndUtp,
+    TcpOnly,
+    UtpOnly,
+}
+
+impl BtPeerProtocol {
+    /// Stable numeric encoding for settings files (`0` = TCP and µTP).
+    pub fn as_u8(self) -> u8 {
+        match self {
+            BtPeerProtocol::TcpAndUtp => 0,
+            BtPeerProtocol::TcpOnly => 1,
+            BtPeerProtocol::UtpOnly => 2,
+        }
+    }
+
+    /// Inverse of [`Self::as_u8`]; unknown values fall back to TCP and µTP.
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => BtPeerProtocol::TcpOnly,
+            2 => BtPeerProtocol::UtpOnly,
+            _ => BtPeerProtocol::TcpAndUtp,
+        }
+    }
 }
 
 impl Default for TransportConfig {
@@ -2300,6 +2590,11 @@ impl Default for TransportConfig {
             bittorrent_use_public_trackers: true,
             bittorrent_max_ratio: 0.0,
             bittorrent_sequential: false,
+            bittorrent_enable_dht: true,
+            bittorrent_enable_lsd: true,
+            bittorrent_peer_protocol: BtPeerProtocol::default(),
+            bittorrent_max_peers_per_torrent: 0,
+            bittorrent_anonymous: false,
         }
     }
 }
@@ -2332,16 +2627,7 @@ impl Transports {
             iroh_enabled: cfg.iroh_enabled,
             #[cfg(feature = "bittorrent")]
             bittorrent: std::sync::Arc::new(bittorrent_adapter::BittorrentAdapter::new(
-                cfg.bittorrent_store_dir.clone(),
-                cfg.proxy.clone(),
-                cfg.bittorrent_seed,
-                cfg.bittorrent_listen_port_range.clone(),
-                cfg.bittorrent_enable_upnp,
-                cfg.bittorrent_max_up_bps,
-                cfg.bittorrent_max_down_bps,
-                cfg.bittorrent_use_public_trackers,
-                cfg.bittorrent_max_ratio,
-                cfg.bittorrent_sequential,
+                cfg,
                 bt_upload_store,
             )),
             #[cfg(feature = "bittorrent")]
@@ -2609,6 +2895,31 @@ fn transport(source: &Source, kind: TransportErrorKind) -> Error {
     Error::transport(source.source_id(), kind)
 }
 
+/// Race a future against the fetch's cooperative cancel flag, so a user Stop
+/// lands promptly even inside library calls that offer no cancellation of their
+/// own (librqbit's `add_torrent` can block for its full timeout on a dead swarm).
+async fn race_cancel<T>(
+    cancel: &Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    fut: impl std::future::Future<Output = T>,
+) -> Result<T> {
+    let cancelled = async {
+        loop {
+            if cancel
+                .as_ref()
+                .map(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+                .unwrap_or(false)
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+    };
+    tokio::select! {
+        r = fut => Ok(r),
+        _ = cancelled => Err(Error::Cancelled),
+    }
+}
+
 /// Small extension so we can attach an io error context to a transport error.
 trait ErrCtx {
     fn context_io(self, e: std::io::Error) -> Error;
@@ -2732,5 +3043,23 @@ mod tests {
         // A single-file torrent: take it regardless of name; the engine verifies.
         let one = vec![("whatever.gguf".to_string(), 555u64)];
         assert_eq!(pick_torrent_file(&one, "model.gguf", 999), Some(0));
+    }
+
+    #[cfg(feature = "bittorrent")]
+    #[test]
+    fn magnet_trackers_are_stripped() {
+        let m = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567\
+                 &dn=model.gguf&tr=udp%3A%2F%2Fattacker%3A6969&tr=http://evil/announce\
+                 &ws=http://evil/file";
+        let out = strip_magnet_trackers(m);
+        assert!(out.contains("xt=urn:btih:"));
+        assert!(out.contains("dn=model.gguf"));
+        assert!(
+            !out.contains("tr="),
+            "announce trackers must be removed: {out}"
+        );
+        assert!(!out.contains("ws="), "web seeds must be removed: {out}");
+        // A magnet with no query is returned unchanged.
+        assert_eq!(strip_magnet_trackers("magnet:foo"), "magnet:foo");
     }
 }

@@ -15,7 +15,7 @@ async fn seed_and_fetch(provider: &IrohNode, fetcher: &IrohNode, src: &Path, des
     let ticket = provider.node_ticket().await.expect("ticket");
     let size = std::fs::metadata(src).unwrap().len();
     fetcher
-        .fetch_from_providers(&blake3, &[ticket], dest, size, None, None)
+        .fetch_from_providers(&blake3, &[ticket], dest, size, None, None, None)
         .await
         .is_ok()
 }
@@ -63,7 +63,7 @@ async fn unseed_and_disconnect_stops_serving() {
     let dest1 = tmp.path().join("out1.bin");
     assert!(provider.metrics().active_uploads_for_hex(&blake3).eq(&0));
     assert!(fetcher
-        .fetch_from_providers(&blake3, &[ticket.clone()], &dest1, size, None, None)
+        .fetch_from_providers(&blake3, &[ticket.clone()], &dest1, size, None, None, None)
         .await
         .is_ok());
     provider
@@ -72,7 +72,7 @@ async fn unseed_and_disconnect_stops_serving() {
         .expect("unseed");
     let dest2 = tmp.path().join("out2.bin");
     let fetched = fetcher
-        .fetch_from_providers(&blake3, &[ticket], &dest2, size, None, None)
+        .fetch_from_providers(&blake3, &[ticket], &dest2, size, None, None, None)
         .await;
     assert!(
         fetched.is_err(),
@@ -107,7 +107,7 @@ async fn hard_disconnects_a_peer_mid_transfer() {
     let t = ticket.clone();
     let d = dest.clone();
     let fetch = tokio::spawn(async move {
-        f.fetch_from_providers(&b3, &[t], &d, size, None, None)
+        f.fetch_from_providers(&b3, &[t], &d, size, None, None, None)
             .await
     });
 
@@ -175,7 +175,7 @@ async fn aggregates_one_blob_from_two_peers() {
     ];
     let dest = tmp.path().join("out.bin");
     fetcher
-        .fetch_from_providers(&b1, &tickets, &dest, bytes.len() as u64, None, None)
+        .fetch_from_providers(&b1, &tickets, &dest, bytes.len() as u64, None, None, None)
         .await
         .expect("striped fetch from two peers should succeed");
 

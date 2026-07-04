@@ -13,6 +13,29 @@
   // Newest first, keyed by transfer_id for stable rendering.
   $: rows = Object.entries(transfers).map(([id, t]) => ({ id, ...t }));
 
+  // Per-transfer available routes ("iroh"/"bt"/"https"/"hf"), fetched once per
+  // card so the row can show standby paths next to the active one.
+  let routes = {};
+  $: for (const t of rows) {
+    if (routes[t.id] === undefined) {
+      routes[t.id] = null;
+      api
+        .transferRoutes(t.id)
+        .then((r) => (routes = { ...routes, [t.id]: r }))
+        .catch(() => (routes = { ...routes, [t.id]: [] }));
+    }
+  }
+  function routeClassOf(src) {
+    if (!src) return "";
+    const s = String(src).trim().toLowerCase();
+    if (s.startsWith("iroh:")) return "iroh";
+    if (s.startsWith("https:")) return "https";
+    if (s.startsWith("hf:")) return "hf";
+    if (s.startsWith("btv2:") || s.startsWith("bittorrent") || s.startsWith("magnet:")) return "bt";
+    return "";
+  }
+  const routeLabels = { iroh: "Iroh", bt: "BitTorrent", https: "HTTPS", hf: "Hugging Face" };
+
   // Whether the header bulk actions are useful: at least one live (pauseable) row,
   // or at least one resumable (paused / waiting) row.
   $: anyActive = rows.some((t) => isActive(t.phase));
@@ -112,9 +135,26 @@
         return "Done";
       case "stopped":
         return "Stopped";
+      case "source-failed":
+        return "Switching source…";
       default:
         return p;
     }
+  }
+
+  // Map the engine's raw source id (hf:… / https:… / iroh:<hash> / btv2:<magnet> /
+  // file:…) to a friendly transport label, matching Atlas — so a full magnet URI or a
+  // 52-char blob hash never lands in the caption.
+  function sourceLabel(src) {
+    if (!src) return "";
+    const s = String(src).trim().toLowerCase();
+    if (s.startsWith("iroh:")) return "a worldwide peer";
+    if (s.startsWith("https:")) return "an HTTPS mirror";
+    if (s.startsWith("hf:")) return "Hugging Face";
+    if (s.startsWith("btv2:") || s.startsWith("bittorrent") || s.startsWith("magnet:"))
+      return "the BitTorrent swarm";
+    if (s.startsWith("file:")) return "a local file";
+    return src;
   }
 
   function fmtEta(s) {
@@ -210,10 +250,24 @@
             {#if rowFormat(null, t.artifact)}<span class="pill fmt f-{formatId(null, t.artifact)}">{rowFormat(null, t.artifact)}</span>{/if}
           </div>
           <div class="muted">
-            {phaseLabel(t.phase)}{t.source ? " · " + t.source : ""}{t.peers
+            {phaseLabel(t.phase)}{t.source ? " · " + sourceLabel(t.source) : ""}{t.peers
               ? " · " + t.peers + (t.peers === 1 ? " peer" : " peers")
               : ""}
           </div>
+          {#if (routes[t.id] || []).length > 1}
+            <div class="paths">
+              <span class="muted">Paths</span>
+              {#each routes[t.id] as r}
+                <span
+                  class="pill {routeClassOf(t.source) === r ? 'ok' : 'standby'}"
+                  title={routeClassOf(t.source) === r
+                    ? "Downloading on this path now"
+                    : "On standby — switches over automatically if the active path stalls"}
+                  >{routeLabels[r] || r}</span
+                >
+              {/each}
+            </div>
+          {/if}
         </div>
         {#if queuePos[t.id] != null}
           <span class="muted qpos" title="Position in the download queue">#{queuePos[t.id] + 1}</span>

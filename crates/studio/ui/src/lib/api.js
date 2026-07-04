@@ -7,8 +7,13 @@ export const api = {
   search: (query) => invoke("search_models", { query }),
   popular: () => invoke("popular_models"),
   modelDetail: (id) => invoke("model_detail", { id }),
-  download: (id, file, clientRef) =>
-    invoke("download_model", { id, file: file ?? null, clientRef: clientRef ?? null }),
+  download: (id, file, clientRef, bundle) =>
+    invoke("download_model", {
+      id,
+      file: file ?? null,
+      bundle: bundle ?? null,
+      clientRef: clientRef ?? null,
+    }),
   resumeDownload: (manifestId) => invoke("resume_download", { manifestId }),
   mesh: (query) => invoke("mesh_search", { query }),
   addByLink: (link, clientRef) =>
@@ -35,6 +40,8 @@ export const api = {
   library: () => invoke("list_library"),
   install: (manifestId, target) => invoke("install_model", { manifestId, target }),
   setShare: (blake3, sha256, on) => invoke("set_share", { blake3, sha256, on }),
+  shareActivity: (blake3) => invoke("share_activity", { blake3 }),
+  transferRoutes: (manifestId) => invoke("transfer_routes", { manifestId }),
   shareNeedsConfirmation: (manifestId) =>
     invoke("share_needs_confirmation", { manifestId }),
   confirmGatedShare: (blake3, sha256) =>

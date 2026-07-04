@@ -1,6 +1,7 @@
 use axum::{
-    extract::{Path as AxPath, State},
-    http::StatusCode,
+    extract::{Path as AxPath, Request, State},
+    http::{header, Method, StatusCode},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -27,13 +28,79 @@ pub async fn run(engine: Arc<Engine>, addr: std::net::SocketAddr) -> anyhow::Res
         .route("/api/cache", get(api_cache))
         .route("/api/health", get(api_health))
         .route("/api/diagnostics", get(api_diagnostics))
+        .layer(middleware::from_fn(local_guard))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
     println!("noema ui: open http://{bound} in your browser");
-    axum::serve(listener, app).await?;
+    // Connect-info lets `local_guard` reject any non-loopback *peer* — the only
+    // unspoofable signal (a `Host`/`Origin` header is attacker-controlled).
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
+}
+
+/// Gate every request: it must look genuinely local and same-origin. The
+/// dashboard is an unauthenticated admin surface (it can import manifests, start
+/// downloads, and install/delete blobs at caller-chosen paths), so without this a
+/// page the user merely *visits* could drive it via the loopback address.
+///
+/// - A loopback `Host` header is required, which defeats DNS rebinding (a remote
+///   name resolving to 127.0.0.1 still carries its own `Host`).
+/// - State-changing methods must not be cross-site: browsers tag the request with
+///   `Sec-Fetch-Site`, and the dashboard's own JS additionally sends
+///   `X-Noema-Local`, which a cross-origin page cannot add without a CORS preflight
+///   that we never grant.
+async fn local_guard(req: Request, next: Next) -> Response {
+    // The unspoofable check: the peer's socket address must be loopback. This holds
+    // even if the server is bound to a public interface, and defeats DNS rebinding
+    // (a rebound request still originates from the remote peer's IP).
+    if let Some(axum::extract::ConnectInfo(peer)) = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+    {
+        if !peer.ip().is_loopback() {
+            return (StatusCode::FORBIDDEN, "remote connection rejected").into_response();
+        }
+    }
+    let host_ok = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .map(host_is_local)
+        .unwrap_or(false);
+    if !host_ok {
+        return (StatusCode::FORBIDDEN, "non-local Host header rejected").into_response();
+    }
+    if req.method() != Method::GET && req.method() != Method::HEAD {
+        let sfs = req
+            .headers()
+            .get("sec-fetch-site")
+            .and_then(|h| h.to_str().ok());
+        let cross_site =
+            matches!(sfs, Some(v) if v != "same-origin" && v != "same-site" && v != "none");
+        let has_token = req.headers().contains_key("x-noema-local");
+        if cross_site && !has_token {
+            return (StatusCode::FORBIDDEN, "cross-site request rejected").into_response();
+        }
+    }
+    next.run(req).await
+}
+
+/// Whether a `Host` header names the loopback interface (port and IPv6 brackets
+/// stripped). Anything else — including a rebinding domain — is rejected.
+fn host_is_local(host: &str) -> bool {
+    let h = host.trim();
+    let h = if let Some(rest) = h.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        h.rsplit_once(':').map(|(a, _)| a).unwrap_or(h)
+    };
+    h == "localhost" || h == "::1" || h.starts_with("127.")
 }
 
 fn e500(e: impl std::fmt::Display) -> Response {

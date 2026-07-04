@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { api, copyText } from "../api.js";
   import { fmtSize, prettyFormat, formatId } from "../format.js";
+  import RouteDetail from "../RouteDetail.svelte";
   export let startDownload;
   export let goTransfers = () => {};
   export let focus = 0;
@@ -18,10 +19,15 @@
     const key = vkey(v);
     // Clear the inline "Downloading…" ack once this transfer settles (success OR
     // failure / stop / waiting), so the Download button never stays stuck.
-    startDownload(detail.id, v.file, () => {
-      started.delete(key);
-      started = started;
-    });
+    startDownload(
+      detail.id,
+      v.file,
+      () => {
+        started.delete(key);
+        started = started;
+      },
+      v.is_bundle
+    );
     started.add(key);
     started = started;
   }
@@ -42,7 +48,7 @@
       const rows = await api.mesh("");
       const m = {};
       for (const r of rows) {
-        if (r.sha256) m[r.sha256] = { iroh: r.peers, bt: r.bt_seeders };
+        if (r.sha256) m[r.sha256] = { iroh: r.peers, bt: r.bt_seeders, magnet: r.magnet };
       }
       meshBySha = m;
     } catch (e) {
@@ -53,6 +59,21 @@
   // single-file content id to match — sharded/bundle variants).
   function avail(v) {
     return v && v.content_id ? meshBySha[v.content_id] || null : null;
+  }
+
+  // The variant whose routes & peers popup is open.
+  let detailVariant = null;
+  function variantProps(v) {
+    const a = avail(v) || {};
+    return {
+      title: (detail ? detail.name + " — " : "") + v.label,
+      subtitle: fmtSize(v.size) + (v.shards > 1 ? ` · ${v.shards} shards` : ""),
+      sha256: v.content_id || "",
+      magnet: a.magnet || "",
+      iroh: a.iroh || 0,
+      bt: a.bt || 0,
+      hfSource: true,
+    };
   }
 
   async function loadHome() {
@@ -169,7 +190,16 @@
           {#if detail}
             {#each detail.variants as v}
               <div class="variant">
-                <div>
+                <div
+                  class="clickable"
+                  role="button"
+                  tabindex="0"
+                  title="Show routes & peers for this quant"
+                  on:click={() => (detailVariant = v)}
+                  on:keydown={(e) =>
+                    (e.key === "Enter" || e.key === " ") &&
+                    (e.preventDefault(), (detailVariant = v))}
+                >
                   <span class="vlabel">{v.label}</span>
                   {#if v.recommended}<span class="pill ok">Recommended</span>{/if}
                   {#if v.format}<span class="pill fmt f-{formatId(v.format)}">{prettyFormat(v.format)}</span>{/if}
@@ -185,7 +215,11 @@
                     <div class="muted">Recommended for this machine · {v.fit_reason}</div>
                   {/if}
                   {#if v.content_id}
-                    <button class="copyid" title="Copy content id" on:click={() => copyText(v.content_id)}>
+                    <button
+                      class="copyid"
+                      title="Copy content id"
+                      on:click|stopPropagation={() => copyText(v.content_id)}
+                    >
                       {v.content_id.slice(0, 16)}…
                     </button>
                   {/if}
@@ -214,3 +248,18 @@
     <p class="muted">No models found. Try a different search.</p>
   {/if}
 </div>
+
+{#if detailVariant}
+  <RouteDetail
+    item={variantProps(detailVariant)}
+    onClose={() => (detailVariant = null)}
+    onGet={started.has(vkey(detailVariant))
+      ? null
+      : () => {
+          const v = detailVariant;
+          detailVariant = null;
+          start(v);
+        }}
+    getLabel="Download"
+  />
+{/if}

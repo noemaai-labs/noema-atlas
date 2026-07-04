@@ -419,10 +419,9 @@ async fn get_json<T: serde::de::DeserializeOwned>(
             resp.status()
         )));
     }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| Error::other(format!("hugging face response: {e}")))?;
+    // Metadata JSON only (file content streams elsewhere). Bound it generously
+    // (32 MiB) so a hostile mirror can't stream an unbounded body.
+    let bytes = crate::util::read_body_capped(resp, 32 * 1024 * 1024).await?;
     serde_json::from_slice(&bytes).map_err(Error::from)
 }
 

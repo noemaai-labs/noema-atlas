@@ -78,8 +78,8 @@ function toast(msg, bad=false){
   const t=document.createElement('div'); t.className='toast'+(bad?' bad':''); t.textContent=msg;
   document.body.appendChild(t); setTimeout(()=>t.remove(), 4200);
 }
-async function api(path, opts){ const r=await fetch(path,opts); if(!r.ok){ let m; try{m=(await r.json()).error}catch{m=r.statusText} throw new Error(m||('HTTP '+r.status)); } return r.json(); }
-function badge(text, cls=''){ return `<span class="badge ${cls}">${text}</span>`; }
+async function api(path, opts){ opts=opts||{}; opts.headers=Object.assign({'X-Noema-Local':'1'}, opts.headers||{}); const r=await fetch(path,opts); if(!r.ok){ let m; try{m=(await r.json()).error}catch{m=r.statusText} throw new Error(m||('HTTP '+r.status)); } return r.json(); }
+function badge(text, cls=''){ return `<span class="badge ${cls}">${esc(text)}</span>`; }
 function bytes(n){ if(n<1024)return n+' B'; const u=['KB','MB','GB','TB']; let i=-1; do{n/=1024;i++}while(n>=1024&&i<u.length-1); return n.toFixed(1)+' '+u[i]; }
 
 document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{
@@ -131,8 +131,8 @@ function importDialog(){
 async function showModel(id){
   const m=await api('/api/manifest/'+encodeURIComponent(id));
   const arts=m.artifacts.map(a=>`
-    <tr><td class="mono">${esc(a.path)}</td><td>${a.role}</td><td>${bytes(a.size_bytes)}</td>
-    <td>${a.format||'—'}</td><td>${a.cached?badge('cached','good'):badge('missing','warn')}</td></tr>`).join('');
+    <tr><td class="mono">${esc(a.path)}</td><td>${esc(a.role)}</td><td>${bytes(a.size_bytes)}</td>
+    <td>${esc(a.format||'—')}</td><td>${a.cached?badge('cached','good'):badge('missing','warn')}</td></tr>`).join('');
   const srcs=m.artifacts.flatMap(a=>a.sources).map(s=>`
     <div class="src">${badge(s.class,'accent')} <span class="mono" style="color:var(--muted)">${esc(s.source_id)}</span>
     ${s.auth!=='None'?badge('auth:'+s.auth,'warn'):''}</div>`).join('');
@@ -146,7 +146,7 @@ async function showModel(id){
       </div>
       <div class="row"><span class="k">Manifest id</span><span class="mono">${m.manifest_id}</span></div>
       <div class="row"><span class="k">Publisher</span><span>${esc(m.publisher)}</span></div>
-      <div class="row"><span class="k">Revision</span><span class="mono">${m.model.revision||'—'}</span></div>
+      <div class="row"><span class="k">Revision</span><span class="mono">${esc(m.model.revision||'—')}</span></div>
       <div class="row"><span class="k">Valid signatures</span><span>${m.valid_signatures.length}</span></div>
       <div class="actions">
         <button id="dl">Download &amp; verify</button>
