@@ -5,6 +5,11 @@ use serde::{Deserialize, Serialize};
 /// The schema version this build understands.
 pub const SCHEMA_VERSION: &str = "1.0";
 
+/// Upper bound on a manifest-declared chunk `leaf_size` (256 MiB). Real leaf sizes
+/// are ~1 MiB; this only exists to stop a hostile manifest forcing a huge scratch
+/// allocation during chunk-tree building.
+pub const MAX_LEAF_SIZE: u64 = 256 * 1024 * 1024;
+
 /// Top-level signed manifest.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Manifest {
@@ -429,12 +434,17 @@ impl Manifest {
         }
         // A content-link (`p2p`) manifest reconstructs a model from a bare
         // content id, so its provenance is only as trustworthy as the license the
-        // link vouched. Treat it as public *only* when that license actually
-        // permits public redistribution — an opaque/unknown-license link must NOT
-        // be auto-reseeded (it could be a gated or private model whose original
-        // manifest never reached this device).
+        // link vouched. Treat it as public *only* when that license is a
+        // recognized open/open-weight tag (`PublicP2pAllowed`). An opaque or
+        // unknown license (`PublicDownloadOnly`) must NOT be auto-reseeded — it
+        // could be a gated or private model laundered through a share link, whose
+        // original gated/token-walled manifest never reached this device. The user
+        // can still opt such a model in per-model from the Library.
         if pid == "p2p" {
-            return self.license.redistribution.allows_public_redistribution();
+            return matches!(
+                self.license.redistribution,
+                RedistributionClass::PublicP2pAllowed
+            );
         }
         self.artifacts.iter().any(|a| {
             a.sources.iter().any(|s| {
@@ -530,6 +540,15 @@ impl Manifest {
                     return Err(Error::InvalidManifest(format!(
                         "artifact `{}` has zero leaf_size",
                         art.path
+                    )));
+                }
+                // A manifest-declared leaf_size drives a `vec![0u8; leaf_size]`
+                // scratch buffer during chunk-tree building; cap it so a hostile
+                // manifest can't force a multi-gigabyte allocation.
+                if c.leaf_size > MAX_LEAF_SIZE {
+                    return Err(Error::InvalidManifest(format!(
+                        "artifact `{}` leaf_size {} exceeds maximum {}",
+                        art.path, c.leaf_size, MAX_LEAF_SIZE
                     )));
                 }
             }

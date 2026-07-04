@@ -302,7 +302,9 @@ impl ChunkTree {
         leaf_size: u64,
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<Self> {
-        let leaf_size = leaf_size.max(1);
+        // Clamp at the allocation site too: the scratch buffer is `leaf_size` bytes,
+        // so a caller passing an unbounded leaf_size must not be able to OOM us.
+        let leaf_size = leaf_size.clamp(1, crate::manifest::MAX_LEAF_SIZE);
         let mut f = std::fs::File::open(path).map_err(|e| Error::fs(path, e))?;
         let mut leaves = Vec::new();
         let mut buf = vec![0u8; leaf_size as usize];

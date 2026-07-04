@@ -9,7 +9,7 @@ members = [
 exclude = ["crates/studio", "vendor/librqbit"]
 
 [workspace.package]
-version = "0.2.0-alpha.2"
+version = "0.2.0-alpha.3"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"

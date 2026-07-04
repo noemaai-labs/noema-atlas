@@ -69,7 +69,9 @@ pub fn kind_from_source_id(source_id: &str) -> TransportKind {
         TransportKind::Https
     } else if s.starts_with("hf:") {
         TransportKind::HuggingFace
-    } else if s.starts_with("bittorrent") || s.starts_with("magnet:") {
+    } else if s.starts_with("btv2:") || s.starts_with("bittorrent") || s.starts_with("magnet:") {
+        // The real BitTorrent source id is `btv2:<magnet-uri>` (Source::source_id);
+        // without the `btv2:` arm it fell through to Unknown and leaked the raw magnet.
         TransportKind::BitTorrent
     } else if s.starts_with("file:") {
         TransportKind::File

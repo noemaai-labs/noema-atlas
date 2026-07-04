@@ -461,7 +461,7 @@
     }
   }
 
-  async function startDownload(id, file, onSettle) {
+  async function startDownload(id, file, onSettle, bundle = false) {
     const ref = beginProvisional(
       {
         artifact: file || id,
@@ -472,7 +472,7 @@
       onSettle
     );
     try {
-      await api.download(id, file, ref);
+      await api.download(id, file, ref, bundle);
     } catch (e) {
       failProvisional(ref, e);
     }

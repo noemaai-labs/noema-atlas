@@ -40,12 +40,25 @@ jobs:
         if: runner.os == 'Linux'
         env:
           APPIMAGE_EXTRACT_AND_RUN: "1"
+          # Pinned sha256 of linuxdeploy-x86_64.AppImage. This tool runs (as root)
+          # as the AppImage builder, so its bytes are part of the release supply
+          # chain and must be verified before exec. The upstream `continuous` asset
+          # is mutable: when a new build is published this check fails closed and
+          # prints the actual hash — review the new build, then bump this value
+          # deliberately rather than trusting whatever is served at fetch time.
+          LINUXDEPLOY_SHA256: "514d4ffe2a2f757369b41863a4f63fbbb222c429652803ebc081cb16ba21ac25"
         run: |
           mkdir -p out
-          # Fetch linuxdeploy so the AppImage bundles its shared libraries.
-          sudo curl -fsSL -o /usr/local/bin/linuxdeploy \
+          # Fetch linuxdeploy (bundles the app's shared libraries), verify it, then
+          # install it — never chmod+exec an unverified network download.
+          curl -fsSL -o /tmp/linuxdeploy \
             https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
-          sudo chmod +x /usr/local/bin/linuxdeploy
+          echo "${LINUXDEPLOY_SHA256}  /tmp/linuxdeploy" | sha256sum -c - || {
+            echo "linuxdeploy checksum mismatch — refusing to run it. actual:";
+            sha256sum /tmp/linuxdeploy;
+            exit 1;
+          }
+          sudo install -m 0755 /tmp/linuxdeploy /usr/local/bin/linuxdeploy
           bash scripts/bundle-linux.sh dist
           cp dist/Noema-Atlas-x86_64.AppImage "out/Noema-Atlas-x86_64.AppImage"
           # Raw binaries as a fallback for headless/server boxes.

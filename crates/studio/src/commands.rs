@@ -302,7 +302,9 @@ fn is_already_running(e: &noema_core::Error) -> bool {
 /// row by the exact id before the download starts, without a FIFO adopt.
 fn content_manifest_id(sha256: &str, blake3: &str) -> String {
     let seed = if sha256.len() == 64 { sha256 } else { blake3 };
-    format!("mdl_p2p_{}", &seed[..12.min(seed.len())])
+    // Slice on char boundaries: an untrusted link's id may be non-ASCII, and
+    // byte-indexing would panic mid-codepoint.
+    format!("mdl_p2p_{}", seed.chars().take(12).collect::<String>())
 }
 
 /// Import the chosen variant's manifest, then download it, streaming verified
@@ -353,6 +355,7 @@ pub async fn download_model(
     state: State<'_, AppState>,
     id: String,
     file: Option<String>,
+    bundle: Option<bool>,
     client_ref: Option<String>,
 ) -> Result<DownloadResult, String> {
     let engine = state.engine.clone();
@@ -361,10 +364,19 @@ pub async fn download_model(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Resolve the import: an explicit GGUF file, else the first GGUF, else the
-    // safetensors/MLX bundle.
+    // Resolve the import: the explicitly requested safetensors/MLX bundle (its
+    // variant has no `file`, so without this flag a mixed repo would fall through
+    // to a GGUF quant the user didn't pick), else an explicit GGUF file, else the
+    // first GGUF, else the bundle.
     let quants = detail.gguf_quants();
-    let import = if let Some(fname) = file.as_deref() {
+    let import = if bundle.unwrap_or(false) {
+        if !detail.has_safetensors_bundle() {
+            return Err("this repo has no safetensors/MLX bundle to download".into());
+        }
+        engine
+            .hf_import_bundle(&detail)
+            .map_err(|e| e.to_string())?
+    } else if let Some(fname) = file.as_deref() {
         // Find the quant that owns the chosen file and fetch all of its shards
         // as one model (a split GGUF downloads every shard, not just one).
         if let Some(q) = quants
@@ -720,6 +732,60 @@ pub async fn set_share(
         state.engine.withdraw_from_tracker(&[blake3.clone()]).await;
     }
     Ok(())
+}
+
+/// The distinct transport paths a transfer's manifest can use ("iroh" / "bt" /
+/// "https" / "hf"), so the Transfers card can show the standby routes alongside
+/// the active one.
+#[tauri::command]
+pub fn transfer_routes(
+    state: State<'_, AppState>,
+    manifest_id: String,
+) -> Result<Vec<String>, String> {
+    let Some(manifest) = state
+        .engine
+        .get_manifest(&manifest_id)
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut routes: Vec<String> = Vec::new();
+    for art in &manifest.artifacts {
+        for s in &art.sources {
+            use noema_core::manifest::SourceClass as C;
+            let tag = match s.class() {
+                C::Iroh => "iroh",
+                C::BittorrentV2 => "bt",
+                C::HttpsMirror => "https",
+                C::Huggingface => "hf",
+                _ => continue,
+            };
+            if !routes.iter().any(|r| r == tag) {
+                routes.push(tag.to_string());
+            }
+        }
+    }
+    let order = |r: &str| match r {
+        "iroh" => 0,
+        "bt" => 1,
+        "https" => 2,
+        _ => 3,
+    };
+    routes.sort_by_key(|r| order(r));
+    Ok(routes)
+}
+
+/// Peers actively pulling this blob from us right now (live Iroh uploads), so
+/// the Library can warn before a share-off hard-disconnects them mid-download.
+#[tauri::command]
+pub async fn share_activity(state: State<'_, AppState>, blake3: String) -> Result<u32, String> {
+    Ok(state
+        .share
+        .lock()
+        .await
+        .as_ref()
+        .map(|w| w.active_uploads_for(&blake3) as u32)
+        .unwrap_or(0))
 }
 
 /// Whether turning sharing on for this model needs an explicit confirmation —

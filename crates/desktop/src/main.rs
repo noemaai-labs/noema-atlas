@@ -463,6 +463,28 @@ struct Settings {
     /// trackers see your IP and the model info-hash. Applied at startup.
     #[serde(default)]
     bt_use_public_trackers: bool,
+    /// Join the mainline DHT (decentralized network) to find more peers. Applied
+    /// at startup.
+    #[serde(default = "default_true")]
+    bt_dht: bool,
+    /// Find LAN peers via Local Peer Discovery (multicast). Applied at startup.
+    #[serde(default = "default_true")]
+    bt_lsd: bool,
+    /// UPnP port forwarding on the router for inbound BitTorrent connectivity.
+    /// Applied at startup.
+    #[serde(default = "default_true")]
+    bt_upnp: bool,
+    /// Peer connection protocol, as `BtPeerProtocol::as_u8` (0 = TCP and µTP).
+    /// Applied at startup.
+    #[serde(default)]
+    bt_protocol: u8,
+    /// Max connected peers per torrent (`0` = unlimited). Applied at startup.
+    #[serde(default)]
+    bt_max_peers: u32,
+    /// Anonymous mode: hide the BitTorrent client identity (blank client string +
+    /// unbranded peer id). Applied at startup.
+    #[serde(default)]
+    bt_anonymous: bool,
     /// Download-routing preference, persisted as `DownloadPreference::as_u8`
     /// (0 = Auto). Applied live and at startup.
     #[serde(default)]
@@ -560,7 +582,9 @@ fn content_transfer_id(target: &noema_core::ShareTarget) -> String {
     } else {
         &target.blake3
     };
-    format!("mdl_p2p_{}", &seed[..12.min(seed.len())])
+    // Slice on char boundaries: an untrusted link's id may be non-ASCII, and
+    // byte-indexing would panic mid-codepoint.
+    format!("mdl_p2p_{}", seed.chars().take(12).collect::<String>())
 }
 
 /// The default community HF mirror (mirrors the same API + resolve endpoints).
@@ -589,6 +613,33 @@ fn single_artifact_blake3(engine: &Engine, manifest_id: &str) -> Option<String> 
     }
     let b3 = &manifest.artifacts[0].hashes.blake3;
     (!b3.is_empty()).then(|| b3.clone())
+}
+
+/// The distinct transport paths a manifest's artifacts can use, in display
+/// order (swarms first, mirrors after). Drives the transfer card's paths row:
+/// every route the engine may take, not just the one currently active.
+fn manifest_route_kinds(manifest: &noema_core::manifest::Manifest) -> Vec<TransportKind> {
+    let mut kinds: Vec<TransportKind> = Vec::new();
+    for art in &manifest.artifacts {
+        for s in &art.sources {
+            let k = TransportKind::from_source_id(&s.source_id());
+            if !matches!(k, TransportKind::Unknown | TransportKind::File) && !kinds.contains(&k) {
+                kinds.push(k);
+            }
+        }
+    }
+    kinds.sort_by_key(route_kind_order);
+    kinds
+}
+
+fn route_kind_order(k: &TransportKind) -> u8 {
+    match k {
+        TransportKind::Iroh => 0,
+        TransportKind::BitTorrent => 1,
+        TransportKind::Https => 2,
+        TransportKind::HuggingFace => 3,
+        _ => 4,
+    }
 }
 
 impl Default for Settings {
@@ -634,6 +685,12 @@ impl Default for Settings {
             // info-hash. Opt in for more peers (the DHT + Atlas tracker work
             // without it). See the privacy disclosure in BT Settings.
             bt_use_public_trackers: false,
+            bt_dht: true,
+            bt_lsd: true,
+            bt_upnp: true,
+            bt_protocol: 0,
+            bt_max_peers: 0,
+            bt_anonymous: false,
             download_preference: 0,
             max_concurrent: default_max_concurrent(),
             bt_sequential: false,
@@ -710,7 +767,10 @@ enum Msg {
     Models(Result<Vec<HfModel>, String>),
     Detail(Result<HfModelDetail, String>),
     /// sha256 -> worldwide peer count (from the tracker).
-    WorldwidePeers(HashMap<String, usize>),
+    WorldwidePeers {
+        iroh: HashMap<String, usize>,
+        bt: HashMap<String, usize>,
+    },
     Progress {
         /// The transfer this update belongs to (routes it to the right card).
         id: noema_core::transfer::TransferId,
@@ -906,6 +966,9 @@ struct ActiveDownload {
     /// BitTorrent magnet / live swarm peers. `None` for bundles (many blobs) or when
     /// the manifest can't be resolved.
     blake3: Option<String>,
+    /// Every transport path this transfer's manifest can use (Iroh / BitTorrent /
+    /// HF / HTTPS), so the card shows the standby routes alongside the active one.
+    routes: Vec<TransportKind>,
     done: u64,
     total: u64,
     source: Option<String>,
@@ -968,6 +1031,7 @@ fn active_download(
         bundle,
         name,
         blake3: None,
+        routes: Vec::new(),
         done: 0,
         total,
         source: None,
@@ -1246,6 +1310,10 @@ struct App {
     add_link_input: String,
     /// sha256 -> worldwide peer count (from the tracker) for the open model.
     worldwide_peers: HashMap<String, usize>,
+    /// sha256 -> worldwide BitTorrent seeder count, from the same tracker sample as
+    /// `worldwide_peers`, so Discover can show Iroh *and* BT availability per quant
+    /// (parity with Studio's "Iroh N · BitTorrent M").
+    worldwide_bt: HashMap<String, usize>,
     /// When the open model's peer counts were last sampled — so they auto-refresh
     /// while viewing and a remote delete/withdraw stops showing as a phantom peer.
     last_peer_check: Option<Instant>,
@@ -1406,6 +1474,13 @@ impl App {
         cfg.transport.bittorrent_max_ratio = settings.bt_max_ratio.max(0.0);
         cfg.transport.bittorrent_sequential = settings.bt_sequential;
         cfg.transport.bittorrent_use_public_trackers = settings.bt_use_public_trackers;
+        cfg.transport.bittorrent_enable_upnp = settings.bt_upnp;
+        cfg.transport.bittorrent_enable_dht = settings.bt_dht;
+        cfg.transport.bittorrent_enable_lsd = settings.bt_lsd;
+        cfg.transport.bittorrent_peer_protocol =
+            noema_core::BtPeerProtocol::from_u8(settings.bt_protocol);
+        cfg.transport.bittorrent_max_peers_per_torrent = settings.bt_max_peers;
+        cfg.transport.bittorrent_anonymous = settings.bt_anonymous;
         // Download-routing preference: applied at startup; the live setter mirrors
         // it after `Engine::open` (the setter takes effect on the next download).
         let download_pref = noema_core::DownloadPreference::from_u8(settings.download_preference);
@@ -1436,6 +1511,7 @@ impl App {
             loading_detail: false,
             add_link_input: String::new(),
             worldwide_peers: HashMap::new(),
+            worldwide_bt: HashMap::new(),
             last_peer_check: None,
             network: Vec::new(),
             network_loading: false,
@@ -1733,6 +1809,7 @@ impl App {
     fn refresh_visible_peer_counts(&mut self) {
         if let Some(detail) = self.detail.clone() {
             self.worldwide_peers.clear();
+            self.worldwide_bt.clear();
             self.start_seeder_check(&detail);
         }
     }
@@ -1778,7 +1855,8 @@ impl App {
             engine.set_bandwidth_schedule(self.settings.bandwidth_schedule());
         }
         self.save_settings();
-        self.status = "BitTorrent settings saved — they take effect next time Atlas starts.".into();
+        self.status =
+            "BitTorrent settings saved. Ratio, sequential, and schedule apply now; port, protocol, discovery, and seeding changes take effect after a restart.".into();
     }
 
     fn start_search(&mut self) {
@@ -1804,6 +1882,7 @@ impl App {
         self.loading_detail = true;
         self.detail = None;
         self.worldwide_peers.clear();
+        self.worldwide_bt.clear();
         self.status = format!("Loading {id}…");
         let (eng, tx, ctx) = (engine.clone(), self.tx.clone(), self.egui_ctx.clone());
         self.rt.spawn(async move {
@@ -1834,18 +1913,23 @@ impl App {
                 .map(|sha| {
                     let e = eng2.clone();
                     tokio::spawn(async move {
-                        let n = e.worldwide_peers(&sha).await;
-                        (sha, n)
+                        let (iroh, bt) = e.worldwide_availability(&sha).await;
+                        (sha, iroh, bt)
                     })
                 })
                 .collect();
-            let mut map: HashMap<String, usize> = HashMap::new();
+            let mut iroh_map: HashMap<String, usize> = HashMap::new();
+            let mut bt_map: HashMap<String, usize> = HashMap::new();
             for h in handles {
-                if let Ok((sha, n)) = h.await {
-                    map.insert(sha, n);
+                if let Ok((sha, iroh, bt)) = h.await {
+                    iroh_map.insert(sha.clone(), iroh);
+                    bt_map.insert(sha, bt);
                 }
             }
-            let _ = tx2.send(Msg::WorldwidePeers(map));
+            let _ = tx2.send(Msg::WorldwidePeers {
+                iroh: iroh_map,
+                bt: bt_map,
+            });
             ctx2.request_repaint();
         });
     }
@@ -1924,6 +2008,9 @@ impl App {
         card.launched = true;
         if !bundle {
             card.blake3 = single_artifact_blake3(&engine, &manifest_id);
+        }
+        if let Ok(Some(m)) = engine.get_manifest(&manifest_id) {
+            card.routes = manifest_route_kinds(&m);
         }
         self.active.push(card);
         self.run_download_task(engine, id, total, bundle);
@@ -2162,6 +2249,7 @@ impl App {
                     card.blake3 = Some(b3);
                 }
             }
+            card.routes = manifest_route_kinds(&manifest);
             self.active.push(card);
         }
     }
@@ -2793,7 +2881,10 @@ impl App {
                         Err(e) => self.status = friendly_error(&e),
                     }
                 }
-                Msg::WorldwidePeers(map) => self.worldwide_peers = map,
+                Msg::WorldwidePeers { iroh, bt } => {
+                    self.worldwide_peers = iroh;
+                    self.worldwide_bt = bt;
+                }
                 Msg::Progress {
                     id,
                     done,
@@ -4731,6 +4822,13 @@ fn quant_detail_modal(app: &mut App, ctx: &egui::Context, actions: &mut Vec<Acti
         String::new()
     };
     let bt_available = !bt_magnet.is_empty();
+    // Live BitTorrent seeder count, symmetric with the Iroh peer count: a
+    // network-catalog row carries its own, Discover rows read the tracker cache.
+    let bt_seeders = match &q.download {
+        QuantDownload::Network(m) => m.bt_seeders,
+        _ if sha.is_empty() => 0,
+        _ => app.worldwide_bt.get(&sha).copied().unwrap_or(0),
+    };
     let mut open = true;
     egui::Window::new("Routes & peers")
         .open(&mut open)
@@ -4798,16 +4896,19 @@ fn quant_detail_modal(app: &mut App, ctx: &egui::Context, actions: &mut Vec<Acti
                 },
                 worldwide > 0,
             );
+            let bt_status = if !bt_enabled {
+                "Off".to_string()
+            } else if bt_seeders > 0 {
+                format!("{bt_seeders} {}", plural(bt_seeders, "seeder"))
+            } else if bt_available {
+                "Magnet ready".to_string()
+            } else {
+                "No magnet".to_string()
+            };
             route_row(
                 ui,
                 TransportKind::BitTorrent,
-                if !bt_enabled {
-                    "Off"
-                } else if bt_available {
-                    "Magnet ready"
-                } else {
-                    "No magnet"
-                },
+                &bt_status,
                 if !bt_enabled {
                     "Off — enable BitTorrent in Settings"
                 } else if bt_available {
@@ -4815,7 +4916,7 @@ fn quant_detail_modal(app: &mut App, ctx: &egui::Context, actions: &mut Vec<Acti
                 } else {
                     "No magnet announced for this file yet"
                 },
-                bt_available,
+                bt_enabled && (bt_available || bt_seeders > 0),
             );
             if bt_available {
                 ui.horizontal(|ui| {
@@ -5916,6 +6017,12 @@ fn draw_file_row(
         .and_then(|s| app.worldwide_peers.get(s))
         .copied()
         .unwrap_or(0);
+    let wbt = f
+        .sha256
+        .as_ref()
+        .and_then(|s| app.worldwide_bt.get(s))
+        .copied()
+        .unwrap_or(0);
     egui::Frame::group(ui.style())
         .inner_margin(egui::Margin::symmetric(12.0, 10.0))
         .show(ui, |ui| {
@@ -5975,6 +6082,13 @@ fn draw_file_row(
                                 ui,
                                 format!("{wpeers} seeding worldwide"),
                                 Some(TransportKind::Iroh),
+                            );
+                        }
+                        if wbt > 0 {
+                            transport_badge(
+                                ui,
+                                format!("{wbt} BitTorrent {}", plural(wbt, "seed")),
+                                Some(TransportKind::BitTorrent),
                             );
                         }
                     });
@@ -6808,6 +6922,45 @@ fn transfer_card(ui: &mut egui::Ui, app: &App, a: &ActiveDownload, actions: &mut
                 ui.label(egui::RichText::new("choosing route…").small().weak());
             }
         });
+        // Every path this transfer can take, not just the active one — the active
+        // route lit, the rest standing by for automatic failover.
+        {
+            let active_kind = a.source.as_deref().map(TransportKind::from_source_id);
+            let mut kinds = a.routes.clone();
+            for sid in a.by_source.keys() {
+                let k = TransportKind::from_source_id(sid);
+                if !matches!(k, TransportKind::Unknown) && !kinds.contains(&k) {
+                    kinds.push(k);
+                }
+            }
+            if let Some(k) = active_kind {
+                if !matches!(k, TransportKind::Unknown) && !kinds.contains(&k) {
+                    kinds.push(k);
+                }
+            }
+            kinds.sort_by_key(route_kind_order);
+            if kinds.len() > 1 {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("Paths").small().weak());
+                    for kind in kinds {
+                        let active = active_kind == Some(kind);
+                        let used = a.by_source.iter().any(|(sid, b)| {
+                            *b > 0 && TransportKind::from_source_id(sid) == kind
+                        });
+                        let resp = transport_chip(ui, kind.display_name(), Some(kind), !active);
+                        if active {
+                            resp.on_hover_text("Downloading on this path now");
+                        } else if used {
+                            resp.on_hover_text("Used earlier in this download");
+                        } else {
+                            resp.on_hover_text(
+                                "On standby — switches over automatically if the active path stalls",
+                            );
+                        }
+                    }
+                });
+            }
+        }
         // Per-source breakdown — the multi-source story made visible.
         let mut by_source: Vec<(&String, &u64)> =
             a.by_source.iter().filter(|(_, b)| **b > 0).collect();
@@ -7305,7 +7458,7 @@ fn bittorrent_settings(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Actio
     ui.add_space(14.0);
     ui.label(egui::RichText::new("BitTorrent").strong());
     ui.label(
-        egui::RichText::new("Connect to the BitTorrent swarm (µTP + DHT), alongside Iroh and Hugging Face. While connected, the options below choose whether Atlas downloads models from the swarm, seeds the open-licensed ones back, or both. The options take effect next time Atlas starts.")
+        egui::RichText::new("Connect to the BitTorrent swarm, alongside Iroh and Hugging Face. While connected, the options below choose whether Atlas downloads models from the swarm, seeds the open-licensed ones back, or both — and how it finds and connects to peers. The options take effect next time Atlas starts.")
             .small()
             .weak(),
     );
@@ -7363,6 +7516,54 @@ fn bittorrent_settings(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Actio
                     app.settings.bt_port = p as u16;
                     changed = true;
                 }
+                if ui
+                    .small_button("Random")
+                    .on_hover_text("Pick a random port (1024–65535).")
+                    .clicked()
+                {
+                    app.settings.bt_port = random_listen_port();
+                    changed = true;
+                }
+            });
+            if ui
+                .checkbox(
+                    &mut app.settings.bt_upnp,
+                    "Use UPnP port forwarding from my router",
+                )
+                .on_hover_text("Ask the router to map the listen port so peers can reach you behind NAT (UPnP/IGD; NAT-PMP isn't supported). Takes effect next time Atlas starts.")
+                .changed()
+            {
+                changed = true;
+            }
+            ui.horizontal(|ui| {
+                ui.label("Peer connection protocol")
+                    .on_hover_text("Which transports carry peer connections. µTP (BEP-29, over UDP) yields to your other traffic; TCP is the classic transport. µTP-only needs the listen port on — with inbound off, outbound falls back to TCP.");
+                let mut proto = noema_core::BtPeerProtocol::from_u8(app.settings.bt_protocol);
+                let before = proto;
+                egui::ComboBox::from_id_source("bt-peer-protocol")
+                    .selected_text(bt_protocol_label(proto))
+                    .show_ui(ui, |ui| {
+                        use noema_core::BtPeerProtocol as P;
+                        for opt in [P::TcpAndUtp, P::TcpOnly, P::UtpOnly] {
+                            ui.selectable_value(&mut proto, opt, bt_protocol_label(opt));
+                        }
+                    });
+                if proto != before {
+                    app.settings.bt_protocol = proto.as_u8();
+                    changed = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Max connections per torrent (0 = unlimited)")
+                    .on_hover_text("Cap on peers connected at once per torrent. There is no global cap across torrents. Takes effect next time Atlas starts.");
+                let mut v = app.settings.bt_max_peers as f64;
+                if ui
+                    .add(egui::DragValue::new(&mut v).range(0.0..=10_000.0).speed(1.0))
+                    .changed()
+                {
+                    app.settings.bt_max_peers = v as u32;
+                    changed = true;
+                }
             });
             ui.horizontal(|ui| {
                 ui.label("BitTorrent upload limit (Mbps, 0 = unlimited)");
@@ -7397,7 +7598,7 @@ fn bittorrent_settings(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Actio
             });
             ui.horizontal(|ui| {
                 ui.label("Seed ratio limit (0 = unlimited)")
-                    .on_hover_text("Stop seeding a model over BitTorrent once you've uploaded this many times its size. 0 seeds indefinitely. Takes effect next time Atlas starts.");
+                    .on_hover_text("Stop seeding a model over BitTorrent once you've uploaded this many times its size. 0 seeds indefinitely. Applied live.");
                 let mut r = app.settings.bt_max_ratio;
                 if ui
                     .add(
@@ -7424,10 +7625,37 @@ fn bittorrent_settings(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Actio
             }
             if ui
                 .checkbox(
+                    &mut app.settings.bt_dht,
+                    "Enable DHT (decentralized network) to find more peers",
+                )
+                .on_hover_text("Join the mainline DHT so transfers find peers without any tracker. Turning it off leaves trackers and Peer Exchange only — magnet fetches then need a reachable tracker. Takes effect next time Atlas starts.")
+                .changed()
+            {
+                changed = true;
+            }
+            if ui
+                .checkbox(
+                    &mut app.settings.bt_lsd,
+                    "Enable Local Peer Discovery to find more peers",
+                )
+                .on_hover_text("Multicast on your LAN so machines on the same network exchange pieces directly. Peer Exchange (PeX) with connected peers is always on for public torrents. Takes effect next time Atlas starts.")
+                .changed()
+            {
+                changed = true;
+            }
+            if ui
+                .checkbox(
                     &mut app.settings.bt_use_public_trackers,
                     "Use public BitTorrent trackers",
                 )
                 .on_hover_text("Announce to public trackers (alongside the DHT and the Atlas tracker) to reach more peers. Off by default: public trackers see your IP address and the model info-hash. Takes effect next time Atlas starts.")
+                .changed()
+            {
+                changed = true;
+            }
+            if ui
+                .checkbox(&mut app.settings.bt_anonymous, "Enable anonymous mode")
+                .on_hover_text("Hide the client identity BitTorrent normally broadcasts: peers and trackers see a blank client name and an unbranded peer id instead of the built-in engine's. Your IP address is still visible to the swarm — only the VPN tunnel (socks5 proxy, under Connection) hides that. Takes effect next time Atlas starts.")
                 .changed()
             {
                 changed = true;
@@ -7545,6 +7773,25 @@ fn bittorrent_settings(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Actio
     if changed {
         actions.push(Action::ApplyBitTorrent);
     }
+}
+
+/// UI label for a BitTorrent peer-connection protocol choice.
+fn bt_protocol_label(p: noema_core::BtPeerProtocol) -> &'static str {
+    match p {
+        noema_core::BtPeerProtocol::TcpAndUtp => "TCP and µTP",
+        noema_core::BtPeerProtocol::TcpOnly => "TCP",
+        noema_core::BtPeerProtocol::UtpOnly => "µTP",
+    }
+}
+
+/// A random inbound listen port in `1024..=65535`. Time-seeded — picking a port
+/// doesn't warrant a rand dependency.
+fn random_listen_port() -> u16 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    1024 + (nanos % 64_512) as u16
 }
 
 /// An HH:MM picker for a minutes-since-midnight value (`0..=1439`), as adjacent
@@ -8240,8 +8487,13 @@ fn fold_download_progress(
 }
 
 fn short_hash(s: &str) -> String {
-    if s.len() > 20 {
-        format!("{}…{}", &s[..10], &s[s.len() - 6..])
+    // Char-safe: hashes are ASCII in practice, but never byte-slice a value that
+    // could be non-ASCII (it would panic mid-codepoint).
+    let n = s.chars().count();
+    if n > 20 {
+        let head: String = s.chars().take(10).collect();
+        let tail: String = s.chars().skip(n - 6).collect();
+        format!("{head}…{tail}")
     } else {
         s.to_string()
     }

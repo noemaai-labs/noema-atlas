@@ -1,6 +1,31 @@
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+/// Read an HTTP response body, refusing more than `max` bytes. External servers
+/// (registry, tracker, Hugging Face, update endpoint) are untrusted, so a body
+/// read must be bounded or a hostile/compromised server could stream an unbounded
+/// response and exhaust client memory.
+#[cfg(feature = "http")]
+pub async fn read_body_capped(
+    mut resp: reqwest::Response,
+    max: usize,
+) -> crate::error::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| crate::error::Error::other(format!("response body: {e}")))?
+    {
+        if buf.len() + chunk.len() > max {
+            return Err(crate::error::Error::other(
+                "response body exceeds maximum allowed size",
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
 /// Current UTC time as an RFC-3339 string, e.g. `2026-06-16T00:00:00Z`.
 pub fn now_rfc3339() -> String {
     OffsetDateTime::now_utc()

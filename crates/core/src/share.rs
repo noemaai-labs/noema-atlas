@@ -62,9 +62,12 @@ pub struct ShareTarget {
 }
 
 impl ShareTarget {
-    /// Whether this target has at least one usable 64-hex content id.
+    /// Whether this target has at least one usable 64-hex content id. The hex
+    /// charset check matters: a content id is later sliced/byte-indexed and used to
+    /// derive on-disk names, so a 64-*byte* string with a multi-byte codepoint must
+    /// not pass here (it would otherwise panic on a non-char-boundary slice).
     pub fn has_content_id(&self) -> bool {
-        self.sha256.len() == 64 || self.blake3.len() == 64
+        is_hex64(&self.sha256) || is_hex64(&self.blake3)
     }
 
     /// The best human title to show: the sender's `title` if set, else the name.
@@ -172,6 +175,11 @@ pub fn is_bundle_link(token: &str) -> bool {
     token.trim().starts_with(BUNDLE_PREFIX)
 }
 
+/// A 64-character lowercase/uppercase ASCII-hex string (a sha256/blake3 content id).
+fn is_hex64(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,5 +269,20 @@ mod tests {
     fn rejects_garbage() {
         assert!(ShareTarget::decode("hello").is_err());
         assert!(ShareTarget::decode("atlas1:!!!notbase64").is_err());
+    }
+
+    #[test]
+    fn rejects_non_hex_content_id() {
+        // 64 *bytes* but containing a multi-byte codepoint: must be rejected, not
+        // accepted (it would later panic on a non-char-boundary slice).
+        let mut sha = "a".repeat(62);
+        sha.push('é'); // +2 bytes -> 64 bytes, non-hex
+        let t = ShareTarget {
+            name: "x.gguf".into(),
+            sha256: sha,
+            ..Default::default()
+        };
+        assert!(!t.has_content_id());
+        assert!(ShareTarget::decode(&t.encode()).is_err());
     }
 }

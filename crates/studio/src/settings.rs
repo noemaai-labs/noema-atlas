@@ -48,8 +48,25 @@ pub struct StudioSettings {
     pub bt_download: bool,
     /// Add the public, well-known BitTorrent trackers (in addition to the DHT) so
     /// transfers find more peers. PRIVACY: this announces your IP and the model's
-    /// info-hash to third-party trackers. On by default, matching the engine.
+    /// info-hash to third-party trackers. Off by default, matching Atlas.
     pub bt_use_public_trackers: bool,
+    /// Join the mainline DHT (decentralized network) to find more peers. Applies
+    /// on next launch.
+    pub bt_dht: bool,
+    /// Find LAN peers via Local Peer Discovery (multicast). Applies on next launch.
+    pub bt_lsd: bool,
+    /// UPnP port forwarding on the router for inbound BitTorrent connectivity.
+    /// Applies on next launch.
+    pub bt_upnp: bool,
+    /// Peer connection protocol, as [`noema_core::BtPeerProtocol`]'s stable `u8`
+    /// (0 = TCP and µTP, 1 = TCP, 2 = µTP). Applies on next launch.
+    pub bt_protocol: u8,
+    /// Max connected peers per torrent (`0` = unlimited). Applies on next launch.
+    pub bt_max_peers: u32,
+    /// Anonymous mode: hide the BitTorrent client identity (blank client string +
+    /// unbranded peer id). The IP address is still visible to the swarm. Applies
+    /// on next launch.
+    pub bt_anonymous: bool,
     /// Seed completed, publicly-redistributable blobs back over BitTorrent.
     pub bt_seed: bool,
     /// Preferred inbound listen port; the range `[port, port+10)` is tried.
@@ -139,7 +156,15 @@ impl Default for StudioSettings {
             seen_intro: false,
             bt_enabled: true,
             bt_download: true,
-            bt_use_public_trackers: true,
+            // Off by default, matching Atlas: public trackers expose your IP +
+            // the model info-hash. DHT/LSD + the Atlas tracker cover discovery.
+            bt_use_public_trackers: false,
+            bt_dht: true,
+            bt_lsd: true,
+            bt_upnp: true,
+            bt_protocol: 0,
+            bt_max_peers: 0,
+            bt_anonymous: false,
             bt_seed: true,
             bt_port: 6881,
             bt_up_cap_mbps: 0,
