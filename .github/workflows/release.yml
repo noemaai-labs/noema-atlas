@@ -46,7 +46,7 @@ jobs:
           # is mutable: when a new build is published this check fails closed and
           # prints the actual hash — review the new build, then bump this value
           # deliberately rather than trusting whatever is served at fetch time.
-          LINUXDEPLOY_SHA256: "514d4ffe2a2f757369b41863a4f63fbbb222c429652803ebc081cb16ba21ac25"
+          LINUXDEPLOY_SHA256: "e87ee0815d109282fdda73e34c2361d64d02b0ffaea3674b18f1fd1f6a687dcf"
         run: |
           mkdir -p out
           # Fetch linuxdeploy (bundles the app's shared libraries), verify it, then
