@@ -2,9 +2,7 @@ use crate::error::{Error, Result};
 use serde::Deserialize;
 use std::time::Duration;
 
-/// Total request budget for a tracker call. Provider lookups are additionally
-/// capped tighter at the call site (the engine races them against a short
-/// timeout) so a slow tracker never dominates the time-to-first-peer.
+/// Total request budget for a tracker call; provider lookups are capped tighter at the call site.
 const TRACKER_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Fail fast on an unroutable tracker host instead of hanging the full request
 /// budget on a stuck TCP connect (reqwest has no default connect timeout).
@@ -50,25 +48,15 @@ pub struct Identity {
     pub device: String,
 }
 
-/// Ownership proof for an announce/withdraw: the request timestamp (ms) and a
-/// base64 Ed25519 signature over the canonical payload (see
-/// [`crate::announce_auth`]), produced from this device's node secret key. The
-/// registry verifies it against the claimed `node_id`. `None` sends an unsigned
-/// request (e.g. an iroh-less build); a registry that requires auth rejects it.
+/// Ownership proof for announce/withdraw: (request timestamp ms, base64 Ed25519
+/// signature over the canonical payload). The registry verifies it against the
+/// claimed `node_id`; `None` sends an unsigned request.
 pub type AnnounceAuth = (i64, String);
 
-/// Announce that this node is sharing the given items (with browse metadata).
-/// Re-announce periodically; the tracker expires stale entries.
-///
-/// `node_id` is this device's *stable* identity (hex). The tracker keys peers by
-/// it so a re-announce after the node's relay/direct addresses change replaces
-/// the old record instead of accumulating a second one (which would otherwise
-/// count one device as several peers). `node_ticket` still carries the current
-/// reachable address used to actually fetch from this peer.
-///
-/// `auth` is the signed ownership proof (timestamp + signature) so the registry
-/// can confirm the announcer actually controls `node_id` instead of trusting the
-/// claim — see [`crate::announce_auth`].
+/// Announce that this node is sharing the given items. Re-announce periodically;
+/// the tracker expires stale entries. `node_id` (stable hex identity) is the peer
+/// key, so a re-announce after address changes replaces the old record instead of
+/// counting one device as several peers.
 pub async fn announce(
     registry: &str,
     proxy: Option<&str>,
@@ -164,10 +152,9 @@ struct CatalogResp {
     models: Vec<CatalogRow>,
 }
 
-/// Browse the worldwide catalog of shared models. `q` filters by name.
-/// `self_id` is this node's own NodeId — it's excluded from each row's peer count
-/// and flags your own shares as `mine`, so your device never reads as a "peer
-/// seeding your files".
+/// Browse the worldwide catalog of shared models. `q` filters by name. `self_id`
+/// (this node's NodeId) is excluded from each row's peer count and flags your own
+/// shares as `mine`.
 pub async fn catalog(
     registry: &str,
     proxy: Option<&str>,
@@ -236,8 +223,7 @@ struct ProviderEntry {
 
 /// Look up providers for a content hash (blake3 or sha256, hex). Returns the
 /// resolved blake3 (Iroh's content address) and the provider node tickets.
-/// `exclude_self` is this node's own NodeId; passing it keeps a peer from
-/// discovering — or fetching from, or counting — itself.
+/// `exclude_self` (this node's NodeId) keeps a peer from discovering itself.
 pub async fn providers(
     registry: &str,
     proxy: Option<&str>,
@@ -268,10 +254,9 @@ pub async fn providers(
     })
 }
 
-/// Un-announce content this node no longer serves, so it drops out of the
-/// catalog and provider lists immediately instead of lingering until its TTL.
-/// `blake3s` empty means "withdraw everything from this node" (e.g. turning
-/// worldwide sharing off). Keyed on the stable `node_id`, so it only ever removes
+/// Un-announce content this node no longer serves so it drops from the catalog
+/// immediately instead of lingering until its TTL. Empty `blake3s` withdraws
+/// everything from this node. Keyed on the stable `node_id`, so it only removes
 /// this node's own records. Best-effort: errors are non-fatal to the caller.
 pub async fn withdraw(
     registry: &str,

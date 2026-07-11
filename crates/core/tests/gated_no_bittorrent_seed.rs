@@ -1,8 +1,4 @@
-//! Guards the gated-leak fix: a token-gated manifest must never be reseeded onto
-//! the public BitTorrent swarm. This pins the redistribution policy at the source
-//! (`PolicyEngine::redistribution_allowed`) and the cache gate (`is_blob_shareable`)
-//! for a manifest gated purely by a `Source::Huggingface { auth: Token }` — i.e.
-//! `access.gated == false`, so it exercises the *token* branch of `is_gated()`.
+//! Guards the gated-leak fix: a token-gated manifest must never be reseeded onto the public BitTorrent swarm.
 #![cfg(feature = "bittorrent")]
 
 use noema_core::db::Db;

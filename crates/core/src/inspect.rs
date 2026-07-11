@@ -102,11 +102,8 @@ fn meta_from_extension(path: &Path) -> FileMeta {
     }
 }
 
-/// Derive a coarse format tag from a filename. Extension-driven, with a name
-/// heuristic for MLX (which ships as safetensors/npz tuned for Apple Silicon).
-/// The tag is for display + cataloguing only — integrity is always the manifest
-/// hash, and `validate_format_header` only hard-checks the formats it has magic
-/// bytes for (gguf/safetensors), so a richer tag here never gates a download.
+/// Derive a coarse format tag from a filename (extension-driven, plus an MLX
+/// name heuristic). Display/catalogue only — never gates a download.
 pub fn format_from_name(filename: &str) -> Option<String> {
     let lower = filename.to_ascii_lowercase();
     // MLX has no unique extension (it is safetensors/npz under the hood); read it
@@ -136,8 +133,7 @@ pub fn format_from_name(filename: &str) -> Option<String> {
     Some(fmt.into())
 }
 
-/// Human-facing label for a format tag from [`format_from_name`] — nicer casing
-/// than a bare uppercase (e.g. `coreml` -> `Core ML`). Unknown tags uppercase.
+/// Human-facing label for a format tag (e.g. `coreml` -> `Core ML`); unknown tags uppercase.
 pub fn pretty_format(format: &str) -> String {
     match format.to_ascii_lowercase().as_str() {
         "gguf" => "GGUF",
@@ -157,9 +153,8 @@ pub fn pretty_format(format: &str) -> String {
     }
     .to_string()
 }
-// We only need the `general.*` strings + the file_type enum. Cap how far we'll
-// scan so a hostile/huge metadata block (e.g. a giant tokenizer token array)
-// can't make us read forever — genuine `general.*` keys sit at the very front.
+// Cap the scan so a hostile/huge metadata block can't make us read forever;
+// genuine `general.*` keys sit at the very front.
 const GGUF_MAX_KV: u64 = 4096;
 const GGUF_MAX_STR: u64 = 64 * 1024;
 const GGUF_MAX_ARRAY_BYTES: u64 = 256 * 1024 * 1024;
@@ -289,8 +284,7 @@ fn scalar_width(vtype: u32) -> Option<u64> {
     })
 }
 
-/// Map the GGML `general.file_type` enum to a human quant label. Best-effort:
-/// covers the common values; unknown values yield `None` (filename wins).
+/// Map the GGML `general.file_type` enum to a human quant label; unknown values yield `None` (filename wins).
 fn quant_from_file_type(ft: u32) -> Option<String> {
     Some(
         match ft {
@@ -376,8 +370,7 @@ fn read_safetensors_meta<R: Read>(r: &mut R, header_len: u64) -> FileMeta {
     meta
 }
 /// Merge a file's header metadata and its filename into one structured identity.
-/// Header values win (the author wrote them); the filename fills the gaps —
-/// most importantly the quant token, which GGUF only encodes as an enum.
+/// Header values win; the filename fills the gaps (most importantly the quant token).
 pub fn parse_model(filename: &str, meta: &FileMeta) -> ParsedModel {
     let base = filename.rsplit(['/', '\\']).next().unwrap_or(filename);
     let format = meta.format.clone().or_else(|| format_from_name(base));

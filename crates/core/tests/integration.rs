@@ -295,11 +295,7 @@ async fn cancel_stops_download_keeps_no_blob_and_does_not_ban_source() {
     assert_eq!(engine.cas().total_blob_bytes().unwrap(), data.len() as u64);
 }
 
-/// Regression: every progress event must carry the in-flight manifest id. The UI
-/// ties a live transfer back to its manifest through this field — without it a
-/// content/link download (whose id is synthesized at import time and never seen
-/// on the wire) can't be resumed from the Transfers page. The engine used to
-/// leave this empty.
+/// Regression: every progress event must carry the in-flight manifest id (the UI resumes by it).
 #[tokio::test]
 async fn progress_events_carry_the_manifest_id() {
     use std::sync::{Arc, Mutex};

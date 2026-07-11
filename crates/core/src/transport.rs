@@ -29,11 +29,9 @@ pub enum AuthRequirement {
     Token { service: String },
 }
 
-/// A byte-progress sink an adapter calls during an in-`open()` transfer.
-///
-/// Iroh downloads the whole blob before it returns a stream, so the engine's
-/// per-chunk progress would otherwise show nothing until the network transfer
-/// had already finished. The closure receives `(bytes_done, bytes_total)`.
+/// A byte-progress sink an adapter calls during an in-`open()` transfer, so
+/// transports that fetch the whole blob before returning a stream (Iroh) can
+/// still report movement. The closure receives `(bytes_done, bytes_total)`.
 #[derive(Clone)]
 pub struct ProgressSink(pub std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>);
 
@@ -49,9 +47,9 @@ impl std::fmt::Debug for ProgressSink {
     }
 }
 
-/// Rich live transfer stats from a swarm transport (BitTorrent), for the UI:
-/// beyond byte progress, the connected-peer count and cumulative upload (so the UI
-/// can show peers + a seed ratio). Down/up speeds are derived UI-side from deltas.
+/// Rich live transfer stats from a swarm transport (BitTorrent) for the UI:
+/// byte progress plus connected-peer count and cumulative upload. Speeds are
+/// derived UI-side from deltas.
 #[derive(Debug, Clone, Default)]
 pub struct LiveStats {
     pub bytes_done: u64,
@@ -61,8 +59,7 @@ pub struct LiveStats {
 }
 
 /// A rich-stats sink an adapter calls during an in-`open()` swarm transfer
-/// (BitTorrent). Separate from [`ProgressSink`] so byte-only transports (Iroh,
-/// HTTP) are unaffected.
+/// (BitTorrent). Separate from [`ProgressSink`] so byte-only transports are unaffected.
 #[derive(Clone)]
 pub struct StatsSink(pub std::sync::Arc<dyn Fn(LiveStats) + Send + Sync>);
 
@@ -81,9 +78,9 @@ impl std::fmt::Debug for StatsSink {
 /// The boxed future a [`PeerRefresh`] call returns.
 pub type PeerRefreshFut = std::pin::Pin<Box<dyn std::future::Future<Output = Vec<String>> + Send>>;
 
-/// Async provider re-query hook for swarm transports: returns the current node
-/// tickets for the artifact (typically a tracker `/providers` call), so an
-/// in-flight multi-peer fetch can add peers that come online mid-transfer.
+/// Async provider re-query hook for swarm transports: returns current node
+/// tickets for the artifact so an in-flight multi-peer fetch can add peers that
+/// come online mid-transfer.
 #[derive(Clone)]
 pub struct PeerRefresh(pub std::sync::Arc<dyn Fn() -> PeerRefreshFut + Send + Sync>);
 
@@ -94,9 +91,7 @@ impl std::fmt::Debug for PeerRefresh {
 }
 
 /// Persistence hook for a blob's *lifetime* BitTorrent upload, so the stop-at-ratio
-/// cap survives restarts (librqbit's own upload counter resets each session).
-/// Implemented by the engine's `Db`; kept as a narrow trait so the transport layer
-/// doesn't depend on the database directly.
+/// cap survives restarts (librqbit's own counter resets each session).
 pub trait BtUploadStore: Send + Sync {
     /// Cumulative bytes uploaded for `blake3` across all prior runs (0 if none).
     fn load_uploaded(&self, blake3: &str) -> u64;
@@ -109,22 +104,17 @@ pub trait BtUploadStore: Send + Sync {
 pub struct FetchCtx {
     pub token: Option<String>,
     pub timeout: Option<Duration>,
-    /// Cooperative cancel flag for a user Pause/Stop. Adapters whose download
-    /// happens inside `open()` (Iroh — the whole blob lands before the engine
-    /// stream loop runs) must poll this and abort promptly; without it Pause/Stop
-    /// would only register after the multi-GB transfer already finished.
+    /// Cooperative cancel flag for a user Pause/Stop. Adapters that download inside
+    /// `open()` (Iroh) must poll this and abort promptly, else Pause/Stop only
+    /// registers after the whole transfer finishes.
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    /// Whether the active interruption is a Stop (discard the partial) rather than
-    /// a Pause (keep it for resume). Adapters that hold their partial somewhere the
-    /// engine can't see (Iroh keeps an incomplete blob in its own store, not the
-    /// engine's `.part`) must, on a discard-cancel, drop that partial themselves so
-    /// a Stop truly starts clean. Ignored by adapters whose partial *is* the
-    /// engine's `.part` (the engine deletes that one).
+    /// Whether the interruption is a Stop (discard the partial) vs a Pause (keep for
+    /// resume). Adapters that hold their partial where the engine can't see it (Iroh)
+    /// must drop it themselves on a discard-cancel; ignored when the partial is the
+    /// engine's `.part`.
     pub discard_partial: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    /// Live byte-progress sink for those same in-`open()` transports, so the UI
-    /// reflects the real transfer instead of a frozen label. `None` for adapters
-    /// whose `open()` returns immediately and streams incrementally (the engine's
-    /// own stream loop already reports those).
+    /// Live byte-progress sink for those same in-`open()` transports. `None` for
+    /// adapters whose `open()` streams incrementally (the engine's read loop reports those).
     pub on_bytes: Option<ProgressSink>,
     /// Rich live-stats sink (peers, upload) for swarm transports (BitTorrent).
     /// `None` for transports that only report bytes via `on_bytes`.
@@ -140,12 +130,9 @@ pub struct Opened {
     pub stream: ByteStream,
     pub effective_start: u64,
     pub total_size: Option<u64>,
-    /// The whole blob was already fetched — and live-progress-reported via
-    /// `ctx.on_bytes` — during `open()` (e.g. Iroh). The returned `stream` just
-    /// re-reads that local file, so the engine's read loop is a local *verify*
-    /// pass, not a network download: it must not be reported (or counted) as a
-    /// second download. `false` for incrementally-streaming transports (HTTP,
-    /// local file), whose read loop *is* the transfer.
+    /// The whole blob was already fetched (and progress-reported via `ctx.on_bytes`)
+    /// during `open()` (e.g. Iroh), so the engine's read loop is a local verify pass,
+    /// not a second download. `false` for incrementally-streaming transports.
     pub prefetched: bool,
 }
 
@@ -203,15 +190,9 @@ fn host_of(url: &str) -> String {
 }
 
 /// Apply an optional proxy (the app's "VPN tunnel") to a reqwest client builder.
-///
-/// `proxy` accepts any scheme reqwest understands — `http://`, `https://`, or
-/// `socks5://` (also `socks5h://` to resolve DNS through the proxy, which is the
-/// safe choice for tunneling). An empty / whitespace value means "no proxy", so
-/// callers can pass a config field straight through. The proxy applies to all
-/// schemes (`Proxy::all`) so both plaintext probes and TLS downloads tunnel.
-///
-/// Returns an error on a malformed proxy URL rather than silently ignoring it —
-/// a misconfigured tunnel should be visible, not leak traffic around the VPN.
+/// Accepts any scheme reqwest understands (`http`/`https`/`socks5`); empty means
+/// no proxy. Errors on a malformed URL rather than silently leaking traffic
+/// around the tunnel.
 #[cfg(feature = "http")]
 pub fn apply_proxy(
     builder: reqwest::ClientBuilder,
@@ -319,11 +300,8 @@ mod net {
 
     impl HttpClient {
         pub fn new(timeout: Duration, proxy: Option<&str>) -> Result<Self> {
-            // `read_timeout` (idle timeout between body reads), NOT `timeout` (a total
-            // request deadline). A multi-GB model download can legitimately run for
-            // longer than any fixed total deadline; bounding it by a *total* timeout
-            // kills healthy in-progress transfers. An idle timeout instead aborts only
-            // when no bytes arrive for `timeout`, which is what we actually want.
+            // `read_timeout` (idle between body reads), NOT `timeout` (total deadline):
+            // a multi-GB download can outrun any total deadline, so bound it by idle time.
             let builder = Client::builder()
                 .user_agent(concat!("noema-atlas/", env!("CARGO_PKG_VERSION")))
                 .connect_timeout(Duration::from_secs(15))
@@ -381,9 +359,8 @@ mod net {
             source_id: &str,
         ) -> Result<Opened> {
             let requested_start = range.map(|r| r.start).unwrap_or(0);
-            // Half-open `[start, end)` → HTTP's inclusive `bytes=start-(end-1)`.
-            // A bounded end enables segmented/multi-connection downloads; with no
-            // end we request an open-ended range (resume-to-EOF).
+            // Half-open `[start, end)` → HTTP's inclusive `bytes=start-(end-1)`; a
+            // bounded end enables segmented downloads, no end means resume-to-EOF.
             let requested_end = range.and_then(|r| r.end);
             let mut req = self.client.get(url);
             if let Some(t) = token {
@@ -575,9 +552,8 @@ mod net {
                 .await
         }
     }
-    // LAN peering was removed (Atlas is a worldwide service). The `LanPeer`
-    // source variant is retained only for back-compat deserialization; it is
-    // never planned or fetched, so it has no adapter.
+    // LAN peering was removed; the `LanPeer` variant is kept only for back-compat
+    // deserialization and has no adapter (never planned or fetched).
 }
 
 #[cfg(feature = "http")]
@@ -589,10 +565,8 @@ mod iroh_adapter {
     use tokio::io::AsyncReadExt;
     use tokio::sync::Mutex;
 
-    /// Fetches a blob over Iroh from the provider node tickets carried by an
-    /// `iroh` source (as returned by the worldwide tracker). The node is spawned
-    /// lazily on first use (binding a QUIC socket is async) and can be dropped and
-    /// re-spawned via [`reset_node`](Self::reset_node) after an interrupted fetch.
+    /// Fetches a blob over Iroh from the provider node tickets in an `iroh` source.
+    /// The node is spawned lazily on first use and re-spawned after an interrupted fetch.
     pub struct IrohAdapter {
         node: Mutex<Option<Arc<crate::iroh_node::IrohNode>>>,
         store_dir: std::path::PathBuf,
@@ -621,12 +595,9 @@ mod iroh_adapter {
             Ok(guard.as_ref().unwrap().clone())
         }
 
-        /// Take the cached fetch node out so the next fetch spawns a fresh one.
-        /// After an interrupted fetch (Pause/Stop) the node's pooled QUIC
-        /// connection to the peer can be left half-open; reusing it makes the next
-        /// attempt sit on "connecting" forever, while a fresh node redials cleanly.
-        /// The peer's blob store is on disk (`store_dir`), so a kept partial still
-        /// resumes. Returns the old node so the caller can tear it down off-path.
+        /// Take the cached fetch node out so the next fetch spawns a fresh one: an
+        /// interrupted fetch can leave the pooled QUIC connection half-open, wedging
+        /// the next attempt on "connecting". Returns the old node to tear down off-path.
         async fn take_node(&self) -> Option<Arc<crate::iroh_node::IrohNode>> {
             self.node.lock().await.take()
         }
@@ -672,12 +643,9 @@ mod iroh_adapter {
             let node = self.node().await?;
             std::fs::create_dir_all(self.store_dir.join("scratch")).ok();
             let tmp = crate::iroh_node::scratch_path(&self.store_dir, blob_hash);
-            // A stripe journal next to the scratch marks it as a resumable striped
-            // partial — keep both so Pause→Resume (or a retry) continues from the
-            // completed pieces. Any journal-less leftover is from a prior aborted
-            // single-peer attempt: clear it, since the export step refuses to
-            // overwrite (that stale file is what surfaced as "iroh transfer:
-            // export: File exists (os error 17)" on retry).
+            // A stripe journal next to the scratch marks a resumable striped partial —
+            // keep both for Pause→Resume. A journal-less leftover is an aborted
+            // single-peer attempt: clear it, else the export step fails with EEXIST.
             let journal = crate::iroh_node::stripe_journal_path(&tmp);
             if tokio::fs::metadata(&tmp).await.is_ok()
                 && tokio::fs::metadata(&journal).await.is_err()
@@ -685,9 +653,8 @@ mod iroh_adapter {
                 let _ = tokio::fs::remove_file(&tmp).await;
             }
             let cancel = ctx.cancel.clone();
-            // Forward iroh's live download progress to the UI: the whole blob
-            // lands here inside `open()`, so without this the transfer would show
-            // no movement until it had already finished.
+            // Forward iroh's live download progress to the UI: the whole blob lands
+            // here inside `open()`, so without this the transfer shows no movement.
             let on_bytes = ctx.on_bytes.as_ref().map(|s| s.0.clone());
             // A full BlobTicket string also works; otherwise treat entries as
             // node tickets and fetch the blob by its blake3 hash.
@@ -718,29 +685,20 @@ mod iroh_adapter {
             self.in_flight
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             if matches!(result, Err(Error::Cancelled)) {
-                // Make Stop/Pause near-instant: hand *all* cleanup to a background
-                // task and return the moment the fetch aborts. Two steps would
-                // otherwise stall the path the user is waiting on — deleting a
-                // multi-GB partial blob, and tearing the fetch node down (closing
-                // the QUIC endpoint and joining its local pool, which can take
-                // seconds or wedge). Taking the node out of the cache here also
-                // means the next fetch spawns a clean one, the half-open-connection
-                // reset that keeps a later pull from sitting on "connecting".
-                //
-                // On a Stop (discard) the partial blob in the node's own store is
-                // dropped too — the engine's `.part` cleanup can't reach it, so
-                // without this Stop would leave the (multi-GB) partial behind.
+                // Make Stop/Pause near-instant: hand all cleanup (deleting the partial
+                // blob, tearing down the node) to a background task and return the
+                // moment the fetch aborts. Taking the node out of the cache also resets
+                // a possibly half-open connection so the next fetch spawns clean. On a
+                // Stop (discard) the partial in the node's own store is dropped too —
+                // the engine's `.part` cleanup can't reach it.
                 let discard = ctx
                     .discard_partial
                     .as_ref()
                     .map(|d| d.load(std::sync::atomic::Ordering::SeqCst))
                     .unwrap_or(false);
-                // Only the sole user may take the shared node down: the endpoint is
-                // one QUIC socket serving every in-flight Iroh download, so pausing
-                // one transfer must not sever the others. When other fetches remain,
-                // the half-open-connection reset is skipped — the striped fetch's
-                // per-peer connect timeout and fail budget absorb a stale pooled
-                // connection on a later attempt.
+                // Only the sole user may take the shared node down: one QUIC socket
+                // serves every in-flight Iroh download, so pausing one must not sever
+                // the others. With other fetches live, the connection reset is skipped.
                 let solo = self.in_flight.load(std::sync::atomic::Ordering::SeqCst) == 0;
                 let unseed_node = if discard { Some(node.clone()) } else { None };
                 drop(node); // release this call's handle; the cached one is taken next
@@ -770,12 +728,10 @@ mod iroh_adapter {
                     }
                 });
             }
-            // Preserve a user-cancel as `Cancelled` so the engine stops the whole
-            // download instead of failing over to the next source. Also pass through
-            // an already-classified transport error untouched: the fetch watchdog
-            // returns `NotFound` (non-retriable) when providers deliver no data, and
-            // re-wrapping it as `Other` would make it retriable — wasting another
-            // full connect window on the same dead peers before failing over.
+            // Preserve a user-cancel as `Cancelled` so the engine stops rather than
+            // failing over. Pass an already-classified transport error through
+            // untouched: re-wrapping the watchdog's non-retriable `NotFound` as `Other`
+            // would make it retriable and waste another connect window on dead peers.
             result.map_err(|e| match e {
                 Error::Cancelled => Error::Cancelled,
                 e @ Error::Transport { .. } => e,
@@ -824,9 +780,8 @@ mod iroh_adapter {
                 stream: Box::pin(stream),
                 effective_start: 0,
                 total_size: total,
-                // Iroh fetches the whole blob during `open()` (above) and
-                // reports it live via `on_bytes`; this stream just re-reads the
-                // local scratch file for verification.
+                // Iroh fetched the whole blob during `open()`; this stream just
+                // re-reads the local scratch file for verification.
                 prefetched: true,
             })
         }
@@ -840,12 +795,10 @@ pub use iroh_adapter::IrohAdapter;
 // BitTorrent adapter (librqbit) — magnet → one verified file → CAS
 // ===========================================================================
 
-/// Remove the announce (`tr=`) parameters from an untrusted magnet URI, keeping the
-/// info-hash (`xt`) and descriptive params. A hostile magnet (from a share link or
-/// an Explore catalog row) could otherwise list attacker-controlled trackers and
-/// make us announce our IP + the model's info-hash to them — and a `udp://` tracker
-/// bypasses any configured socks5 proxy. Discovery still works via DHT and our own
-/// proxy-aware tracker list, attached separately as an `AddTorrentOptions` field.
+/// Strip announce (`tr=`) params from an untrusted magnet URI, keeping the info-hash
+/// (`xt`) and descriptive params. A hostile magnet could otherwise announce our IP +
+/// info-hash to attacker-controlled (and proxy-bypassing `udp://`) trackers.
+/// Discovery still works via DHT and our own proxy-aware tracker list.
 #[cfg(feature = "bittorrent")]
 fn strip_magnet_trackers(magnet: &str) -> String {
     let Some((base, query)) = magnet.split_once('?') else {
@@ -855,9 +808,8 @@ fn strip_magnet_trackers(magnet: &str) -> String {
         .split('&')
         .filter(|kv| {
             let key = kv.split('=').next().unwrap_or("").to_ascii_lowercase();
-            // `tr` (and the older `tr.N` form) are announce URLs; `ws`/`as`/`xs` are
-            // alternate web-seed/source URLs — all peer-controlled fetch targets we
-            // refuse to honor from an untrusted magnet.
+            // `tr`/`tr.N` are announce URLs; `ws`/`as`/`xs` are alternate web-seed/source
+            // URLs — all peer-controlled fetch targets we refuse from an untrusted magnet.
             !(key == "tr" || key.starts_with("tr.") || key == "ws" || key == "as" || key == "xs")
         })
         .collect();
@@ -868,11 +820,9 @@ fn strip_magnet_trackers(magnet: &str) -> String {
     }
 }
 
-/// Choose which file in a (possibly multi-file) torrent matches the artifact we
-/// want. Exact basename+size first; then a size-only fallback *only* when exactly
-/// one file has that size (else ambiguous → refuse and let the engine fail over);
-/// finally the single-file shortcut. Pure (no I/O, no librqbit types) so it's
-/// unit-testable without a swarm.
+/// Choose which file in a (possibly multi-file) torrent matches the wanted artifact:
+/// exact basename+size, then size-only when unambiguous, then the single-file
+/// shortcut. Pure so it's unit-testable without a swarm.
 #[cfg(feature = "bittorrent")]
 fn pick_torrent_file(files: &[(String, u64)], want_name: &str, want_size: u64) -> Option<usize> {
     if let Some(i) = files
@@ -918,10 +868,9 @@ mod bittorrent_adapter {
     /// librqbit's per-torrent id (a `usize`; not re-exported at the crate root).
     type TorrentId = usize;
 
-    /// Well-known public BitTorrent trackers, layered on top of DHT so a magnet that
-    /// only carries an info-hash still finds peers fast. Attached to both the created
-    /// torrent's announce-list (seed path) and a magnet-only add (leech path), gated
-    /// by `TransportConfig::bittorrent_use_public_trackers`.
+    /// Well-known public BitTorrent trackers, layered on DHT so an info-hash-only
+    /// magnet still finds peers fast. Gated by
+    /// `TransportConfig::bittorrent_use_public_trackers`.
     pub const PUBLIC_TRACKERS: &[&str] = &[
         "udp://tracker.opentrackr.org:1337/announce",
         "udp://open.tracker.cl:1337/announce",
@@ -934,13 +883,8 @@ mod bittorrent_adapter {
     ];
 
     /// The public-tracker list to attach, given whether the app proxy is set.
-    ///
-    /// PRIVACY: librqbit routes only peer/DHT traffic (and `https://` tracker
-    /// announces) through a `socks5` proxy — UDP tracker announces go out direct.
-    /// So with a proxy ("VPN tunnel") configured, every `udp://` tracker would leak
-    /// the user's real IP *and* the model's info-hash to the tracker operator. When
-    /// a proxy is set we therefore drop the `udp://` trackers and keep only the
-    /// `https://` one (which IS proxied); with no proxy we use the full list.
+    /// PRIVACY: librqbit can't proxy `udp://` tracker announces, so with a proxy set
+    /// they'd leak the user's real IP + info-hash — drop them and keep only `https://`.
     fn public_trackers(proxy_set: bool) -> Vec<String> {
         PUBLIC_TRACKERS
             .iter()
@@ -971,9 +915,8 @@ mod bittorrent_adapter {
         librqbit::dht::Id20::new(b)
     }
 
-    /// Normalize librqbit's `ConnectionKind` (not nameable outside the crate, but it
-    /// `Display`s as `tcp`/`utp`/`socks`) to the UI's `"TCP"`/`"uTP"`/`"unknown"`.
-    /// `None` (peer not yet live) maps to `"unknown"`.
+    /// Normalize librqbit's `ConnectionKind` (`Display`s as `tcp`/`utp`/`socks`) to
+    /// the UI's `"TCP"`/`"uTP"`/`"unknown"`; `None` maps to `"unknown"`.
     fn conn_kind_label<T: std::fmt::Display>(kind: Option<T>) -> String {
         match kind.map(|k| k.to_string()) {
             Some(s) if s.eq_ignore_ascii_case("tcp") => "TCP".to_string(),
@@ -983,11 +926,9 @@ mod bittorrent_adapter {
         }
     }
 
-    /// Per-peer rate state kept between `peers_for` polls. `base_*` is the byte
-    /// snapshot at `at`; the rate is recomputed over that window only once it spans at
-    /// least `PEER_RATE_WINDOW`, and held steady (`last_*_bps`) in between. This keeps
-    /// per-peer speeds stable whether the UI polls every frame (egui) or every few
-    /// seconds (Studio), instead of dividing by a noisy sub-second delta.
+    /// Per-peer rate state kept between `peers_for` polls. `base_*` is the byte snapshot
+    /// at `at`; the rate is recomputed once the window spans `PEER_RATE_WINDOW` and held
+    /// steady (`last_*_bps`) in between, so speeds stay stable regardless of poll rate.
     #[derive(Clone, Copy)]
     struct PeerSample {
         base_down: u64,
@@ -1000,10 +941,8 @@ mod bittorrent_adapter {
     /// Minimum window over which a per-peer rate is averaged before the baseline rolls.
     const PEER_RATE_WINDOW: Duration = Duration::from_millis(1000);
 
-    /// Decode a BitTorrent peer_id (20 raw bytes) into a human client name, following
-    /// the common Azureus-style (`-XXVVVV-…`) convention. Returns `"unknown"` when the
-    /// prefix isn't recognized. Best-effort and purely cosmetic (peer_ids are
-    /// self-reported and can be spoofed).
+    /// Decode a BitTorrent peer_id (20 raw bytes) into a client name via the Azureus-style
+    /// (`-XXVVVV-…`) convention; `"unknown"` when unrecognized. Cosmetic (peer_ids can be spoofed).
     fn decode_peer_client(id: [u8; 20]) -> String {
         // Azureus style: '-' + two-char client code + four version chars + '-'.
         if id[0] == b'-' && id[7] == b'-' {
@@ -1073,16 +1012,6 @@ mod bittorrent_adapter {
         }
     }
 
-    /// Fetches ONE file from a BitTorrent swarm by magnet into a scratch dir, then
-    /// streams it back for the engine to verify (mirroring the Iroh adapter's
-    /// download-to-tempfile-then-stream-back shape; `prefetched: true`). The torrent
-    /// is **never trusted**: the engine re-verifies every byte against the signed
-    /// manifest, so a v1/hybrid swarm is fine.
-    ///
-    /// The librqbit `Session` is **persistent** (resume-data + fastresume), so a
-    /// paused or interrupted download resumes from its on-disk pieces rather than
-    /// restarting. Seeding completed blobs is wired separately (engine-driven, from
-    /// a reflink of the CAS blob). The session lazily binds on first use.
     /// A live peer of a managed torrent (seeding or actively leeching), mapped from
     /// librqbit's per-peer stats snapshot for the UI's peer list.
     #[derive(Debug, Clone)]
@@ -1135,48 +1064,38 @@ mod bittorrent_adapter {
         down_bps: u64,
         /// Attach the public-tracker list to created torrents and magnet-only adds.
         use_public_trackers: bool,
-        /// Seed/upload ratio at which a seeded torrent is paused (`0.0` = unlimited).
-        /// Stored as f64 *bits* in an atomic so the UI can raise/lower/clear it at
-        /// runtime; lowering or clearing it resumes blobs the watcher had paused. This
-        /// is the **global default**; per-blob overrides in `blob_max_ratio` win.
+        /// Seed/upload ratio at which a seeded torrent is paused (`0.0` = unlimited),
+        /// as f64 bits in an atomic so the UI can change it at runtime. Global default;
+        /// per-blob overrides in `blob_max_ratio` win.
         max_ratio: Arc<AtomicU64>,
-        /// Per-blob stop-at-ratio overrides (blake3 → cap). When a blob has an entry
-        /// here the watcher uses it instead of the global `max_ratio`; `0.0` pins that
-        /// blob to unlimited even if the global cap is set. Absent ⇒ use the global.
+        /// Per-blob stop-at-ratio overrides (blake3 → cap) the watcher uses instead of
+        /// the global `max_ratio`; `0.0` pins unlimited. Absent ⇒ use the global.
         blob_max_ratio: Arc<Mutex<HashMap<String, f64>>>,
-        /// Download pieces in order (sequential) for new BT leeches. Applied to the add
-        /// options and pushed live onto active torrents on change. `0.0`-style default
-        /// is off (normal first/last/rarest picking).
+        /// Download pieces in order (sequential) for new BT leeches; applied to add
+        /// options and pushed live onto active torrents on change. Default off.
         sequential: Arc<AtomicBool>,
         /// Previous per-peer byte snapshot, keyed blake3 → addr, so `peers_for` can
         /// derive per-peer bytes/sec from the delta between polls.
         peer_samples: Arc<Mutex<HashMap<String, HashMap<String, PeerSample>>>>,
-        /// Blake3s the ratio watcher has paused after reaching the lifetime cap. Kept
-        /// distinct from a user Pause so `is_seeding` can report them as NOT seeding
-        /// (the pill mustn't lie) and so a later cap raise/clear can resume exactly
-        /// these — without un-pausing a torrent the user paused by hand.
+        /// Blake3s the ratio watcher paused at the lifetime cap. Distinct from a user
+        /// Pause so `is_seeding` reports them as not seeding and a later cap raise/clear
+        /// resumes exactly these, not torrents the user paused by hand.
         ratio_paused: Arc<Mutex<HashSet<String>>>,
-        /// Lifetime-upload persistence (engine's `Db`), so the ratio cap is a
-        /// lifetime ratio across runs rather than per-session. `None` in builds with
-        /// no store (the cap then degrades to per-session, as before).
+        /// Lifetime-upload persistence (engine's `Db`) so the ratio cap spans runs.
+        /// `None` in builds with no store (cap degrades to per-session).
         upload_store: Option<Arc<dyn BtUploadStore>>,
-        /// In-flight + active seeds, keyed by blob blake3. Lets `unseed` find the
-        /// added torrent (to delete it + its reflinked seed file) and abort a
-        /// still-promoting `seed_promote` task before it adds the torrent.
+        /// In-flight + active seeds, keyed by blob blake3. Lets `unseed` find the added
+        /// torrent and abort a still-promoting `seed_promote` task.
         seeds: Arc<Mutex<HashMap<String, SeedEntry>>>,
-        /// Torrent id of each in-flight *leech* download, keyed by blob blake3, so
-        /// `peers_for` can read a downloading swarm's live peers. Inserted when the
-        /// download torrent is added and removed when `open` returns.
+        /// Torrent id of each in-flight leech download, keyed by blob blake3, so
+        /// `peers_for` can read a downloading swarm's live peers.
         active: Arc<Mutex<HashMap<String, TorrentId>>>,
     }
 
-    /// Per-blob seeding state. A single blob can be seeded under more than one file
-    /// name (e.g. a post-import rename), each producing a *distinct* torrent
-    /// (info-hash includes the file name). We therefore track **all** of them:
-    /// `promotions` are the in-flight `seed_promote` tasks (each with its own
-    /// `wanted` abort flag), and `torrent_ids` accumulates every added torrent — so
-    /// `unseed` tears down ALL of a blob's torrents, not just the most recent (the
-    /// leak when this was keyed to a single id).
+    /// Per-blob seeding state. A blob can be seeded under multiple file names, each a
+    /// distinct torrent (info-hash includes the name), so we track all of them:
+    /// `promotions` are in-flight `seed_promote` tasks and `torrent_ids` every added
+    /// torrent, so `unseed` tears down all of a blob's torrents, not just the latest.
     #[derive(Default)]
     struct SeedEntry {
         promotions: Vec<Promotion>,
@@ -1191,9 +1110,8 @@ mod bittorrent_adapter {
     }
 
     impl BittorrentAdapter {
-        /// Build from the `bittorrent_*` (and app `proxy`) fields of the transport
-        /// config. `upload_store` persists lifetime upload for the stop-at-ratio
-        /// cap; `None` degrades the cap to per-session.
+        /// Build from the `bittorrent_*` (and app `proxy`) config fields. `upload_store`
+        /// persists lifetime upload for the ratio cap; `None` degrades it to per-session.
         pub fn new(cfg: &TransportConfig, upload_store: Option<Arc<dyn BtUploadStore>>) -> Self {
             BittorrentAdapter {
                 session: OnceCell::new(),
@@ -1221,23 +1139,20 @@ mod bittorrent_adapter {
             }
         }
 
-        /// Whether the app proxy ("VPN tunnel") is configured (non-empty). Drives the
-        /// proxy-aware public-tracker filter ([`public_trackers`]): with a proxy set,
-        /// `udp://` trackers (which librqbit can't proxy) are dropped to avoid leaking
-        /// the user's real IP + the model info-hash around the tunnel.
+        /// Whether a socks5 app proxy ("VPN tunnel") is set. Drives the proxy-aware
+        /// public-tracker filter: with a proxy, unproxyable `udp://` trackers are
+        /// dropped to avoid leaking the user's real IP + info-hash around the tunnel.
         fn proxy_set(&self) -> bool {
-            // Only a socks5 proxy actually tunnels peer/DHT traffic (see `session`),
-            // so only then would a udp tracker leak around it. With any other proxy
-            // (or none) dropping udp trackers buys no privacy, just fewer peers.
+            // Only a socks5 proxy tunnels peer/DHT traffic (see `session`), so only then
+            // would a udp tracker leak around it; dropping them otherwise just loses peers.
             self.proxy
                 .as_deref()
                 .map(str::trim)
                 .is_some_and(|p| p.starts_with("socks5"))
         }
 
-        /// Lazily build the persistent session (binds sockets + starts DHT) on first
-        /// use. Seeding wants an inbound listener + UPnP; if binding fails (ports
-        /// taken) it retries leech-only so downloads still work this run.
+        /// Lazily build the persistent session (binds sockets + starts DHT) on first use.
+        /// If binding the seed listener fails (ports taken) it retries leech-only.
         async fn session(&self) -> Result<&Arc<Session>> {
             self.session
                 .get_or_try_init(|| async {
@@ -1258,9 +1173,8 @@ mod bittorrent_adapter {
                         download_bps: bps_to_limit(self.down_bps),
                     };
                     let mk_opts = |listen: Option<ListenerOptions>| {
-                        // µTP dials out from the inbound listener's socket, so with
-                        // no listener bound "µTP only" would leave no way to reach
-                        // peers at all — outbound TCP stays on in that case.
+                        // µTP dials out from the inbound listener's socket, so with no
+                        // listener bound "µTP only" leaves no way to reach peers — keep TCP on.
                         let enable_tcp = self.peer_protocol != BtPeerProtocol::UtpOnly
                             || listen.is_none();
                         SessionOptions {
@@ -1271,19 +1185,16 @@ mod bittorrent_adapter {
                                 proxy_url: socks_proxy_url.clone(),
                                 ..Default::default()
                             }),
-                            // Decentralized peer discovery: mainline DHT + LAN
-                            // multicast (LSD), each behind its user toggle. PeX has
-                            // no librqbit toggle (always on for public torrents).
+                            // Decentralized peer discovery: mainline DHT + LAN multicast
+                            // (LSD), each behind its toggle. PeX is always on (no toggle).
                             dht: self.enable_dht.then(DhtSessionConfig::default),
                             disable_local_service_discovery: !self.enable_lsd,
                             // Session-wide default cap on concurrent connected peers
                             // per torrent; librqbit has no global-across-torrents cap.
                             peer_limit: (self.max_peers_per_torrent > 0)
                                 .then_some(self.max_peers_per_torrent as usize),
-                            // Anonymous mode: blank client string (peer extended
-                            // handshake + tracker user-agent, like libtorrent's
-                            // anonymous_mode) and an unbranded random peer id,
-                            // instead of advertising "rqbit <version>".
+                            // Anonymous mode: blank client string + unbranded random peer
+                            // id, instead of advertising "rqbit <version>".
                             peer_id: self.anonymous.then(random_peer_id),
                             client_name_and_version: self.anonymous.then(String::new),
                             ratelimits,
@@ -1296,10 +1207,8 @@ mod bittorrent_adapter {
                             ..Default::default()
                         }
                     };
-                    // A fresh listener in the configured mode (TCP / µTP BEP-29 /
-                    // both) bound to `port`; UPnP mapping only when we intend to
-                    // seed. Rebuilt per attempt so we can walk the configured range
-                    // instead of giving up after the first port.
+                    // A fresh listener in the configured mode bound to `port`; UPnP only
+                    // when seeding. Rebuilt per attempt so we can walk the port range.
                     let mk_listener = |port: u16| ListenerOptions {
                         mode: match self.peer_protocol {
                             BtPeerProtocol::TcpAndUtp => ListenerMode::TcpAndUtp,
@@ -1310,12 +1219,9 @@ mod bittorrent_adapter {
                         enable_upnp_port_forwarding: self.seed && self.enable_upnp,
                         ..Default::default()
                     };
-                    // `listen_ports == None` means "inbound listening disabled" (DHT +
-                    // outbound only) — honor it literally. Otherwise walk the range and
-                    // bind the FIRST free port; only if every port is taken do we fall
-                    // back to no inbound listener. (Previously only `range.start` was
-                    // tried, so one busy port silently dropped inbound TCP *and* uTP for
-                    // the whole run even when the rest of the user's range was free.)
+                    // `listen_ports == None` means inbound listening disabled (DHT +
+                    // outbound only). Otherwise bind the first free port in the range,
+                    // falling back to no listener only if every port is taken.
                     let sess = match &self.listen_ports {
                         None => Session::new_with_opts(scratch.clone(), mk_opts(None)).await,
                         Some(range) => {
@@ -1347,15 +1253,10 @@ mod bittorrent_adapter {
                             TransportErrorKind::Other(format!("session init: {e}")),
                         )
                     })?;
-                    // Consent: if seeding is disabled, tear down any *completed* seed
-                    // torrents that librqbit auto-revived from persistence at init.
-                    // Persistence is all-or-nothing per session folder, so it re-attaches
-                    // finished seeds (which would upload to peers — and *uncapped*, since
-                    // the ratio watcher below only runs when `self.seed`) alongside the
-                    // incomplete downloads we DO want to resume. Drop only the finished
-                    // ones; `delete_files: false` keeps the bytes on disk so re-enabling
-                    // seeding (the engine's launch re-seed) can re-add them. Without this,
-                    // turning "Seed over BitTorrent" off does not actually stop seeding.
+                    // If seeding is disabled, tear down completed seed torrents librqbit
+                    // auto-revived from persistence (all-or-nothing per session folder),
+                    // else turning seeding off wouldn't actually stop seeding. Keep the
+                    // bytes (`delete_files: false`) so re-enabling can re-add them.
                     if !self.seed {
                         let finished: Vec<TorrentId> = sess.with_torrents(|torrents| {
                             torrents
@@ -1369,19 +1270,13 @@ mod bittorrent_adapter {
                             }
                         }
                     }
-                    // Sweep orphaned per-fetch scratch dirs left by a crash or an
-                    // early-dropped stream from a *prior* run. Only delete a `dl-*`
-                    // dir that no current torrent points at — a paused/in-progress BT
-                    // download keeps its (deterministic) dir for resume, and the
-                    // session has just re-attached those persisted torrents, so their
-                    // output folders are live here and are preserved.
+                    // Sweep orphaned per-fetch scratch dirs from a prior crash: only a
+                    // `dl-*` dir no current torrent points at (re-attached in-progress
+                    // downloads keep their dir for resume and are preserved).
                     sweep_orphan_scratch(&scratch);
-                    // Stop-at-ratio: a lightweight periodic task pauses any seeded
-                    // torrent whose *lifetime* upload/size ratio has reached the cap,
-                    // and resumes ones it paused if the cap is later lowered/cleared.
-                    // Runs whenever we seed (the cap is read live, so it can start at
-                    // 0/unlimited and be raised at runtime); the watcher itself no-ops
-                    // each tick while the cap is unlimited.
+                    // Stop-at-ratio: a periodic task pauses any seeded torrent past its
+                    // lifetime upload/size cap and resumes it if the cap is later
+                    // lowered/cleared. Runs whenever we seed; no-ops while unlimited.
                     if self.seed {
                         tokio::spawn(ratio_watch(
                             sess.clone(),
@@ -1397,11 +1292,9 @@ mod bittorrent_adapter {
                 .await
         }
 
-        /// Seed a verified CAS blob to the swarm: reflink it under its model name
-        /// (CoW where supported), build a v1 torrent over it, and add it to the
-        /// persistent session (which announces to the DHT). Returns immediately — the
-        /// (one-time, cold) session init AND the heavy piece-hashing both run on the
-        /// spawned task, so a launch re-seed never stalls the first transfer.
+        /// Seed a verified CAS blob: reflink it under its model name, build a v1 torrent,
+        /// and add it to the persistent session (which announces to the DHT). Returns
+        /// immediately — session init and piece-hashing run on the spawned task.
         pub async fn seed_blob(
             self: &Arc<Self>,
             cas_blob: std::path::PathBuf,
@@ -1421,9 +1314,8 @@ mod bittorrent_adapter {
             let me = self.clone();
             let b3 = blake3.clone();
             let wanted_task = wanted.clone();
-            // Resolve the (lazily-bound) session *inside* the task so its cold init
-            // (binding sockets, starting DHT/UPnP) is off the caller's path, then run
-            // the promotion. A session-init failure just means "don't seed this one".
+            // Resolve the lazily-bound session inside the task so its cold init is off
+            // the caller's path; a session-init failure just means "don't seed this one".
             let task = tokio::spawn(async move {
                 let session = match me.session().await {
                     Ok(s) => s.clone(),
@@ -1448,9 +1340,8 @@ mod bittorrent_adapter {
                 )
                 .await;
             });
-            // Append this promotion to the blob's entry rather than replacing it: a
-            // blob can be seeded under more than one file name (distinct torrents),
-            // and dropping the prior entry would orphan its already-added torrent.
+            // Append to the blob's entry rather than replacing: a blob can be seeded
+            // under multiple names, and replacing would orphan the prior torrent.
             self.seeds
                 .lock()
                 .unwrap()
@@ -1461,37 +1352,29 @@ mod bittorrent_adapter {
             Ok(())
         }
 
-        /// Whether this blob is *managed* by the live session (a seed torrent or an
-        /// in-flight promotion exists) — including one the ratio watcher has paused.
-        /// Used to skip a redundant re-seed so a duplicate promotion isn't spawned;
-        /// the UI-facing signal is [`is_actively_seeding`](Self::is_actively_seeding).
-        /// Note a persisted magnet is NOT the signal — after a restart the in-memory
-        /// map is empty even for blobs we should re-add (the launch sweep's job).
+        /// Whether this blob is *managed* by the live session (seed torrent or in-flight
+        /// promotion, including one the ratio watcher paused), used to skip a redundant
+        /// re-seed. The UI signal is [`is_actively_seeding`](Self::is_actively_seeding).
         pub fn is_seeding(&self, blake3: &str) -> bool {
             self.seeds.lock().unwrap().contains_key(blake3)
         }
 
-        /// Whether this blob is *actively* seeding right now — managed AND not paused
-        /// by the stop-at-ratio watcher. The UI's "Seeding" pill reads this so a
-        /// ratio-paused seed isn't shown as seeding (it's uploading nothing).
+        /// Whether this blob is *actively* seeding — managed AND not paused by the
+        /// stop-at-ratio watcher. The UI's "Seeding" pill reads this.
         pub fn is_actively_seeding(&self, blake3: &str) -> bool {
             self.seeds.lock().unwrap().contains_key(blake3)
                 && !self.ratio_paused.lock().unwrap().contains(blake3)
         }
 
-        /// Set the stop-at-ratio cap at runtime (`0.0` = unlimited). Lowering or
-        /// clearing it lets the watcher resume blobs it had paused on the next tick;
-        /// raising it lets newly-over-cap blobs pause. The cap is read live by the
-        /// watcher (started whenever we seed), so this needs no session rebuild.
+        /// Set the stop-at-ratio cap at runtime (`0.0` = unlimited). The watcher reads
+        /// it live, resuming paused blobs on lower/clear and pausing over-cap ones on raise.
         pub fn set_max_ratio(&self, max_ratio: f64) {
             self.max_ratio.store(max_ratio.to_bits(), Ordering::Relaxed);
         }
 
-        /// Set or clear a **per-blob** stop-at-ratio override. `Some(cap)` pins this
-        /// blob to `cap` (`0.0` = unlimited) regardless of the global default; `None`
-        /// drops the override so the blob follows the global cap again. The watcher
-        /// reads this live, so a change takes effect on the next 30s tick (and an
-        /// override that drops below the current ratio resumes a ratio-paused seed).
+        /// Set or clear a **per-blob** stop-at-ratio override. `Some(cap)` pins this blob
+        /// to `cap` (`0.0` = unlimited) regardless of the global; `None` drops it back to
+        /// the global. Read live by the watcher (effective on the next 30s tick).
         pub fn set_blob_max_ratio(&self, blake3: &str, cap: Option<f64>) {
             let mut g = self.blob_max_ratio.lock().unwrap();
             match cap {
@@ -1744,15 +1627,9 @@ mod bittorrent_adapter {
         }
     }
 
-    /// Remove leaked, *empty* `dl-*` per-fetch scratch dirs under `scratch` at
-    /// session init. An empty `dl-*` dir can only be a shell left by a crash or an
-    /// early-dropped stream (the `create_dir_all` ran but no data file remains) — a
-    /// paused/in-progress BT download always has its partial file inside, so it's
-    /// never empty and is preserved for resume. librqbit doesn't expose a live
-    /// torrent's output path publicly, so "is it empty" is the conservative,
-    /// resume-safe orphan test; the in-process `ScratchGuard` handles the common
-    /// case (verify-fail / early drop) within a run. The librqbit persistence dir
-    /// lives outside `scratch`, so it's never considered here.
+    /// Remove leaked, *empty* `dl-*` per-fetch scratch dirs at session init. Emptiness
+    /// is the resume-safe orphan test: a paused/in-progress download keeps its partial
+    /// file inside, so a non-empty dir is left for resume.
     fn sweep_orphan_scratch(scratch: &std::path::Path) {
         let Ok(entries) = std::fs::read_dir(scratch) else {
             return;
@@ -1778,16 +1655,9 @@ mod bittorrent_adapter {
         }
     }
 
-    /// Periodically enforce the stop-at-ratio cap against each blob's **lifetime**
-    /// upload/size ratio: pause a blob's seed torrents once over the cap, and resume
-    /// the ones it paused if the cap is later lowered or cleared. Cheap: one stats
-    /// read per seeded torrent every 30s. Runs for the life of the session, reading
-    /// the cap live so a runtime change takes effect on the next tick.
-    ///
-    /// Lifetime ratio = `persisted_baseline + this_session_upload` over the blob
-    /// size, so the cap survives restarts (librqbit's upload counter is per-session).
-    /// The persisted total is refreshed each tick; `baseline` is read once per blob
-    /// and cached here so the in-session refresh never double-counts.
+    /// Periodically (30s) enforce the stop-at-ratio cap on each blob's lifetime
+    /// upload/size ratio: pause seed torrents over the cap, resume when it's relaxed.
+    /// Lifetime = persisted baseline + this session, so the cap survives restarts.
     async fn ratio_watch(
         session: Arc<Session>,
         seeds: Arc<Mutex<HashMap<String, SeedEntry>>>,
@@ -2214,20 +2084,9 @@ mod bittorrent_adapter {
         }
     }
 
-    /// Background seed promotion: reflink the CAS blob under its model name, create a
-    /// v1 torrent over it, and add it to the session to seed (DHT-announced). Every
-    /// step degrades gracefully — a failure just means "don't seed this one".
-    ///
-    /// `wanted` is polled after each long step; a concurrent [`unseed`] clears it to
-    /// abort the promotion before the torrent is added (a race the detached spawn
-    /// would otherwise lose, leaking a seed for a model the user just stopped). If we
-    /// do add it, its id is recorded in `seeds` so a *later* unseed can delete it.
     /// Removes this promotion from the blob's `seeds` entry when the promotion task
-    /// ends, so a *failed* promotion (reflink/create/serialize error, or a lost
-    /// `wanted` race) leaves no phantom "Seeding" state behind — `is_seeding` reads
-    /// the map's presence, and a stuck entry also blocks every later re-seed attempt.
-    /// On the success path the promotion has already been moved into `torrent_ids`, so
-    /// the retain is a no-op and the (non-empty) entry is kept.
+    /// ends, so a failed promotion leaves no phantom "Seeding" state behind. On the
+    /// success path it's already moved into `torrent_ids`, so the retain is a no-op.
     struct PromotionGuard {
         seeds: Arc<Mutex<HashMap<String, SeedEntry>>>,
         blake3: String,

@@ -42,15 +42,33 @@ impl TransportKind {
             Self::Iroh => egui::Color32::from_rgb(0x6c, 0x9c, 0xff),
             Self::Https => egui::Color32::from_rgb(0x5d, 0xb0, 0xff),
             Self::HuggingFace => egui::Color32::from_rgb(0xff, 0xb3, 0x47),
-            Self::BitTorrent => egui::Color32::from_rgb(0x6f, 0xcf, 0x7f),
+            // Deliberately NOT green: green is the app-wide success/upload
+            // color, and a protocol brand must not read as a status.
+            Self::BitTorrent => egui::Color32::from_rgb(0xd8, 0x7a, 0xde),
             Self::File => egui::Color32::from_rgb(0x9a, 0x9a, 0x9a),
             Self::Unknown => egui::Color32::from_rgb(0x8a, 0x8a, 0x8a),
         }
     }
 
-    /// The brand color, adjusted for legibility on the current theme. The base
-    /// colors are tuned for a dark background; on light backgrounds they're
-    /// darkened so badge text/icons keep enough contrast (e.g. HF amber on white).
+    /// One-line lay explanation, used as hover text on every pill.
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Iroh => {
+                "Iroh — Noema's worldwide peer network. Verified pieces are striped from many peers at once."
+            }
+            Self::Https => "A direct mirror download, verified against the same hash.",
+            Self::HuggingFace => {
+                "Hugging Face — the original host. Used as a fallback, verified against the same hash."
+            }
+            Self::BitTorrent => {
+                "BitTorrent — the public torrent network. Extra seeders beyond Noema users."
+            }
+            Self::File => "A file already on this machine.",
+            Self::Unknown => "An additional download source.",
+        }
+    }
+
+    /// The brand color, darkened on light backgrounds to preserve contrast.
     pub fn color_on(self, dark: bool) -> egui::Color32 {
         let c = self.color();
         if dark {
@@ -310,7 +328,7 @@ fn transport_pill(
         ui.painter().galley(text_pos, galley, visuals.text_color());
     }
 
-    response.on_hover_text(kind.display_name())
+    response.on_hover_text(kind.description())
 }
 
 fn label_text(text_or_source: &str, kind: TransportKind) -> String {

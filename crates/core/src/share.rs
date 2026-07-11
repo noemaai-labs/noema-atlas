@@ -9,14 +9,9 @@ const BUNDLE_PREFIX: &str = "atlasb1:";
 const B64: base64::engine::general_purpose::GeneralPurpose =
     base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
-/// Everything a peer needs to fetch + verify a shared file.
-///
-/// `name` is the canonical lookup/filename; the optional `title`/`family`/
-/// `quant`/`desc`/`origin` fields let a receiver render a meaningful card *fully
-/// offline* — without them, a model that isn't on Hugging Face would show up as
-/// nothing but a filename. They are descriptive metadata only: the sender typed
-/// them, they are NOT part of the content-verification path (only the hashes
-/// are), so a receiver UI must present them as "sender says", not as verified.
+/// Everything a peer needs to fetch + verify a shared file. The descriptive
+/// fields are "sender says" metadata, NOT part of content verification (only
+/// the hashes are), so a receiver UI must present them as such.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShareTarget {
     /// Suggested file / display name (the canonical slug or filename).
@@ -28,14 +23,11 @@ pub struct ShareTarget {
     /// SHA-256 content id (lowercase hex). The primary lookup key.
     #[serde(rename = "s", default)]
     pub sha256: String,
-    /// BLAKE3 content id (lowercase hex). Optional — resolved via the tracker if
-    /// absent — but included when known for a direct, robust lookup.
+    /// BLAKE3 content id (lowercase hex). Optional — resolved via the tracker if absent.
     #[serde(rename = "b3", default)]
     pub blake3: String,
-    /// License tag (SPDX or HF-style), when known. Lets the receiver decide
-    /// whether the model may be auto-reseeded: an open/open-weight license is
-    /// reshared by default; an unknown license is fetched but kept private until
-    /// the user opts in (so a gated model can't be laundered public via a link).
+    /// License tag (SPDX or HF-style), when known. Controls auto-reseed: open
+    /// licenses reshare by default; unknown ones stay private until the user opts in.
     #[serde(rename = "l", default)]
     pub license: String,
     /// Human display title chosen by the sender, e.g. `Mistral-7B-Instruct-v0.3`.
@@ -53,19 +45,16 @@ pub struct ShareTarget {
     /// Where this came from — e.g. the old Hugging Face URL, now gone.
     #[serde(rename = "o", default, skip_serializing_if = "String::is_empty")]
     pub origin: String,
-    /// BitTorrent magnet (info-hash) when the sender is seeding this file over
-    /// BitTorrent — lets a receiver join the swarm straight from the link. Like the
-    /// other descriptive fields it is "sender says"; the bytes are still verified
-    /// against the content hashes above.
+    /// BitTorrent magnet (info-hash) when the sender is seeding over BitTorrent;
+    /// "sender says" like the other descriptive fields (bytes still hash-verified).
     #[serde(rename = "mag", default, skip_serializing_if = "String::is_empty")]
     pub magnet: String,
 }
 
 impl ShareTarget {
-    /// Whether this target has at least one usable 64-hex content id. The hex
-    /// charset check matters: a content id is later sliced/byte-indexed and used to
-    /// derive on-disk names, so a 64-*byte* string with a multi-byte codepoint must
-    /// not pass here (it would otherwise panic on a non-char-boundary slice).
+    /// Whether this target has a usable 64-hex content id. The hex check matters:
+    /// the id is later byte-sliced, so a 64-*byte* string with a multi-byte codepoint
+    /// must be rejected (else a non-char-boundary slice panics).
     pub fn has_content_id(&self) -> bool {
         is_hex64(&self.sha256) || is_hex64(&self.blake3)
     }
@@ -121,10 +110,8 @@ impl ShareTarget {
     }
 }
 
-/// A multi-file bundle: a whole sharded model (e.g. `model-00001-of-00003`,
-/// `config.json`, `tokenizer.json`) shared under **one** copy-pasteable link.
-/// Each file is still verified independently against its own content id; the
-/// bundle just groups them so a receiver fetches the whole model in one paste.
+/// A multi-file bundle: a whole sharded model shared under one copy-pasteable
+/// link. Each file is still verified independently against its own content id.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShareBundle {
     /// Display name for the whole model, e.g. `Llama-3.1-70B-Instruct`.

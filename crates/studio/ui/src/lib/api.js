@@ -6,7 +6,23 @@ export const api = {
   appInfo: () => invoke("app_info"),
   search: (query) => invoke("search_models", { query }),
   popular: () => invoke("popular_models"),
+  modelList: ({ search, sort, ggufOnly, limit } = {}) =>
+    invoke("model_list", {
+      search: search ?? null,
+      sort: sort || "trending",
+      ggufOnly: !!ggufOnly,
+      limit: limit ?? null,
+    }),
+  modelListPage: (next) => invoke("model_list_page", { next }),
+  modelConversions: (id) => invoke("model_conversions", { id }),
+  checkModelUpdates: () => invoke("check_model_updates"),
+  scanImport: () => invoke("scan_import"),
+  runtimesPresent: () => invoke("runtimes_present"),
+  handoffLmstudio: (path, name) => invoke("handoff_lmstudio", { path, name }),
+  handoffOllama: (path, name) => invoke("handoff_ollama", { path, name }),
   modelDetail: (id) => invoke("model_detail", { id }),
+  readme: (id, revision) => invoke("model_readme", { id, revision }),
+  openExternal: (url) => invoke("open_external", { url }),
   download: (id, file, clientRef, bundle) =>
     invoke("download_model", {
       id,
@@ -84,8 +100,7 @@ export const pickModelFile = () =>
 export const onProgress = (cb) =>
   listen("download://progress", (e) => cb(e.payload));
 export const onDone = (cb) => listen("download://done", (e) => cb(e.payload));
-// Fires once per download, right after the engine registers the manifest, so the
-// front-end can re-key its provisional (`tmp_…`) row by the real transfer id.
+// Fires after the engine registers the manifest, so the UI can re-key its tmp_… row by the real transfer id.
 export const onRegistered = (cb) =>
   listen("download://registered", (e) => cb(e.payload));
 export const onImportProgress = (cb) =>

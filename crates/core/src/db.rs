@@ -156,26 +156,19 @@ CREATE TABLE IF NOT EXISTS bt_blob_ratio (
 );
 "#;
 
-/// Additive column migrations for indexes created before the column existed.
-/// Each `ADD COLUMN` is guarded — a fresh DB already has it from `SCHEMA`, so the
-/// duplicate-column error is expected and ignored.
+/// Additive column migrations; each `ADD COLUMN` is guarded (the duplicate-column error on a fresh DB is expected and ignored).
 fn migrate(conn: &Connection) {
     let _ = conn.execute(
         "ALTER TABLE share_overrides ADD COLUMN confirmed_gated INTEGER NOT NULL DEFAULT 0",
         [],
     );
-    // Cooldown timestamp for integrity bans. Older DBs banned permanently; backfill
-    // any existing ban with `now` so it, too, ages out of the cooldown instead of
-    // stranding the source (often the innocent one that merely *finished* a file over
-    // a corrupt inherited partial) forever.
+    // Cooldown timestamp for integrity bans; backfill existing bans with `now` so old permanent bans age out of the cooldown.
     let _ = conn.execute("ALTER TABLE source_health ADD COLUMN banned_at TEXT", []);
     let _ = conn.execute(
         "UPDATE source_health SET banned_at = ?1 WHERE banned = 1 AND banned_at IS NULL",
         params![crate::util::now_rfc3339()],
     );
-    // Git blob OID → blake3 mapping. Bundle sidecars (config/tokenizer) are
-    // declared git-blob-sha1-only in HF manifests, so this is the only key
-    // install / cache-hit can resolve their committed blobs by.
+    // Git blob OID → blake3 mapping: bundle sidecars are git-sha1-only in HF manifests, the only key to resolve their committed blobs.
     let _ = conn.execute("ALTER TABLE cache_blobs ADD COLUMN git_blob_sha1 TEXT", []);
 }
 
@@ -186,9 +179,8 @@ pub struct Db {
     share_gated: AtomicBool,
 }
 
-/// Lets the BitTorrent transport persist each blob's lifetime upload through the
-/// DB (so the stop-at-ratio cap is a lifetime ratio). Errors are swallowed — a
-/// missed read/write only degrades the ratio accounting, never the transfer.
+/// Persists each blob's lifetime BT upload through the DB (so the ratio cap is
+/// lifetime). Errors are swallowed: a miss only degrades ratio accounting.
 impl crate::transport::BtUploadStore for Db {
     fn load_uploaded(&self, blake3: &str) -> u64 {
         self.bt_uploaded(blake3).unwrap_or(0)
@@ -252,9 +244,8 @@ pub struct SourceHealth {
     pub integrity_failures: i64,
     pub last_latency_ms: Option<i64>,
     pub banned: bool,
-    /// RFC3339 timestamp of the most recent integrity ban (`None` if never banned).
-    /// The planner treats a ban as active only within a cooldown window from this;
-    /// after it, the source is retried (and re-banned if it fails integrity again).
+    /// RFC3339 timestamp of the most recent integrity ban (`None` if never banned);
+    /// the planner treats the ban as active only within a cooldown window from this.
     pub banned_at: Option<String>,
 }
 
@@ -294,7 +285,7 @@ impl Db {
         self.conn.lock().expect("db mutex poisoned")
     }
 
-    /// Enable/disable auto-sharing of gated/restrictive *public* models (the
+    /// Enable/disable auto-sharing of gated/restrictive *public* models.
     pub fn set_share_gated(&self, on: bool) {
         self.share_gated.store(on, Ordering::Relaxed);
     }
@@ -433,18 +424,11 @@ impl Db {
     }
 
     /// Whether a blob is shared to the mesh (LAN serve + worldwide announce).
-    ///
-    /// mesh, or a public mirror) is shared so anyone can find it in Explore —
-    /// auto-shared, so a personal download isn't silently broadcast). A privately
-    /// imported file (publisher `local`, no public source) is NOT auto-shared.
-    /// A per-model override (this table) **always wins, in either direction** —
-    /// Atlas is a content-addressed P2P service that verifies bytes, not
-    /// licenses, so the operator decides what to share (including gated/
-    /// restrictive content they explicitly opt in). A blob of unknown provenance
+    /// A per-model override always wins in either direction; gated/restrictive
+    /// content is shareable only after explicit confirm-before-share.
     pub fn is_blob_shareable(&self, blake3: &str) -> Result<bool> {
-        // Gated/restrictive content needs an explicit confirm-before-share, not
-        // just a `shared=1` override: such a blob is seedable only once the user
-        // has confirmed it (`confirmed_gated`). An explicit stop still wins.
+        // Gated/restrictive content is seedable only after explicit confirm-before-share
+        // (`confirmed_gated`), not a plain `shared=1`; an explicit stop still wins.
         if self.blob_is_gated_or_restrictive(blake3)? {
             if self.share_override(blake3)? == Some(false) {
                 return Ok(false);
@@ -485,14 +469,10 @@ impl Db {
         }))
     }
 
-    /// `(has_manifest, gated, shareable_by_default)` for a cached blob, derived
-    /// from ALL its containing manifest(s). `gated` is true if any is
-    /// access-controlled (surfaced as a Library badge); `shareable_by_default` is
-    /// true if at least one manifest is publicly auto-shareable — openly-licensed
-    /// public models always, plus gated/restrictive public models when the
-    /// `share_gated` opt-in is on (Atlas verifies content, not licenses). Matches
-    /// artifacts by blake3 OR the blob's sha256 (HF-synth manifests are
-    /// sha256-only until first download).
+    /// `(has_manifest, gated, shareable_by_default)` for a cached blob, derived from
+    /// all its manifest(s). `gated` if any is access-controlled; `shareable_by_default`
+    /// if any is publicly auto-shareable (openly-licensed always, gated/restrictive when
+    /// the `share_gated` opt-in is on). Matches by blake3 OR sha256 (HF-synth is sha256-only).
     pub fn blob_provenance(&self, blake3: &str) -> Result<(bool, bool, bool)> {
         let include_gated = self.share_gated();
         let conn = self.lock();
@@ -530,10 +510,9 @@ impl Db {
         Ok((true, gated, any_auto))
     }
 
-    /// Browse metadata for a cached blob from its containing manifest(s):
-    /// `(model_name, license_spdx, quant)`. `quant` is the model's quantization
-    /// variant (e.g. `Q4_K_M`), parsed from the manifest. Matches artifacts by
-    /// blake3 OR sha256 (HF-synth manifests are sha256-only).
+    /// Browse metadata `(model_name, license_spdx, quant)` for a cached blob from its
+    /// manifest(s); `quant` is the quantization variant (e.g. `Q4_K_M`). Matches by
+    /// blake3 OR sha256 (HF-synth is sha256-only).
     pub fn blob_catalog_meta(
         &self,
         blake3: &str,
@@ -604,9 +583,8 @@ impl Db {
         Ok(())
     }
 
-    /// Record the user's explicit confirmation to share a gated/restrictive blob:
-    /// sets both `shared` and `confirmed_gated`. Required before such content is
-    /// seeded (openly-licensed content auto-shares without this).
+    /// Record explicit confirmation to share a gated/restrictive blob: sets both
+    /// `shared` and `confirmed_gated`, required before such content is seeded.
     pub fn confirm_gated_share(&self, blake3: &str, sha256: &str) -> Result<()> {
         let conn = self.lock();
         conn.execute(
@@ -618,10 +596,9 @@ impl Db {
         Ok(())
     }
 
-    /// Revoke every confirmed gated/restrictive share at once (the global
-    /// "stop sharing gated models" action): clears `confirmed_gated` and `shared`
-    /// for all such overrides so `is_blob_shareable` flips them to false. Returns
-    /// the `(blake3, sha256)` of each cleared blob so callers can unseed it.
+    /// Revoke every confirmed gated/restrictive share at once: clears `confirmed_gated`
+    /// and `shared` for all such overrides. Returns each cleared `(blake3, sha256)` so
+    /// callers can unseed it.
     pub fn clear_all_gated_confirmations(&self) -> Result<Vec<(String, String)>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
@@ -667,9 +644,8 @@ impl Db {
         Ok(())
     }
 
-    /// Forget the persisted BitTorrent magnet for a blob — called when the blob
-    /// stops being BT-seeded (share-off / evict) so it no longer rides out in
-    /// share links and tracker announces. No-op if no magnet was recorded.
+    /// Forget the persisted BitTorrent magnet for a blob (on share-off / evict) so it
+    /// no longer rides out in share links. No-op if no magnet was recorded.
     pub fn clear_bt_magnet(&self, blake3: &str) -> Result<()> {
         let conn = self.lock();
         conn.execute("DELETE FROM bt_magnets WHERE blake3 = ?1", params![blake3])?;
@@ -713,10 +689,9 @@ impl Db {
         Ok(v.unwrap_or(0).max(0) as u64)
     }
 
-    /// Set or clear a per-model BitTorrent stop-at-ratio override. `Some(cap)` stores
-    /// it (`0.0` = unlimited for this blob); `None` removes the override so the blob
-    /// follows the global cap. Best-effort: a DB error is logged, not propagated, so a
-    /// settings change never fails on persistence.
+    /// Set or clear a per-model BT stop-at-ratio override: `Some(cap)` stores it (`0.0`
+    /// = unlimited), `None` removes it (blob follows the global cap). Best-effort: a DB
+    /// error is logged, not propagated.
     pub fn set_bt_blob_ratio(&self, blake3: &str, cap: Option<f64>) {
         let conn = self.lock();
         let res = match cap {
@@ -764,10 +739,9 @@ impl Db {
 
     pub fn upsert_cache_blob(&self, meta: &BlobMeta, state: &str) -> Result<()> {
         let conn = self.lock();
-        // Keyed on blake3. On re-upsert, never clobber a known sha256/size with an
-        // empty/zero one: a blake3-only manifest (or a bare Content-ID add) can
-        // re-touch a blob whose sha256 we already learned, and that sha256 is now
-        // load-bearing for `is_blob_shareable`'s sha256 match.
+        // On re-upsert, never clobber a known sha256/size with an empty/zero one: a
+        // blake3-only re-touch must not lose a sha256 that `is_blob_shareable`'s
+        // sha256 match now depends on.
         conn.execute(
             "INSERT INTO cache_blobs (blake3, sha256, size_bytes, state, committed_at)
              VALUES (?1,?2,?3,?4,?5)
@@ -860,9 +834,8 @@ impl Db {
     pub fn delete_cache_blob(&self, blake3: &str) -> Result<()> {
         let conn = self.lock();
         conn.execute("DELETE FROM cache_blobs WHERE blake3 = ?1", params![blake3])?;
-        // Drop any share override too, so a later re-download starts from the
-        // default (e.g. a gated model goes back to private rather than silently
-        // re-sharing because of a stale opt-in).
+        // Drop any share override too, so a later re-download starts from the default
+        // (a gated model goes back to private, not a stale re-share).
         conn.execute(
             "DELETE FROM share_overrides WHERE blake3 = ?1",
             params![blake3],
@@ -964,9 +937,8 @@ impl Db {
         Ok(())
     }
 
-    /// Drop a download row entirely — used by a user Stop, which discards the
-    /// partial transfer so the next attempt starts clean (no `paused` row to
-    /// resume from). No-op if the row doesn't exist.
+    /// Drop a download row entirely (user Stop): discards the partial so the next
+    /// attempt starts clean, not resuming a `paused` row. No-op if absent.
     pub fn delete_download(&self, download_id: &str) -> Result<()> {
         let conn = self.lock();
         conn.execute(
@@ -1061,11 +1033,10 @@ impl Db {
         let succ = success as i64;
         let fail = (!success) as i64;
         let integ = integrity_failure as i64;
-        // For a fresh row: an integrity failure bans it (stamping `banned_at`); a plain
-        // success/failure does not. For an existing row: a SUCCESS clears any ban (the
-        // source has proven itself), an integrity failure (re-)stamps the ban time, and
-        // an ordinary failure leaves the ban window untouched. The ban is thus a
-        // cooldown, not a life sentence — the planner retries after it elapses.
+        // Fresh row: an integrity failure bans it (stamping `banned_at`); plain
+        // success/failure does not. Existing row: a SUCCESS clears any ban, an integrity
+        // failure (re-)stamps the ban time, an ordinary failure leaves it untouched —
+        // so the ban is a cooldown the planner retries after, not permanent.
         let ban_insert = if success { 0 } else { integ };
         let ban_at_insert: Option<&str> = (!success && integrity_failure).then_some(now.as_str());
         conn.execute(

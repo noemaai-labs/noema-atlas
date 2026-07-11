@@ -1,7 +1,7 @@
 <script>
   import { onMount, onDestroy } from "svelte";
   import { api } from "../api.js";
-  import { fmtSize, rowFormat, formatId } from "../format.js";
+  import { fmtSize, rowFormat, formatId, TRANSPORT_HINTS } from "../format.js";
   import RouteDetail from "../RouteDetail.svelte";
   export let startLink = () => {};
   export let startMesh = () => {};
@@ -74,18 +74,55 @@
     started = started;
   }
 
-  onMount(() => {
+  // Multi-GB downloads confirm first (name + size) unless the user opted out via
+  // "Don't ask again" (settings.skip_download_confirm). RouteDetail's Get bypasses
+  // this: its modal already showed name + size behind an explicit button.
+  let settings = null;
+  let confirmDl = null; // { kind: "mesh", m } | { kind: "link", link }
+  let dontAsk = false;
+  function requestGet(m) {
+    if (settings && settings.skip_download_confirm) return get(m);
+    dontAsk = false;
+    confirmDl = { kind: "mesh", m };
+  }
+  function requestAdd() {
+    const l = link.trim();
+    if (!l) return;
+    if (settings && settings.skip_download_confirm) return add();
+    dontAsk = false;
+    confirmDl = { kind: "link", link: l };
+  }
+  async function acceptConfirm() {
+    const c = confirmDl;
+    confirmDl = null;
+    if (!c) return;
+    if (dontAsk) {
+      try {
+        const s = settings || (await api.getSettings());
+        s.skip_download_confirm = true;
+        await api.saveSettings(s);
+        settings = s;
+      } catch (e) {}
+    }
+    if (c.kind === "mesh") get(c.m);
+    else add();
+  }
+
+  onMount(async () => {
     search();
     timer = setInterval(() => {
       if (!loading) search();
     }, 20000);
+    try {
+      settings = await api.getSettings();
+    } catch (e) {}
   });
   onDestroy(() => timer && clearInterval(timer));
 </script>
 
 <div class="view">
   <div style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
-    <h2 style="margin:0;">Explore the worldwide mesh</h2>
+    <h2 style="margin:0;">Explore the Atlas network</h2>
     <button class="btn sm" on:click={search} disabled={loading}>
       {loading ? "Refreshing…" : "Refresh"}
     </button>
@@ -95,14 +132,14 @@
     <input
       bind:value={link}
       placeholder="Paste a share link — atlas1:… or atlasb1:…"
-      on:keydown={(e) => e.key === "Enter" && add()}
+      on:keydown={(e) => e.key === "Enter" && requestAdd()}
     />
-    <button class="btn primary" on:click={add}>Add</button>
+    <button class="btn primary" on:click={requestAdd}>Add</button>
   </div>
   {#if linkStarted}
     <p class="dl-ack" style="margin:-8px 0 14px;">
       <span class="upwave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
-      <span class="dl-live">Fetching from the mesh…</span>
+      <span class="dl-live">Searching the Atlas network…</span>
       <button class="btn sm" on:click={goTransfers}>View transfer</button>
     </p>
   {/if}
@@ -148,7 +185,7 @@
               <button class="btn sm" on:click={goTransfers}>View transfer</button>
             </div>
           {:else}
-            <button class="btn sm primary" on:click={() => get(m)}>Get</button>
+            <button class="btn sm primary" on:click={() => requestGet(m)}>Get</button>
           {/if}
         </div>
       </div>
@@ -173,7 +210,11 @@
               {m.name}
               {#if rowFormat(null, m.name)}<span class="pill fmt f-{formatId(null, m.name)}">{rowFormat(null, m.name)}</span>{/if}
             </div>
-            <div class="muted">{fmtSize(m.size)}{m.quant ? " · " + m.quant : ""}{m.license ? " · " + m.license : ""} · Iroh {m.peers} · BitTorrent {m.bt_seeders}</div>
+            <div class="muted">
+              {fmtSize(m.size)}{m.quant ? " · " + m.quant : ""}{m.license ? " · " + m.license : ""}
+              <span class="pill t-iroh" title={TRANSPORT_HINTS.iroh}>Iroh {m.peers}</span>
+              <span class="pill t-bt" title={TRANSPORT_HINTS.bt}>BitTorrent {m.bt_seeders}</span>
+            </div>
           </div>
           {#if m.in_library}
             <span class="pill">in library</span>
@@ -184,7 +225,7 @@
               <button class="btn sm" on:click={goTransfers}>View transfer</button>
             </div>
           {:else}
-            <button class="btn sm primary" on:click={() => get(m)}>Get</button>
+            <button class="btn sm primary" on:click={() => requestGet(m)}>Get</button>
           {/if}
         </div>
       </div>
@@ -193,11 +234,38 @@
 
   {#if !loading && results.length === 0 && !error}
     <p class="muted">
-      No models on the mesh yet. Paste a share link above to fetch one, or turn on
-      worldwide sharing in Settings so your models appear here.
+      Nothing shared on the Atlas network yet. Paste a share link above to fetch one,
+      or turn on worldwide sharing in Settings so your models appear here.
     </p>
   {/if}
 </div>
+
+{#if confirmDl}
+  <div class="modal-backdrop">
+    <div class="modal" style="max-width:440px">
+      <div class="modal-head"><h3>Download this model?</h3></div>
+      {#if confirmDl.kind === "mesh"}
+        <p class="muted">
+          <strong>{confirmDl.m.name}</strong> ·
+          {confirmDl.m.size ? fmtSize(confirmDl.m.size) : "size unknown"}
+        </p>
+      {:else}
+        <p class="muted">Fetch the model behind this share link — size unknown until the manifest arrives.</p>
+        <p class="mono" style="word-break:break-all; user-select:text">
+          {confirmDl.link.length > 90 ? confirmDl.link.slice(0, 90) + "…" : confirmDl.link}
+        </p>
+      {/if}
+      <label class="check">
+        <input type="checkbox" bind:checked={dontAsk} />
+        Don't ask again
+      </label>
+      <div class="actions">
+        <button class="btn" on:click={() => (confirmDl = null)}>Cancel</button>
+        <button class="btn primary" on:click={acceptConfirm}>Download</button>
+      </div>
+    </div>
+  </div>
+{/if}
 
 {#if detailItem}
   <RouteDetail

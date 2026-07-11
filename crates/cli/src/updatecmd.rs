@@ -1,11 +1,5 @@
 //! `noema update …` — offline tooling to mint the signed auto-update manifest the
-//! VPS serves at `/update/latest`.
-//!
-//! This runs **locally**, decoupled from CI: the private signing key never leaves
-//! the release manager's machine, so a CI compromise can't forge an update. The
-//! typical release step is `noema update sign --spec spec.json --assets-dir out/
-//! --secret-file release.key --out release-manifest.json`, then scp that file to the
-//! VPS and attach it to the GitHub release as a fallback source.
+//! VPS serves at `/update/latest`; runs locally so the signing key never touches CI.
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
@@ -188,8 +182,7 @@ fn read_secret(args: &SignArgs) -> Result<String> {
     if raw.is_empty() {
         bail!("no signing key: pass --secret-file, --secret, or set NOEMA_UPDATE_SECRET");
     }
-    // Validate the shape up front so a malformed key fails fast, before we hash every
-    // asset, rather than with an opaque error at signing time.
+    // Validate the shape up front so a malformed key fails fast, before we hash every asset.
     if raw.len() != 64 || !raw.bytes().all(|b| b.is_ascii_hexdigit()) {
         bail!("signing key must be a 32-byte ed25519 seed as 64 hex chars");
     }

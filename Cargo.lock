@@ -4730,7 +4730,7 @@ checksum = "43794a0ace135be66a25d3ae77d41b91615fb68ae937f904090203e81f755b65"
 
 [[package]]
 name = "noema-cli"
-version = "0.2.0-alpha.3"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum 0.7.9",
@@ -4751,7 +4751,7 @@ dependencies = [
 
 [[package]]
 name = "noema-core"
-version = "0.2.0-alpha.3"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -4791,7 +4791,7 @@ dependencies = [
 
 [[package]]
 name = "noema-desktop"
-version = "0.2.0-alpha.3"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "eframe",
@@ -4812,7 +4812,7 @@ dependencies = [
 
 [[package]]
 name = "noema-registry"
-version = "0.2.0-alpha.3"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum 0.7.9",

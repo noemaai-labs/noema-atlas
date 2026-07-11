@@ -31,8 +31,7 @@
   }
   onDestroy(stopProgress);
 
-  // Button label while working: a live phase ("Hashing… 47%") beats a dead
-  // "Working…" so a multi-gigabyte import never looks frozen.
+  // Live phase label (e.g. "Hashing… 47%") so a large import never looks frozen.
   $: workingLabel =
     phase === "hashing" && pct > 0 ? `Hashing… ${pct}%` : "Working…";
 

@@ -6,11 +6,8 @@ use crate::manifest::{
 };
 use serde::Deserialize;
 
-/// The canonical Hub origin. Used for the human-facing `license_url` /
-/// `model_card_ref` embedded in synthesized manifests, so those stay identical
-/// regardless of whether *this* user fetched the catalog via a mirror — keeping
-/// content-addressed manifests stable across mirror and non-mirror peers. The
-/// `model_detail`) so an HF mirror works exactly like the real Hub.
+/// The canonical Hub origin, used for `license_url` / `model_card_ref` in
+/// synthesized manifests so content-addressed manifests stay stable across mirrors.
 pub const HF_CANONICAL_ENDPOINT: &str = "https://huggingface.co";
 
 /// Normalize a configured Hub endpoint (trim trailing slashes), falling back to
@@ -50,16 +47,11 @@ impl HfModel {
     pub fn has_gguf(&self) -> bool {
         self.tags.iter().any(|t| t == "gguf")
     }
-    /// The weight/serialization formats this repo publishes (GGUF, Safetensors,
-    /// MLX, ONNX, …), read from its Hub tags and returned as canonical ids in a
-    /// stable display order. Ids match [`crate::inspect::pretty_format`], so the
-    /// Discover card chips read identically to the per-variant format badges.
-    /// Deduped; empty when no recognized format tag is present.
+    /// The weight/serialization formats this repo publishes (from Hub tags), as
+    /// canonical ids in display order; deduped, empty when none recognized.
     pub fn model_formats(&self) -> Vec<&'static str> {
-        // (Hub tag, canonical format id), ordered by display priority. GGUF and
-        // MLX lead because they're the locally-runnable formats Atlas targets.
-        // Tags are the library identifiers the Hub actually emits; a couple of
-        // formats have two spellings (jax/flax, paddle/paddlepaddle) folded here.
+        // (Hub tag, canonical format id), in display-priority order; alias
+        // spellings (jax/flax, paddle/paddlepaddle) fold to one id.
         const MAP: &[(&str, &str)] = &[
             ("gguf", "gguf"),
             ("mlx", "mlx"),
@@ -110,9 +102,7 @@ pub struct HfFile {
 
 impl HfFile {
     pub fn format(&self) -> Option<String> {
-        // Sidecar config/index files are JSON; otherwise defer to the shared
-        // detector so the HF browser labels the same formats as the rest of the
-        // app (GGUF, Safetensors, ONNX, MLX, PyTorch, Core ML, …).
+        // Sidecar config/index files are JSON; otherwise defer to the shared detector.
         if self.rfilename.to_ascii_lowercase().ends_with(".json") {
             return Some("json".into());
         }
@@ -176,7 +166,7 @@ impl HfFile {
 }
 
 /// Full model detail: revision-pinned files + gating + license.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct HfModelDetail {
     pub id: String,
     pub revision: String,
@@ -185,10 +175,18 @@ pub struct HfModelDetail {
     /// Repo tags (e.g. `mlx`, `gguf`, `safetensors`) — used to label the bundle.
     pub tags: Vec<String>,
     pub files: Vec<HfFile>,
+    pub downloads: u64,
+    pub likes: u64,
+    pub last_modified: Option<String>,
+    /// Total parameter count, when the Hub reports it (safetensors or GGUF meta).
+    pub params: Option<u64>,
+    /// Context window in tokens, when the Hub reports it (GGUF metadata).
+    pub context_length: Option<u64>,
+    /// Model architecture (e.g. `llama`), from GGUF metadata or the repo config.
+    pub architecture: Option<String>,
 }
 
-/// One GGUF quant. Large models split a quant across several shard files
-/// quant whose `files` download and install together as one model.
+/// One GGUF quant, possibly split across shard files that download and install as one model.
 #[derive(Debug, Clone)]
 pub struct GgufQuant {
     pub label: String,
@@ -230,6 +228,31 @@ fn quant_label_from_stem(stem: &str) -> String {
 impl HfModelDetail {
     pub fn name(&self) -> &str {
         self.id.rsplit('/').next().unwrap_or(&self.id)
+    }
+    /// Parameter count as a compact label ("7.6B", "356M"), when known.
+    pub fn params_label(&self) -> Option<String> {
+        let n = self.params?;
+        Some(if n >= 1_000_000_000 {
+            let b = n as f64 / 1e9;
+            if b >= 100.0 {
+                format!("{b:.0}B")
+            } else {
+                format!("{b:.1}B")
+            }
+        } else if n >= 1_000_000 {
+            format!("{:.0}M", n as f64 / 1e6)
+        } else {
+            n.to_string()
+        })
+    }
+    /// Context window as a compact label ("128K", "32K"), when known.
+    pub fn context_label(&self) -> Option<String> {
+        let n = self.context_length?;
+        Some(if n >= 1024 {
+            format!("{}K", n / 1024)
+        } else {
+            n.to_string()
+        })
     }
     /// Downloadable weight files, largest-first is rarely useful; keep API order.
     pub fn weight_files(&self) -> Vec<&HfFile> {
@@ -354,6 +377,42 @@ struct RawDetail {
     tags: Vec<String>,
     #[serde(default)]
     siblings: Vec<RawSibling>,
+    #[serde(default)]
+    downloads: u64,
+    #[serde(default)]
+    likes: u64,
+    #[serde(rename = "lastModified", default)]
+    last_modified: Option<String>,
+    #[serde(default)]
+    config: Option<RawConfig>,
+    #[serde(default)]
+    safetensors: Option<RawParamCount>,
+    #[serde(default)]
+    gguf: Option<RawGgufMeta>,
+}
+
+#[derive(Deserialize)]
+struct RawConfig {
+    #[serde(default)]
+    architectures: Vec<String>,
+    #[serde(default)]
+    model_type: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawParamCount {
+    #[serde(default)]
+    total: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct RawGgufMeta {
+    #[serde(default)]
+    total: Option<u64>,
+    #[serde(default)]
+    architecture: Option<String>,
+    #[serde(default)]
+    context_length: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -389,9 +448,8 @@ fn license_from_tags(tags: &[String]) -> Option<String> {
         .find_map(|t| t.strip_prefix("license:").map(|s| s.to_string()))
 }
 
-/// Classify an HF license tag into a redistribution policy. Thin wrapper over the
-/// shared [`RedistributionClass::for_license`] so the importer and the
-/// content-link path recognize the same open / open-weight licenses.
+/// Classify an HF license tag into a redistribution policy, via the shared
+/// [`RedistributionClass::for_license`].
 fn redistribution_for(license: &Option<String>) -> RedistributionClass {
     RedistributionClass::for_license(license.as_deref())
 }
@@ -425,11 +483,169 @@ async fn get_json<T: serde::de::DeserializeOwned>(
     serde_json::from_slice(&bytes).map_err(Error::from)
 }
 
-/// Search the Hub for models matching `query`.
+/// How to order a Hub model listing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ModelSort {
+    /// The Hub's "hot right now" ranking.
+    #[default]
+    Trending,
+    Downloads,
+    Likes,
+    Updated,
+}
+
+impl ModelSort {
+    fn api_key(self) -> &'static str {
+        match self {
+            ModelSort::Trending => "trendingScore",
+            ModelSort::Downloads => "downloads",
+            ModelSort::Likes => "likes",
+            ModelSort::Updated => "lastModified",
+        }
+    }
+}
+
+/// Parameters for one page of a Hub model listing (search / browse / drill-down).
+#[derive(Debug, Clone, Default)]
+pub struct ModelListQuery {
+    pub search: Option<String>,
+    /// Restrict to one publisher/org (the Hub `author` param).
+    pub author: Option<String>,
+    /// Tag filters, ANDed by the Hub — e.g. `gguf`, `license:apache-2.0`,
+    /// `base_model:quantized:org/name`.
+    pub filters: Vec<String>,
+    pub sort: ModelSort,
+    pub limit: usize,
+}
+
+/// One page of a model listing plus the cursor URL of the next page.
+#[derive(Debug, Clone)]
+pub struct ModelPage {
+    pub models: Vec<HfModel>,
+    /// Absolute URL of the next page (from the Hub's `Link: rel="next"` header),
+    /// consumed by [`list_models_page`]. `None` = last page.
+    pub next: Option<String>,
+}
+
+fn raw_to_model(m: RawModel) -> HfModel {
+    HfModel {
+        id: m.id,
+        downloads: m.downloads,
+        likes: m.likes,
+        pipeline_tag: m.pipeline_tag,
+        gated: parse_gated(&m.gated),
+        last_modified: m.last_modified,
+        tags: m.tags,
+    }
+}
+
+/// The `rel="next"` target of an RFC-8288 `Link` header, if any.
+fn next_link(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let link = headers.get(reqwest::header::LINK)?.to_str().ok()?;
+    for part in link.split(',') {
+        let part = part.trim();
+        if part.contains("rel=\"next\"") {
+            let url = part.split('>').next()?.trim().strip_prefix('<')?;
+            return Some(url.to_string());
+        }
+    }
+    None
+}
+
+async fn get_models_page(
+    client: &reqwest::Client,
+    url: &str,
+    query: &[(&str, &str)],
+    token: Option<&str>,
+    endpoint: &str,
+) -> Result<ModelPage> {
+    let mut req = client.get(url);
+    if !query.is_empty() {
+        req = req.query(query);
+    }
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| Error::other(format!("hugging face request: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(Error::other(format!(
+            "hugging face returned {}",
+            resp.status()
+        )));
+    }
+    // Only follow pagination back to the origin we queried — a hostile mirror
+    // must not be able to point the next page anywhere else.
+    let next = next_link(resp.headers()).filter(|n| n.starts_with(normalize_endpoint(endpoint)));
+    let bytes = crate::util::read_body_capped(resp, 32 * 1024 * 1024).await?;
+    let raw: Vec<RawModel> = serde_json::from_slice(&bytes).map_err(Error::from)?;
+    Ok(ModelPage {
+        models: raw.into_iter().map(raw_to_model).collect(),
+        next,
+    })
+}
+
+/// List Hub models: search, author drill-down, tag facets, sort, pagination.
 ///
-/// `endpoint` is the Hub origin to query (e.g. `https://huggingface.co` or an HF
-/// mirror like `https://hf-mirror.com`); a mirror exposes the same API surface,
-/// so it works identically.
+/// `endpoint` is the Hub origin to query (real Hub or an HF mirror).
+pub async fn list_models(
+    client: &reqwest::Client,
+    endpoint: &str,
+    query: &ModelListQuery,
+    token: Option<&str>,
+) -> Result<ModelPage> {
+    let url = format!("{}/api/models", normalize_endpoint(endpoint));
+    let limit_s = query.limit.max(1).to_string();
+    let mut params: Vec<(&str, &str)> = vec![
+        ("limit", &limit_s),
+        ("full", "true"),
+        ("config", "false"),
+        ("sort", query.sort.api_key()),
+        ("direction", "-1"),
+    ];
+    if let Some(s) = query.search.as_deref().filter(|s| !s.trim().is_empty()) {
+        params.push(("search", s));
+    }
+    if let Some(a) = query.author.as_deref().filter(|a| !a.trim().is_empty()) {
+        params.push(("author", a));
+    }
+    for f in &query.filters {
+        params.push(("filter", f));
+    }
+    get_models_page(client, &url, &params, token, endpoint).await
+}
+
+/// Fetch the next page of a listing, using the cursor URL from a prior
+/// [`ModelPage::next`].
+pub async fn list_models_page(
+    client: &reqwest::Client,
+    next_url: &str,
+    token: Option<&str>,
+) -> Result<ModelPage> {
+    get_models_page(client, next_url, &[], token, next_url).await
+}
+
+/// GGUF/MLX/other conversions of a base repo, via the Hub's model-tree tags
+/// (`base_model:quantized:<repo>`), most-downloaded first.
+pub async fn model_conversions(
+    client: &reqwest::Client,
+    endpoint: &str,
+    base_id: &str,
+    limit: usize,
+    token: Option<&str>,
+) -> Result<Vec<HfModel>> {
+    let q = ModelListQuery {
+        filters: vec![format!("base_model:quantized:{base_id}")],
+        sort: ModelSort::Downloads,
+        limit,
+        ..Default::default()
+    };
+    Ok(list_models(client, endpoint, &q, token).await?.models)
+}
+
+/// Search the Hub for models matching `query` (Hub relevance order).
 pub async fn search_models(
     client: &reqwest::Client,
     endpoint: &str,
@@ -437,6 +653,8 @@ pub async fn search_models(
     limit: usize,
     token: Option<&str>,
 ) -> Result<Vec<HfModel>> {
+    // Hub relevance ranking only applies without an explicit sort key, so this
+    // bypasses list_models' always-sorted form.
     let url = format!("{}/api/models", normalize_endpoint(endpoint));
     let limit_s = limit.to_string();
     let raw: Vec<RawModel> = get_json(
@@ -451,54 +669,57 @@ pub async fn search_models(
         token,
     )
     .await?;
-    Ok(raw
-        .into_iter()
-        .map(|m| HfModel {
-            id: m.id,
-            downloads: m.downloads,
-            likes: m.likes,
-            pipeline_tag: m.pipeline_tag,
-            gated: parse_gated(&m.gated),
-            last_modified: m.last_modified,
-            tags: m.tags,
-        })
-        .collect())
+    Ok(raw.into_iter().map(raw_to_model).collect())
 }
 
-/// The most-downloaded models on the Hub (no search filter), for a default
+/// The most-downloaded models on the Hub (no search filter).
 pub async fn popular_models(
     client: &reqwest::Client,
     endpoint: &str,
     limit: usize,
     token: Option<&str>,
 ) -> Result<Vec<HfModel>> {
-    let url = format!("{}/api/models", normalize_endpoint(endpoint));
-    let limit_s = limit.to_string();
-    let raw: Vec<RawModel> = get_json(
-        client,
-        &url,
-        &[
-            ("sort", "downloads"),
-            ("direction", "-1"),
-            ("limit", &limit_s),
-            ("full", "true"),
-            ("config", "false"),
-        ],
-        token,
+    let q = ModelListQuery {
+        sort: ModelSort::Downloads,
+        limit,
+        ..Default::default()
+    };
+    Ok(list_models(client, endpoint, &q, token).await?.models)
+}
+
+/// Coarse quality tier for a GGUF quant label (static community wisdom).
+/// `None` for unrecognized labels.
+pub fn quant_quality_tier(label: &str) -> Option<(&'static str, &'static str)> {
+    let l = label.trim().to_ascii_uppercase();
+    let starts = |p: &str| l.starts_with(p);
+    Some(
+        if starts("F32") || starts("F16") || starts("BF16") || starts("FP16") || starts("FP32") {
+            (
+                "full precision",
+                "Original unquantized weights — biggest files, reference quality",
+            )
+        } else if starts("Q8") {
+            (
+                "near-lossless",
+                "Practically indistinguishable from the original",
+            )
+        } else if starts("Q6") {
+            ("near-lossless", "Very close to the original")
+        } else if starts("Q5") {
+            (
+                "balanced+",
+                "A notch above the Q4 sweet spot, for a little more size",
+            )
+        } else if starts("Q4") || starts("IQ4") {
+            ("balanced", "The community sweet spot — good quality per GB")
+        } else if starts("Q3") || starts("IQ3") {
+            ("compact", "Noticeable quality loss — for tight memory")
+        } else if starts("Q2") || starts("IQ2") || starts("IQ1") || starts("Q1") || starts("TQ") {
+            ("smallest", "Visibly degraded — only when nothing else fits")
+        } else {
+            return None;
+        },
     )
-    .await?;
-    Ok(raw
-        .into_iter()
-        .map(|m| HfModel {
-            id: m.id,
-            downloads: m.downloads,
-            likes: m.likes,
-            pipeline_tag: m.pipeline_tag,
-            gated: parse_gated(&m.gated),
-            last_modified: m.last_modified,
-            tags: m.tags,
-        })
-        .collect())
 }
 
 /// Fetch a model's revision-pinned file list + gating + license.
@@ -533,6 +754,23 @@ pub async fn model_detail(
             }
         })
         .collect();
+    let params = raw
+        .safetensors
+        .as_ref()
+        .and_then(|s| s.total)
+        .or_else(|| raw.gguf.as_ref().and_then(|g| g.total));
+    let architecture = raw
+        .gguf
+        .as_ref()
+        .and_then(|g| g.architecture.clone())
+        .or_else(|| {
+            raw.config.as_ref().and_then(|c| {
+                c.architectures
+                    .first()
+                    .cloned()
+                    .or_else(|| c.model_type.clone())
+            })
+        });
     Ok(HfModelDetail {
         id: id.to_string(),
         revision: raw.sha.unwrap_or_else(|| "main".to_string()),
@@ -540,7 +778,49 @@ pub async fn model_detail(
         license: license_from_tags(&raw.tags),
         tags: raw.tags,
         files,
+        downloads: raw.downloads,
+        likes: raw.likes,
+        last_modified: raw.last_modified,
+        params,
+        context_length: raw.gguf.as_ref().and_then(|g| g.context_length),
+        architecture,
     })
+}
+
+/// Fetch a model's raw README.md (the model card body) pinned to `revision`.
+/// Returns `Ok(None)` when the repo has no README.
+pub async fn model_readme(
+    client: &reqwest::Client,
+    endpoint: &str,
+    id: &str,
+    revision: &str,
+    token: Option<&str>,
+) -> Result<Option<String>> {
+    let url = format!(
+        "{}/{id}/resolve/{revision}/README.md",
+        normalize_endpoint(endpoint)
+    );
+    let mut req = client.get(&url);
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| Error::other(format!("hugging face request: {e}")))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        return Err(Error::other(format!(
+            "hugging face returned {}",
+            resp.status()
+        )));
+    }
+    // Model cards are text; bound the body so a hostile mirror can't stream an
+    // unbounded one.
+    let bytes = crate::util::read_body_capped(resp, 4 * 1024 * 1024).await?;
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
 }
 
 /// Synthesize a (sha256-backed, unsigned) manifest for one file of an HF model.
@@ -632,10 +912,9 @@ pub fn manifest_for(detail: &HfModelDetail, file: &HfFile) -> Result<Manifest> {
     Ok(manifest)
 }
 
-/// Synthesize one manifest for a GGUF quant that may be split across several
-/// shard files (`…-00001-of-00009.gguf`). Each shard is an artifact verified by
-/// its LFS sha256, so a single download fetches, verifies, caches, and installs
-/// the whole quant as one model. A single-file quant routes through here too
+/// Synthesize one manifest for a GGUF quant, possibly split across shard files
+/// (`…-00001-of-00009.gguf`) each verified by its LFS sha256, that download and
+/// install as one model. Single-file quants route through here too.
 pub fn manifest_for_gguf_quant(detail: &HfModelDetail, files: &[HfFile]) -> Result<Manifest> {
     if files.is_empty() {
         return Err(Error::other("no GGUF files in this quant"));
@@ -734,10 +1013,9 @@ pub fn manifest_for_gguf_quant(detail: &HfModelDetail, files: &[HfFile]) -> Resu
 }
 
 /// Synthesize one manifest covering an entire sharded safetensors/MLX model:
-/// every weight shard (verified by its LFS sha256) plus the companion files —
-/// config, tokenizer, shard index — needed to load it (verified by the git blob
-/// OID the Hub publishes for those non-LFS files). One manifest ⇒ one download
-/// button ⇒ the rest of the engine (verify, cache, resume, P2P) works unchanged.
+/// every weight shard (verified by its LFS sha256) plus the companion files
+/// (config, tokenizer, shard index) needed to load it, verified by the git blob
+/// OID the Hub publishes for those non-LFS files.
 pub fn manifest_for_bundle(detail: &HfModelDetail) -> Result<Manifest> {
     let shards = detail.safetensors_shards();
     if shards.is_empty() {
@@ -1006,6 +1284,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn next_link_parses_hub_pagination() {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(
+            reqwest::header::LINK,
+            "<https://huggingface.co/api/models?cursor=abc&limit=30>; rel=\"next\""
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            next_link(&h).as_deref(),
+            Some("https://huggingface.co/api/models?cursor=abc&limit=30")
+        );
+        let empty = reqwest::header::HeaderMap::new();
+        assert!(next_link(&empty).is_none());
+    }
+
+    #[test]
+    fn quality_tiers_cover_common_quants() {
+        assert_eq!(quant_quality_tier("Q4_K_M").unwrap().0, "balanced");
+        assert_eq!(quant_quality_tier("IQ2_XS").unwrap().0, "smallest");
+        assert_eq!(quant_quality_tier("Q8_0").unwrap().0, "near-lossless");
+        assert_eq!(quant_quality_tier("F16").unwrap().0, "full precision");
+        assert_eq!(quant_quality_tier("q6_k").unwrap().0, "near-lossless");
+        assert!(quant_quality_tier("WEIRD").is_none());
+    }
+
+    #[test]
+    fn params_and_context_labels() {
+        let d = HfModelDetail {
+            params: Some(7_615_000_000),
+            context_length: Some(131_072),
+            ..Default::default()
+        };
+        assert_eq!(d.params_label().as_deref(), Some("7.6B"));
+        assert_eq!(d.context_label().as_deref(), Some("128K"));
+    }
+
+    #[test]
     fn parses_gated_variants() {
         assert!(parse_gated(&serde_json::json!("auto")));
         assert!(parse_gated(&serde_json::json!("manual")));
@@ -1140,6 +1456,7 @@ mod tests {
             license: Some("apache-2.0".into()),
             tags: vec![],
             files: vec![],
+            ..Default::default()
         };
         let file = hf_file(
             "qwen2.5-0.5b-instruct-q4_k_m.gguf",
@@ -1194,6 +1511,7 @@ mod tests {
                 hf_file("README.md", 5, None, Some("f".repeat(40))),
                 hf_file(".gitattributes", 5, None, Some("0".repeat(40))),
             ],
+            ..Default::default()
         };
         assert!(detail.has_safetensors_bundle());
         assert!(detail.is_mlx());
@@ -1278,6 +1596,7 @@ mod tests {
             license: None,
             tags: vec![],
             files,
+            ..Default::default()
         };
 
         let quants = detail.gguf_quants();

@@ -20,8 +20,7 @@ async fn seed_and_fetch(provider: &IrohNode, fetcher: &IrohNode, src: &Path, des
         .is_ok()
 }
 
-/// A blob seeded on one node can be fetched, byte-for-byte, by another — i.e. the
-/// `BlobServer` accept-handler serves exactly like the stock one.
+/// A blob seeded on one node can be fetched, byte-for-byte, by another.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn serves_blob_to_a_peer() {
     let tmp = tempfile::tempdir().unwrap();
@@ -44,9 +43,7 @@ async fn serves_blob_to_a_peer() {
     );
 }
 
-/// After `unseed_and_disconnect`, the blob is no longer served — a fresh fetch
-/// from a peer fails. (With no active transfer there are no connections to sever,
-/// so this checks the unseed half goes through the new code path.)
+/// After `unseed_and_disconnect`, a fresh fetch from a peer fails (no active transfer, so only the unseed half runs).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unseed_and_disconnect_stops_serving() {
     let tmp = tempfile::tempdir().unwrap();
@@ -80,10 +77,7 @@ async fn unseed_and_disconnect_stops_serving() {
     );
 }
 
-/// The heart of the fix: a peer pulling *this file* is detectable per-blob (so the
-/// UI can warn), and `unseed_and_disconnect` severs it mid-transfer — the
-/// provider's per-blob active count goes positive during the pull and drops back
-/// to zero once disconnected, and the peer's fetch does not complete.
+/// `unseed_and_disconnect` severs a peer mid-transfer: the per-blob active count rises during the pull, drops to zero after disconnect, and the fetch does not complete.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hard_disconnects_a_peer_mid_transfer() {
     use std::sync::Arc;
@@ -151,8 +145,7 @@ async fn hard_disconnects_a_peer_mid_transfer() {
     );
 }
 
-/// The same blob seeded on two peers is fetched from both at once (size is over the
-/// multi-peer threshold, so the striped path runs) and assembled byte-for-byte.
+/// The same blob seeded on two peers is fetched from both at once (striped path) and assembled byte-for-byte.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn aggregates_one_blob_from_two_peers() {
     let tmp = tempfile::tempdir().unwrap();

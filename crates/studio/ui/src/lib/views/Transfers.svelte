@@ -1,7 +1,16 @@
 <script>
   import { onMount, onDestroy } from "svelte";
   import { api } from "../api.js";
-  import { fmtSize, fmtRate, fmtRatio, rowFormat, formatId } from "../format.js";
+  import {
+    fmtSize,
+    fmtRate,
+    fmtRatio,
+    rowFormat,
+    formatId,
+    routeClassOf,
+    TRANSPORT_HINTS,
+  } from "../format.js";
+  import { receipts } from "../receipts.js";
   export let transfers = {};
   export let pause = () => {};
   export let stop = () => {};
@@ -13,28 +22,76 @@
   // Newest first, keyed by transfer_id for stable rendering.
   $: rows = Object.entries(transfers).map(([id, t]) => ({ id, ...t }));
 
-  // Per-transfer available routes ("iroh"/"bt"/"https"/"hf"), fetched once per
-  // card so the row can show standby paths next to the active one.
+  // Per-transfer available routes ("iroh"/"bt"/"https"/"hf") for the Paths row.
+  // Mesh / share-link downloads register their routes slightly AFTER the card
+  // appears, so an empty answer is refetched (throttled) while the transfer is
+  // still live, instead of being cached forever.
   let routes = {};
+  let routesAt = {};
+  function fetchRoutes(id) {
+    routesAt[id] = Date.now();
+    api
+      .transferRoutes(id)
+      .then((r) => (routes = { ...routes, [id]: r }))
+      .catch(() => (routes = { ...routes, [id]: routes[id] || [] }));
+  }
   $: for (const t of rows) {
     if (routes[t.id] === undefined) {
       routes[t.id] = null;
-      api
-        .transferRoutes(t.id)
-        .then((r) => (routes = { ...routes, [t.id]: r }))
-        .catch(() => (routes = { ...routes, [t.id]: [] }));
+      fetchRoutes(t.id);
     }
   }
-  function routeClassOf(src) {
-    if (!src) return "";
-    const s = String(src).trim().toLowerCase();
-    if (s.startsWith("iroh:")) return "iroh";
-    if (s.startsWith("https:")) return "https";
-    if (s.startsWith("hf:")) return "hf";
-    if (s.startsWith("btv2:") || s.startsWith("bittorrent") || s.startsWith("magnet:")) return "bt";
-    return "";
+  function refreshEmptyRoutes() {
+    for (const t of rows) {
+      const r = routes[t.id];
+      if (
+        (r == null || r.length === 0) &&
+        isActive(t.phase) &&
+        Date.now() - (routesAt[t.id] || 0) >= 5000
+      )
+        fetchRoutes(t.id);
+    }
   }
   const routeLabels = { iroh: "Iroh", bt: "BitTorrent", https: "HTTPS", hf: "Hugging Face" };
+
+  // Wall-clock tick so a route's rate text disappears once the route goes quiet
+  // (>4s without bytes) even when no new progress events arrive to re-render.
+  let nowMs = Date.now();
+
+  // Live per-route caption for a Paths pill: the smoothed rate while that route
+  // is carrying bytes (App.svelte attributes progress deltas per route class),
+  // plus the connected swarm size on the BitTorrent pill.
+  function rateSuffix(t, r, now) {
+    if (!isActive(t.phase)) return "";
+    let s = "";
+    const rr = t.routeRates && t.routeRates[r];
+    if (rr && rr.bps > 1024 && rr.at && now - rr.at <= 4000) s += " " + fmtRate(rr.bps);
+    if (r === "bt" && t.peers) s += ` · ${t.peers} peer${t.peers === 1 ? "" : "s"}`;
+    return s;
+  }
+
+  // Failover visibility: when a transfer's active source changes route class
+  // mid-download, toast the switch and pulse the newly-active Paths pill.
+  let lastClass = {};
+  let pulses = {};
+  $: for (const t of rows) {
+    const c = routeClassOf(t.source);
+    if (!c) continue;
+    const prev = lastClass[t.id];
+    lastClass[t.id] = c;
+    if (prev && prev !== c) {
+      flash(
+        `Switched to ${routeLabels[c] || c} — ${t.failover_reason || "the previous path stalled"}`
+      );
+      pulses = { ...pulses, [t.id]: c };
+      setTimeout(() => {
+        if (pulses[t.id] === c) {
+          const { [t.id]: _gone, ...rest } = pulses;
+          pulses = rest;
+        }
+      }, 2100);
+    }
+  }
 
   // Whether the header bulk actions are useful: at least one live (pauseable) row,
   // or at least one resumable (paused / waiting) row.
@@ -101,9 +158,7 @@
   }
 
   // Map the engine's raw phase tokens (and the UI's own transient states) to
-  // friendly labels. The engine emits lowercase strings like "downloading" /
-  // "connecting" / "verifying" / "discovering peers" / "queued" via the progress
-  // event; without this they'd leak verbatim into the card caption.
+  // friendly labels; without this the raw progress-event strings leak into the caption.
   function phaseLabel(p) {
     if (p == null) return "";
     if (String(p).startsWith("error")) return p; // keep the error detail
@@ -142,13 +197,12 @@
     }
   }
 
-  // Map the engine's raw source id (hf:… / https:… / iroh:<hash> / btv2:<magnet> /
-  // file:…) to a friendly transport label, matching Atlas — so a full magnet URI or a
-  // 52-char blob hash never lands in the caption.
+  // Map the engine's raw source id to a friendly transport label, matching Atlas —
+  // so a full magnet URI or a 52-char blob hash never lands in the caption.
   function sourceLabel(src) {
     if (!src) return "";
     const s = String(src).trim().toLowerCase();
-    if (s.startsWith("iroh:")) return "a worldwide peer";
+    if (s.startsWith("iroh:")) return "an Iroh peer";
     if (s.startsWith("https:")) return "an HTTPS mirror";
     if (s.startsWith("hf:")) return "Hugging Face";
     if (s.startsWith("btv2:") || s.startsWith("bittorrent") || s.startsWith("magnet:"))
@@ -171,6 +225,19 @@
   const isResumable = (p) => p === "paused" || p === "waiting";
   const isDone = (p) => p === "done" || p === "stopped" || String(p).startsWith("error");
   const isActive = (p) => !isBusy(p) && !isResumable(p) && !isDone(p);
+
+  // Friendly per-class labels for the source-health list — the raw source ids
+  // (full magnet URIs, blob hashes) stay hover-only.
+  const healthLabels = {
+    iroh: "Iroh peer",
+    bt: "BitTorrent swarm",
+    hf: "Hugging Face",
+    https: "HTTPS mirror",
+    file: "Local file",
+  };
+  function healthLabel(src) {
+    return healthLabels[routeClassOf(src)] || "Other source";
+  }
 
   let health = [];
   let sharing = { sharing: false, total: 0, models: [] };
@@ -201,8 +268,10 @@
     loadSharing();
     loadQueue();
     timer = setInterval(() => {
+      nowMs = Date.now();
       loadSharing();
       loadQueue();
+      refreshEmptyRoutes();
     }, 3000);
   });
   onDestroy(() => {
@@ -259,11 +328,12 @@
               <span class="muted">Paths</span>
               {#each routes[t.id] as r}
                 <span
-                  class="pill {routeClassOf(t.source) === r ? 'ok' : 'standby'}"
-                  title={routeClassOf(t.source) === r
-                    ? "Downloading on this path now"
-                    : "On standby — switches over automatically if the active path stalls"}
-                  >{routeLabels[r] || r}</span
+                  class="pill t-{r} {routeClassOf(t.source) === r ? '' : 'standby'} {pulses[t.id] === r ? 'pulse' : ''}"
+                  title={(TRANSPORT_HINTS[r] ? TRANSPORT_HINTS[r] + " " : "") +
+                    (routeClassOf(t.source) === r
+                      ? "Downloading on this path now."
+                      : "On standby — switches over automatically if the active path stalls.")}
+                  >{routeLabels[r] || r}{rateSuffix(t, r, nowMs)}</span
                 >
               {/each}
             </div>
@@ -303,6 +373,9 @@
               : ""}
           </span>
         </div>
+      {/if}
+      {#if t.phase === "done" && $receipts.get(t.id)}
+        <p class="muted">{$receipts.get(t.id)}</p>
       {/if}
       {#if t.failover_reason}
         <p class="muted">Switched source · {t.failover_reason}</p>
@@ -365,8 +438,8 @@
           <div class="uprow {m.uploads > 0 ? 'active' : ''}">
             <span class="upname mono">{m.name}</span>
             <div class="upright">
-              {#if m.iroh_seeding}<span class="pill" title="Seeding over Iroh">Iroh</span>{/if}
-              {#if m.bt_seeding}<span class="pill" title="Seeding over BitTorrent">BT</span>{/if}
+              {#if m.iroh_seeding}<span class="pill t-iroh" title={"Seeding over Iroh. " + TRANSPORT_HINTS.iroh}>Iroh</span>{/if}
+              {#if m.bt_seeding}<span class="pill t-bt" title={"Seeding over BitTorrent. " + TRANSPORT_HINTS.bt}>BT</span>{/if}
               {#if m.uploads > 0}
                 <span class="upwave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
                 <span class="upcount">{m.uploads} pulling</span>
@@ -387,9 +460,11 @@
   {#if health.length === 0}<p class="muted">No source activity recorded yet.</p>{/if}
   {#each health as h}
     <div class="row">
-      <span class="mono">{h.source_id}</span>
+      <span title={h.source_id}>{healthLabel(h.source_id)}</span>
       <span class="muted">
-        {h.success} ok · {h.failure} fail{h.banned ? " · banned" : ""}{h.last_latency_ms != null
+        {h.success} ok · {h.failure} fail{h.banned
+          ? " · resting after repeated failures — retried automatically"
+          : ""}{h.last_latency_ms != null
           ? " · " + h.last_latency_ms + "ms"
           : ""}
       </span>

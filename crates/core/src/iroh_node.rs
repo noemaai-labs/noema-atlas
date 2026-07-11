@@ -36,54 +36,32 @@ const STREAM_RECEIVE_WINDOW: u32 = 16 * 1024 * 1024;
 /// without forwarding iroh's own progress the transfer would appear frozen.
 type BytesProgress = Arc<dyn Fn(u64, u64) + Send + Sync>;
 
-/// How long an iroh fetch may wait for the *first* bytes from any provider before
-/// giving up. Tracker-announced peers can be stale — a peer that removed a model
-/// or went offline still lingers until its tracker TTL, and a dead peer's ticket
-/// still parses into a valid `NodeAddr` — so without this ceiling a download dials
-/// dead nodes indefinitely and the UI sits on "connecting" forever. On timeout the
-/// fetch errors so the engine fails over to the next source (e.g. Hugging Face).
-/// Generous enough for relay/NAT-traversed QUIC, where the handshake to a *live*
-/// peer routinely takes several seconds.
+/// How long an iroh fetch waits for the *first* bytes from any provider before
+/// giving up; on timeout it fails over to the next source (e.g. Hugging Face).
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Once bytes are flowing, the maximum silence between progress events before the
-/// transfer is treated as stalled (the peer dropped mid-transfer). Conservatively
-/// large so a slow-but-alive link is never mistaken for a dead one: iroh streams
-/// to the scratch store at full network speed (the engine's rate-limit pacing
-/// happens later), so a live transfer emits progress far more often than this.
+/// transfer is treated as stalled (the peer dropped mid-transfer).
 const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
-/// Upper bound on resolving this node's reachable address. `node_addr()` normally
-/// returns promptly once the endpoint has a relay home / direct candidates;
-/// bounding it keeps a discovery stall from wedging worldwide-share startup (and
-/// the UI thread that `block_on`s it).
+/// Upper bound on resolving this node's reachable address, so a discovery stall
+/// can't wedge worldwide-share startup (the UI thread `block_on`s it).
 const NODE_ADDR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// Upper bound on each step of a hard share-stop. The UI thread `block_on`s
-/// `stop()`, so an unresponsive router/endpoint shutdown must not freeze the app —
-/// drop the handles and move on instead.
+/// Upper bound on each step of a hard share-stop, so an unresponsive
+/// router/endpoint shutdown can't freeze the UI thread that `block_on`s it.
 const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How often the seeder sweeps for upload slots whose peer vanished without a
-/// clean end-of-transfer event. iroh keeps a downloader's QUIC connection pooled
-/// after it abandons a request, so a peer that quits a pull mid-stream (a user
-/// Stop on the far side) frequently emits no `TransferAborted` on our side — the
-/// slot would otherwise pin the "N peers pulling" count up indefinitely.
+/// clean end-of-transfer event.
 const UPLOAD_REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// An upload slot with no provider event for this long is treated as a peer that
-/// went away, and the slot is reclaimed. The seeder sends to its scratch store at
-/// full network speed (the rate-limit pacing is on the *downloader*), so a live
-/// transfer — even over a slow or high-latency link — emits progress far more
-/// often than this; a window this size only trips when a peer has actually stopped
-/// reading. Kept well under the downloader's [`STALL_TIMEOUT`] so the seeder's
-/// a minute after a peer quits.
+/// An upload slot with no provider event for this long is treated as a vanished
+/// peer and reclaimed. Kept well under the downloader's [`STALL_TIMEOUT`].
 const UPLOAD_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// Watchdog decision for an in-flight iroh fetch: abort if we are still connecting
-/// past [`CONNECT_TIMEOUT`], or if a connected transfer has gone silent past
-/// [`STALL_TIMEOUT`]. Pure so the policy can be unit-tested without a live QUIC
-/// transfer.
+/// Watchdog decision for an in-flight iroh fetch: abort if still connecting past
+/// [`CONNECT_TIMEOUT`], or a connected transfer has gone silent past [`STALL_TIMEOUT`].
 fn fetch_stalled(
     elapsed_since_start: std::time::Duration,
     received_bytes: bool,
@@ -105,21 +83,16 @@ const MULTIPEER_MIN_BYTES: u64 = 2 * STRIPE_PIECE_BYTES;
 
 const MAX_STRIPE_PEERS: usize = 16;
 
-/// Pieces one peer keeps in flight at once (each on its own QUIC stream over the
-/// peer's one connection). A single in-flight request leaves the link idle for a
-/// full round-trip between pieces — on a relayed/high-latency path that gap alone
-/// caps throughput well below the link rate. Three lanes keep the pipe full
-/// without starving the work-stealing queue for faster peers.
+/// Pieces one peer keeps in flight at once, each on its own QUIC stream over the
+/// peer's one connection. Pipelining keeps the link busy across piece boundaries.
 const PIPELINE_PER_PEER: usize = 3;
 
-/// Consecutive failed pieces before a peer is dropped from the swarm. One bad
-/// stream shouldn't evict an otherwise-healthy peer (its piece just requeues for
-/// another lane/peer), but a peer failing repeatedly is dead weight.
+/// Consecutive failed pieces before a peer is dropped from the swarm (one bad
+/// stream shouldn't evict a healthy peer — its piece just requeues elsewhere).
 const PEER_FAIL_BUDGET: u64 = 3;
 
 /// How often the striped driver re-asks the caller for providers, so peers that
-/// come online mid-download join the swarm and previously-dropped ones get a
-/// fresh chance — the swarm grows as it goes instead of being fixed at start.
+/// come online mid-download join the swarm and dropped ones get a fresh chance.
 const PEER_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Callback handing the striped fetch a fresh provider-ticket list mid-transfer
@@ -132,9 +105,8 @@ pub type MoreNodes =
 const BLAKE3_CHUNK: u64 = 1024;
 
 /// Scratch file a fetch writes a blob into before the engine verifies it. One
-/// place derives the name — the adapter creating it and the engine discarding a
-/// removed transfer's leftovers must agree. `blob_hash` is externally supplied
-/// and not guaranteed ASCII, so take chars, never byte-index (panics mid-codepoint).
+/// place derives the name so the adapter and engine agree. `blob_hash` is not
+/// guaranteed ASCII, so take chars, never byte-index (panics mid-codepoint).
 pub(crate) fn scratch_path(store_dir: &Path, blob_hash: &str) -> std::path::PathBuf {
     store_dir.join("scratch").join(format!(
         "iroh-{}.tmp",
@@ -142,20 +114,18 @@ pub(crate) fn scratch_path(store_dir: &Path, blob_hash: &str) -> std::path::Path
     ))
 }
 
-/// Sidecar journal recording a striped fetch's completed pieces, so Pause/Stop,
-/// a crash, or a failed attempt resumes where it left off instead of re-fetching
-/// a multi-GB blob from byte 0. Lives next to the scratch file; its presence is
-/// also what tells the adapter a scratch leftover is a resumable partial.
+/// Sidecar journal recording a striped fetch's completed pieces, so Pause/Stop or
+/// a crash resumes where it left off instead of re-fetching from byte 0. Its
+/// presence also tells the adapter a scratch leftover is a resumable partial.
 pub(crate) fn stripe_journal_path(dest: &Path) -> std::path::PathBuf {
     let mut os = dest.as_os_str().to_os_string();
     os.push(".stripes");
     std::path::PathBuf::from(os)
 }
 
-/// Load the completed-piece set from a stripe journal. Empty (→ fresh start)
-/// unless the journal's header matches this exact blob + size AND the scratch
-/// file still exists at its full pre-sized length. A torn trailing line (killed
-/// mid-append) just drops that piece — it re-downloads.
+/// Load the completed-piece set from a stripe journal. Empty (fresh start) unless
+/// the header matches this exact blob + size and the scratch file still exists at
+/// its full pre-sized length. A torn trailing line just drops that piece.
 fn load_stripe_journal(
     journal: &Path,
     hash: &Hash,
@@ -183,8 +153,7 @@ fn load_stripe_journal(
         .collect()
 }
 
-/// Split a blob into contiguous `[start_chunk, end_chunk)` stripe pieces. Pure for
-/// unit testing.
+/// Split a blob into contiguous `[start_chunk, end_chunk)` stripe pieces.
 fn stripe_pieces(size: u64) -> std::collections::VecDeque<(u64, u64)> {
     let total_chunks = size.div_ceil(BLAKE3_CHUNK);
     let piece_chunks = STRIPE_PIECE_BYTES / BLAKE3_CHUNK;
@@ -295,12 +264,9 @@ impl StripeShared {
 }
 
 /// Add one peer to a striped fetch: dial it once, then run [`PIPELINE_PER_PEER`]
-/// lanes over that connection, each pulling pieces from the shared queue on its
-/// own QUIC stream. Pipelining keeps the link busy across piece boundaries — with
-/// a single in-flight request the peer idles a full round-trip between pieces. A
-/// lane failure requeues its piece; [`PEER_FAIL_BUDGET`] consecutive failures
-/// retire the whole peer (transient errors don't, so one bad stream can't evict a
-/// healthy peer the way the old one-shot workers did).
+/// lanes over that connection, each pulling pieces from the shared queue on its own
+/// QUIC stream. A lane failure requeues its piece; [`PEER_FAIL_BUDGET`] consecutive
+/// failures retire the whole peer (transient errors don't).
 fn spawn_stripe_peer(
     workers: &mut tokio::task::JoinSet<()>,
     shared: Arc<StripeShared>,
@@ -388,13 +354,8 @@ fn spawn_stripe_peer(
     });
 }
 
-/// Live provider-side counters for the worldwide Iroh seeder.
-///
-/// These are intentionally small and cloneable so the desktop UI can sample the
-/// same way it samples the LAN HTTP server. Iroh emits progress events while a
-/// remote peer is pulling bytes and final transfer stats when the request ends;
-/// the event sink below uses progress for live graph movement and reconciles to
-/// the final byte count for accurate session totals.
+/// Live provider-side counters for the worldwide Iroh seeder. Small and cloneable
+/// so the desktop UI can sample them the same way it samples the LAN HTTP server.
 #[derive(Debug, Clone, Default)]
 pub struct IrohMetrics {
     uploaded_bytes: Arc<AtomicU64>,
@@ -459,18 +420,16 @@ impl IrohMetrics {
 #[derive(Debug, Clone)]
 struct Upload {
     /// The blob this request is serving. Stashed so the completed/aborted event
-    /// — which only carries the connection/request ids, not the hash — can
-    /// decrement the right per-hash active counter, and so we can find which
-    /// connections to sever when *this* blob's share is turned off.
+    /// (which carries only the connection/request ids) can decrement the right
+    /// per-hash counter and find which connections to sever on this blob's share-off.
     hash: Hash,
     /// Bytes counted as uploaded for this request so far. Relative to *this*
     /// request: only the ranges we actually send, never a prefix a resuming peer
     /// already holds.
     sent: u64,
-    /// The last absolute blob offset a progress event reported, or `None` until
-    /// the first event sets the baseline. Progress carries the *absolute* offset
-    /// into the blob, so a resumed transfer's first event lands wherever the peer
-    /// left off — we baseline to it rather than counting it.
+    /// The last absolute blob offset a progress event reported, or `None` until the
+    /// first event sets the baseline. A resumed transfer's first event lands where
+    /// the peer left off, so we baseline to it rather than counting it.
     last_offset: Option<u64>,
     /// When we last saw any provider event for this request. The reaper reclaims a
     /// slot idle past [`UPLOAD_STALL_TIMEOUT`], so a peer that quit mid-pull without
@@ -521,13 +480,9 @@ impl ProviderEventSink {
             });
             up.last_event_at = std::time::Instant::now();
             match up.last_offset {
-                // First progress event for this request. `end_offset` is the
-                // *absolute* offset into the blob, so when a peer resumes a
-                // download it had stopped — it already holds `[0, end_offset)` and
-                // is only pulling the tail — this first event jumps straight to
-                // where it left off. Counting that as freshly-uploaded bytes is the
-                // phantom "instant 1.5 GB/s" spike on the upload graph. Baseline to
-                // this offset and count only forward progress from here.
+                // First progress event: `end_offset` is the *absolute* blob offset,
+                // so a resumed transfer jumps straight to where it left off. Baseline
+                // to it rather than counting it (the phantom "instant upload" spike).
                 None => up.last_offset = Some(end_offset),
                 Some(prev) => {
                     if end_offset > prev {
@@ -549,10 +504,9 @@ impl ProviderEventSink {
             .and_then(|mut progress| progress.remove(&key));
         if let Some(up) = up {
             if let Some(final_bytes) = final_bytes {
-                // `final_bytes` is the actual bytes sent for this request (the wire
-                // total, already net of any resumed prefix). Reconcile the
-                // remainder our forward-delta counting didn't capture — notably the
-                // first chunk, which we consumed only to establish the baseline.
+                // `final_bytes` is the actual wire total sent (net of any resumed
+                // prefix). Reconcile the remainder forward-delta counting missed —
+                // notably the baseline first chunk.
                 self.metrics
                     .add_uploaded(final_bytes.saturating_sub(up.sent));
             }
@@ -560,14 +514,9 @@ impl ProviderEventSink {
         }
     }
 
-    /// Reclaim upload slots whose peer stopped pulling without a final event.
-    ///
-    /// iroh pools a downloader's connection after it abandons a request, so a peer
-    /// that quits mid-pull (a user Stop on the far side) often produces no
-    /// `TransferAborted` here; the request then sits in `progress` forever and
-    /// keeps the per-hash and global "pulling now" counters pinned up. Sweeping
-    /// out entries idle past `max_idle` keeps the seeder's counts honest. Returns
-    /// the number of slots reclaimed.
+    /// Reclaim upload slots whose peer stopped pulling without a final event (iroh
+    /// pools the connection, so no `TransferAborted` arrives and the slot would
+    /// otherwise pin the "pulling now" counts up). Returns the number reclaimed.
     fn reap_stalled(&self, max_idle: std::time::Duration) -> usize {
         let now = std::time::Instant::now();
         let stale: Vec<(u64, u64)> = {
@@ -588,9 +537,8 @@ impl ProviderEventSink {
         stale.len()
     }
 
-    /// Reconcile when a serving connection's loop ends: decrement any requests
-    /// still counted on it. Pairs with the [`BlobServer`] accept-handler so a peer
-    /// whose connection actually closed clears at once, rather than waiting for
+    /// Reconcile when a serving connection's loop ends: decrement any requests still
+    /// counted on it, so a closed connection clears at once rather than waiting for
     /// the idle sweep.
     fn connection_closed(&self, conn_id: u64) {
         let keys: Vec<(u64, u64)> = {
@@ -670,10 +618,9 @@ impl CustomEventSender for ProviderEventSink {
     }
 }
 
-/// Live QUIC connections we're currently serving blobs over, keyed by their
-/// stable id (the same `connection_id` the provider events carry). Lets us reach
-/// in and `close()` exactly the connections pulling a given blob when its share
-/// is turned off — the per-file equivalent of closing the whole endpoint.
+/// Live QUIC connections we're serving blobs over, keyed by their stable id (the
+/// `connection_id` provider events carry). Lets us `close()` exactly the
+/// connections pulling a given blob when its share is turned off.
 #[derive(Clone, Default)]
 struct ConnRegistry {
     conns: Arc<Mutex<HashMap<u64, Connection>>>,
@@ -693,10 +640,8 @@ impl ConnRegistry {
     }
 
     /// Hard-close the listed connections (those mid-transfer of a blob whose share
-    /// just stopped). Closing severs every stream on the connection at once, so a
-    /// peer's in-flight pull of that file is cut immediately rather than left to
-    /// time out. iroh re-accepts a fresh connection if that peer later wants
-    /// something we still share.
+    /// just stopped), severing every stream at once instead of letting the pull time
+    /// out. iroh re-accepts a fresh connection if that peer later wants something else.
     fn close(&self, ids: &[u64]) {
         if let Ok(m) = self.conns.lock() {
             for id in ids {
@@ -708,11 +653,9 @@ impl ConnRegistry {
     }
 }
 
-/// Our own blobs accept-handler, a thin wrapper over [`handle_connection`] (what
-/// `Blobs` does internally) that also records each live connection in a
-/// [`ConnRegistry`]. Registering on accept and de-registering when the connection
-/// loop ends is what lets a per-model share-off forcibly disconnect the peers
-/// pulling *that* model — `Blobs`'s own handler keeps no such handle.
+/// Our own blobs accept-handler, a thin wrapper over [`handle_connection`] that also
+/// records each live connection in a [`ConnRegistry`] — which is what lets a
+/// per-model share-off forcibly disconnect the peers pulling that model.
 #[derive(Clone)]
 struct BlobServer {
     store: FsStore,
@@ -764,9 +707,8 @@ impl ProtocolHandler for BlobServer {
 }
 
 /// Load this node's persistent Ed25519 secret key from `store_dir/node.key`,
-/// generating and persisting a fresh one on first run. A stable key yields a
-/// stable NodeId across process restarts — the tracker then recognizes this
-/// device as the same peer instead of counting each launch as a new one.
+/// generating and persisting a fresh one on first run. A stable key yields a stable
+/// NodeId across restarts, so the tracker sees one device instead of one per launch.
 fn load_or_create_secret_key(store_dir: &Path) -> Result<SecretKey> {
     let path = store_dir.join("node.key");
     if let Ok(bytes) = std::fs::read(&path) {
@@ -803,14 +745,10 @@ fn load_or_create_secret_key(store_dir: &Path) -> Result<SecretKey> {
     Ok(key)
 }
 
-/// This device's stable NodeId (hex) derived from the persisted node key, WITHOUT
-/// spawning an endpoint (no QUIC socket bind). Returns `None` if no key exists yet
-/// — i.e. worldwide sharing has never run — so there are no prior announces to
-/// exclude or withdraw anyway. The value is identical to a live
-/// [`IrohNode::node_id`] (both are the Ed25519 public key's `Display`), so the
-/// tracker treats them as one identity. This lets the engine exclude — and
-/// withdraw — its *own* prior-session announces (which survive on the tracker for
-/// their TTL, keyed on this same stable id) even when the seeder isn't running.
+/// This device's stable NodeId (hex) derived from the persisted node key, without
+/// spawning an endpoint. `None` if no key exists yet (worldwide sharing has never
+/// run). Identical to a live [`IrohNode::node_id`], so the engine can exclude and
+/// withdraw its own prior-session announces even when the seeder isn't running.
 pub fn node_id_from_store(store_dir: &Path) -> Option<String> {
     let path = store_dir.join("node.key");
     let bytes = std::fs::read(&path).ok()?;
@@ -820,15 +758,11 @@ pub fn node_id_from_store(store_dir: &Path) -> Option<String> {
 }
 
 /// Sign a tracker announce/withdraw payload with this device's node SECRET key,
-/// proving ownership of the claimed NodeId. Returns `(node_id, ts_ms, sig_b64)`
-/// for the client to attach to the request; the registry rebuilds the same
-/// canonical payload and verifies it against `node_id` (see
-/// [`crate::announce_auth`]). The signed payload also binds `ticket` (this node's
-/// current reachable ticket) and `audience` (the registry base URL being posted to),
-/// so a MITM can't rewrite the address and a captured request can't replay against a
-/// different registry. Loads the persisted key directly (no live endpoint needed),
-/// so the announce loop can sign without holding the node. `None` when no key exists
-/// yet (worldwide sharing has never run), or when an item id is not canonical 64-hex.
+/// proving ownership of the claimed NodeId. Returns `(node_id, ts_ms, sig_b64)`; the
+/// registry rebuilds the same canonical payload and verifies it (see
+/// [`crate::announce_auth`]). The payload also binds `ticket` and `audience` so a
+/// MITM can't rewrite the address and a captured request can't replay against a
+/// different registry. `None` when no key exists yet or an item id isn't 64-hex.
 pub fn sign_announce(
     store_dir: &Path,
     method: &str,
@@ -886,15 +820,12 @@ impl IrohNode {
         std::fs::create_dir_all(store_dir).map_err(|e| Error::fs(store_dir, e))?;
         let pool = LocalPool::single();
         // Persist the node identity so this device keeps a *stable* NodeId across
-        // restarts. Without it, every launch (and every worldwide off→on toggle)
-        // mints a fresh random NodeId, so the tracker sees a brand-new peer while
-        // the previous announcement is still live — making one device show up as
-        // two (or more) peers until the stale entry expires.
+        // restarts; otherwise every launch mints a fresh NodeId and shows up as a
+        // new peer while the previous announcement is still live.
         let secret_key = load_or_create_secret_key(store_dir)?;
         // Lift QUIC flow control above quinn's conservative 1.25 MB per-stream
-        // default so a high-latency / relayed path isn't pinned to ~10 MB/s by
-        // the window alone (see `stream_window_bytes`). Applied endpoint-wide, so
-        // both fetching and serving connections benefit.
+        // default so a high-latency / relayed path isn't pinned to ~10 MB/s by the
+        // window alone. Applied endpoint-wide, so fetch and serve both benefit.
         let mut transport = TransportConfig::default();
         transport
             .stream_receive_window(VarInt::from_u32(STREAM_RECEIVE_WINDOW)) // how fast a peer may send to us
@@ -906,24 +837,17 @@ impl IrohNode {
         let endpoint = Endpoint::builder()
             .secret_key(secret_key)
             .transport_config(transport)
-            // n0 DNS + relays reach worldwide peers; local-network (mDNS/swarm)
-            // discovery lets two devices on the same LAN resolve each other's
-            // current address directly and dial without a relay round-trip — the
-            // difference between a multi-second relayed connect and an instant
-            // local one. Both run together; iroh merges the candidates. The
-            // method degrades gracefully (a failed mDNS setup is silently
-            // skipped), and the `discovery-local-network` feature it needs is
-            // already on via the `iroh` umbrella crate, so this needs no Cargo
-            // change.
+            // n0 DNS + relays reach worldwide peers; local-network (mDNS) discovery
+            // lets two devices on the same LAN dial directly without a relay
+            // round-trip. Both run together; a failed mDNS setup is silently skipped.
             .discovery_n0()
             .discovery_local_network()
             .bind()
             .await
             .map_err(|e| ierr("endpoint bind", e))?;
-        // Retry the store load briefly: on a quick stop→start (e.g. toggling
-        // worldwide off/on) a previous node's redb lock may take a moment to
-        // release as its store Arc drops, so the immediate reopen can transiently
-        // conflict.
+        // Retry the store load briefly: on a quick stop→start a previous node's redb
+        // lock may take a moment to release as its store Arc drops, so the immediate
+        // reopen can transiently conflict.
         let store = {
             let mut attempt = FsStore::load(store_dir).await;
             for _ in 0..5 {
@@ -937,10 +861,9 @@ impl IrohNode {
         };
         let downloader = Downloader::new(store.clone(), endpoint.clone(), pool.handle().clone());
         let metrics = IrohMetrics::default();
-        // One sink backs both halves: `Blobs` keeps it for any events its own
-        // paths emit, and our `BlobServer` accept-handler feeds it the serving
-        // events. Both `EventSender`s wrap clones of the *same* sink, so the
-        // per-blob counters and progress map stay unified.
+        // One sink backs both halves: `Blobs` keeps it for events its own paths emit
+        // and our `BlobServer` feeds it the serving events, so the per-blob counters
+        // and progress map stay unified.
         let sink = ProviderEventSink::new(metrics.clone());
         let registry = ConnRegistry::default();
         let blobs = Arc::new(Blobs::new_with_events(
@@ -995,10 +918,9 @@ impl IrohNode {
         self.metrics.clone()
     }
 
-    /// This node's stable NodeId (hex). Unlike the full node *ticket* — whose
-    /// relay/direct addresses change as the network shifts — this is the durable
-    /// identity of the device, so it's the correct key for de-duplicating peers
-    /// on the tracker (one device = one NodeId, however its addresses move).
+    /// This node's stable NodeId (hex). Unlike the full node *ticket* (whose
+    /// relay/direct addresses shift as the network moves), this is the durable device
+    /// identity — the correct key for de-duplicating peers on the tracker.
     pub fn node_id(&self) -> String {
         self.endpoint.node_id().to_string()
     }
@@ -1041,14 +963,10 @@ impl IrohNode {
         Ok(hex::encode(hash.as_bytes()))
     }
 
-    /// Stop serving a previously-seeded blob: drop the temp tag that protected it
-    /// and delete it from the blob store, so peers can no longer pull it over
-    /// Iroh. The blob was seeded **by reference**, so the underlying CAS file is
-    /// untouched — only the store's ability to serve it is removed.
-    ///
-    /// This is what makes "stop sharing this model" actually sever uploads:
-    /// withdrawing from the tracker only hides it from discovery, but a peer that
-    /// already knows the hash could still fetch the bytes until we unseed.
+    /// Stop serving a previously-seeded blob: drop the temp tag and delete it from
+    /// the store so peers can no longer pull it over Iroh. Seeded **by reference**,
+    /// so the underlying CAS file is untouched. Withdrawing from the tracker only
+    /// hides it from discovery; a peer that knows the hash could still fetch until now.
     pub async fn unseed(&self, blake3_hex: &str) -> Result<()> {
         let hash = Hash::from(crate::hash::parse_hex32(blake3_hex)?);
         if let Ok(mut tags) = self.tags.lock() {
@@ -1062,13 +980,9 @@ impl IrohNode {
     }
 
     /// Stop serving a blob **and** hard-disconnect any peer currently pulling it.
-    ///
-    /// [`unseed`](Self::unseed) alone only stops *new* reads; a peer mid-transfer
-    /// keeps streaming the bytes it already requested. This additionally closes the
-    /// QUIC connections that are actively transferring this blob, so "stop sharing
-    /// this file" severs the swarm for that file the same way turning worldwide off
-    /// severs the whole node — but scoped to the one blob, leaving connections that
-    /// are only pulling other (still-shared) files alone.
+    /// [`unseed`](Self::unseed) alone only stops *new* reads; this also closes the
+    /// QUIC connections actively transferring this blob, scoped to the one blob so
+    /// pulls of other still-shared files are left alone.
     pub async fn unseed_and_disconnect(&self, blake3_hex: &str) -> Result<()> {
         let hash = Hash::from(crate::hash::parse_hex32(blake3_hex)?);
         // Snapshot which connections are pulling this blob *before* unseeding —
@@ -1158,13 +1072,10 @@ impl IrohNode {
             .await
     }
 
-    /// Parse tracker tickets into dialable addresses, de-duplicating by stable
-    /// NodeId (a peer that re-announced under changed addresses isn't dialed
-    /// twice) and dropping this node itself. The tracker is asked to exclude the
-    /// querier, but an older deployed registry ignores that parameter — and a
-    /// stale self-entry (e.g. right after deleting the local copy) would make the
-    /// fetch dial its own store, burn a connect window on a blob it knows it
-    /// doesn't have, and look "stuck resolving".
+    /// Parse tracker tickets into dialable addresses, de-duplicating by stable NodeId
+    /// and dropping this node itself. An older deployed registry ignores the
+    /// exclude-querier request, and a stale self-entry would make the fetch dial its
+    /// own store and look "stuck resolving".
     fn parse_provider_tickets(
         &self,
         node_tickets: &[String],
@@ -1183,14 +1094,11 @@ impl IrohNode {
         nodes
     }
 
-    /// Pull one blob from many peers at once. The blob is split into pieces in a
-    /// shared queue; each peer runs [`PIPELINE_PER_PEER`] lanes pulling pieces
-    /// (work-stealing, so fast peers do more and a piece a dead peer drops is
-    /// re-queued), each fetched as a bao-verified range written straight to
-    /// `dest` at its absolute offset. `more_nodes`, when given, is polled every
-    /// [`PEER_REFRESH_INTERVAL`] so providers that appear mid-transfer join the
-    /// swarm — the download starts with whoever is reachable now and gathers
-    /// peers as it goes rather than resolving everyone up front.
+    /// Pull one blob from many peers at once: split into pieces in a shared queue,
+    /// each peer running [`PIPELINE_PER_PEER`] work-stealing lanes that write
+    /// bao-verified ranges straight to `dest` at their absolute offset. `more_nodes`,
+    /// when given, is polled every [`PEER_REFRESH_INTERVAL`] so providers appearing
+    /// mid-transfer join the swarm.
     #[allow(clippy::too_many_arguments)]
     pub async fn fetch_striped(
         &self,
@@ -1202,10 +1110,9 @@ impl IrohNode {
         on_bytes: Option<BytesProgress>,
         more_nodes: Option<MoreNodes>,
     ) -> Result<()> {
-        // Resume: the journal names the pieces already bao-verified into `dest` by
-        // a previous attempt of this exact blob+size — only the rest is fetched.
-        // Anything stale (missing/mismatched header, wrong file length, unknown
-        // piece bounds) falls back to a fresh start.
+        // Resume: the journal names the pieces already bao-verified into `dest` by a
+        // previous attempt of this exact blob+size — only the rest is fetched.
+        // Anything stale falls back to a fresh start.
         let journal_path = stripe_journal_path(dest);
         let all = stripe_pieces(size);
         let mut done = load_stripe_journal(&journal_path, &hash, size, dest);
@@ -1367,11 +1274,9 @@ impl IrohNode {
         }
     }
 
-    /// Run the (`!Send`) download + export on the blob store's local pool. The
-    /// download runs from every candidate node concurrently; the whole transfer
-    /// is raced against `cancel` so a user Stop aborts it promptly (dropping the
-    /// pool `Run` future cancels the in-flight task), keeping any partial blob in
-    /// the store so a later attempt resumes instead of restarting.
+    /// Run the (`!Send`) download + export on the blob store's local pool, from every
+    /// candidate node concurrently. Raced against `cancel` so a user Stop aborts
+    /// promptly, keeping any partial blob in the store for a later resume.
     async fn fetch_hash(
         &self,
         hash: Hash,
@@ -1389,10 +1294,9 @@ impl IrohNode {
         let endpoint = self.endpoint.clone();
         let dest_pb = dest.to_path_buf();
 
-        // The progress channel is created out here (rather than inside the pool
-        // task) so this `select!` loop can drain iroh's download-progress events
-        // and forward live byte counts to the UI; the sender moves into the
-        // (`!Send`) pool task.
+        // The progress channel is created out here (not inside the pool task) so this
+        // `select!` loop can drain iroh's download-progress events and forward live
+        // byte counts to the UI; the sender moves into the (`!Send`) pool task.
         let (tx, rx) = async_channel::unbounded::<DownloadProgress>();
         let run = self.pool.handle().spawn(move || async move {
             let progress = AsyncChannelProgressSender::new(tx);
@@ -1407,21 +1311,16 @@ impl IrohNode {
                 .download(endpoint, req, progress)
                 .await
                 .map_err(|e| format!("download: {e}"))?;
-            // A leftover from a previous/aborted attempt would make the export
-            // fail (`ExportMode::Copy` errors on an existing file; a `rename`
-            // export fails on Windows if the dest exists) — remove it first so the
-            // export is idempotent and a retry/redownload always succeeds.
+            // A leftover from a previous/aborted attempt would make the export fail
+            // (a `rename` export fails on Windows if the dest exists) — remove it
+            // first so a retry/redownload always succeeds.
             if tokio::fs::metadata(&dest_pb).await.is_ok() {
                 let _ = tokio::fs::remove_file(&dest_pb).await;
             }
-            // Export by *reference*, not by copy. `TryReference` moves the
-            // just-downloaded blob out of the iroh store (a free `rename` on the
-            // same filesystem — `store_dir/scratch` lives under the store dir) and
-            // re-points the store entry at the scratch file, instead of writing a
-            // second full-size copy like `ExportMode::Copy` did. The engine then
-            // verifies the scratch bytes and commits them to the CAS, so the model
-            // is written to disk twice (iroh's download + the CAS) rather than
-            // three times (download + this export copy + the CAS).
+            // Export by *reference*, not by copy: `TryReference` moves the downloaded
+            // blob out of the iroh store (a free `rename` on the same filesystem) and
+            // re-points the entry at the scratch file, so the model is written to disk
+            // twice (download + CAS) rather than three times.
             if let Err(e) = store
                 .export(
                     hash,
@@ -1431,9 +1330,8 @@ impl IrohNode {
                 )
                 .await
             {
-                // The remove above can race a leftover being recreated (or fail
-                // silently), which surfaces as "export: File exists (os error 17)"
-                // and used to kill the retry a user just clicked. Clear the
+                // The remove above can race a leftover being recreated, which
+                // surfaces as "export: File exists (os error 17)". Clear the
                 // destination and try once more before giving up.
                 let _ = tokio::fs::remove_file(&dest_pb).await;
                 store
@@ -1446,14 +1344,10 @@ impl IrohNode {
                     .await
                     .map_err(|e2| format!("export: {e2} (first attempt: {e})"))?;
             }
-            // Drop the now-redundant store entry. After the move it references the
-            // scratch file, which the engine deletes once it has streamed it into
-            // the CAS — left in place that would dangle, and (worse) the iroh store
-            // would otherwise keep a *second* permanent copy of every downloaded
-            // model. Seeding never needs this entry: it re-imports the committed
-            // CAS blob by reference (see `seed_file`). Deleting an `External` entry
-            // is a no-op on the underlying file, so the scratch the `select!` loop
-            // below still has to read is left untouched.
+            // Drop the now-redundant store entry: after the move it references the
+            // scratch file, so left in place the iroh store would keep a *second*
+            // permanent copy of every model. Deleting an `External` entry is a no-op
+            // on the underlying file, so the scratch the `select!` loop reads is safe.
             let _ = store.delete(vec![hash]).await;
             Ok::<(), String>(())
         });
@@ -1465,13 +1359,11 @@ impl IrohNode {
         let mut last_emit: u64 = 0;
         // Always drain the progress channel — even with no UI sink — so the
         // connect/stall watchdog below can observe whether bytes are actually
-        // flowing. Gating this on `on_bytes` (as it once was) meant a headless
-        // fetch never saw progress and the watchdog couldn't fire.
+        // flowing.
         let mut rx_open = true;
-        // Connect/stall watchdog state. `started` anchors the pre-first-byte
-        // connect window (an absolute ceiling, immune to chatty `Connected`/`Found`
-        // events that don't mean data is moving); `last_progress` anchors the
-        // post-first-byte stall window and resets on *every* `Progress` event.
+        // Connect/stall watchdog state: `started` anchors the pre-first-byte connect
+        // window (an absolute ceiling); `last_progress` anchors the post-first-byte
+        // stall window and resets on *every* `Progress` event.
         let started = std::time::Instant::now();
         let mut received_bytes = false;
         let mut last_progress = started;
@@ -1494,9 +1386,8 @@ impl IrohNode {
                         Ok(DownloadProgress::Found { size, .. }) => total = total.max(size),
                         Ok(DownloadProgress::Progress { offset, .. }) => {
                             // Real bytes are flowing: switch the watchdog from the
-                            // connect window to the stall window, resetting it on
-                            // every event unconditionally (a peer that re-emits a
-                            // stale offset must not keep a dead transfer alive).
+                            // connect window to the stall window, resetting on every
+                            // event (a re-emitted stale offset mustn't keep it alive).
                             received_bytes = true;
                             last_progress = std::time::Instant::now();
                             if let Some(sink) = on_bytes.as_deref() {
@@ -1519,12 +1410,10 @@ impl IrohNode {
                         // cancels the in-flight download/export.
                         return Err(Error::Cancelled);
                     }
-                    // Watchdog: if no peer has delivered the size header within the
-                    // connect window, or a connected transfer has gone silent past
-                    // the stall window, give up. Returning drops `run` (aborting the
-                    // pool task, keeping any partial blob in the store for a later
-                    // resume) and surfaces a non-retriable `NotFound` so the engine
-                    // fails over to the next source instead of hanging on dead peers.
+                    // Watchdog: if no size header arrived within the connect window,
+                    // or a connected transfer has gone silent past the stall window,
+                    // give up. Returning drops `run` (keeping any partial blob for a
+                    // later resume) and surfaces `NotFound` so the engine fails over.
                     if fetch_stalled(started.elapsed(), received_bytes, last_progress.elapsed()) {
                         tracing::warn!(
                             connected = received_bytes,
@@ -1554,16 +1443,13 @@ impl IrohNode {
     }
 
     /// Hard-stop sharing **without** consuming the node: stop accepting new
-    /// connections (router) *and* close the QUIC endpoint so peers currently
-    /// pulling bytes from us are severed at once. `Router` and `Endpoint` are both
-    /// cloneable handles over shared state, so shutting a clone down stops the live
-    /// node. Used when the user turns worldwide sharing off — "stop" must actually
-    /// disconnect the swarm, not just stop re-announcing.
+    /// connections (router) *and* close the QUIC endpoint so peers currently pulling
+    /// from us are severed at once. Used when the user turns worldwide sharing off —
+    /// "stop" must actually disconnect the swarm, not just stop re-announcing.
     pub async fn shutdown_handle(&self) {
-        // Bound each step: the UI thread `block_on`s the `stop()` that calls this,
-        // so an unresponsive router/endpoint must not freeze the app. On timeout we
-        // simply drop the handles and move on — the worst case is the OS reclaiming
-        // the socket slightly later, not a hung "Stop sharing" button.
+        // Bound each step: the UI thread `block_on`s the `stop()` that calls this, so
+        // an unresponsive router/endpoint must not freeze the app. On timeout, drop
+        // the handles and move on.
         let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, self.router.clone().shutdown()).await;
         let _ = tokio::time::timeout(
             SHUTDOWN_TIMEOUT,
@@ -1581,11 +1467,9 @@ mod tests {
 
     const MIB: u64 = 1024 * 1024;
 
-    /// The connect/stall watchdog must: never trip while still inside its window,
-    /// trip once the connect window elapses with no bytes, switch to the (longer)
-    /// stall window the moment bytes flow, and trip again if a connected transfer
-    /// goes silent. This is what turns an all-dead provider set into a prompt
-    /// failover instead of an indefinite "connecting" hang.
+    /// The connect/stall watchdog must never trip while inside its window, trip once
+    /// the connect window elapses with no bytes, switch to the (longer) stall window
+    /// the moment bytes flow, and trip again if a connected transfer goes silent.
     #[test]
     fn watchdog_bounds_connect_and_stall() {
         // Still connecting, within the connect window: keep waiting.
@@ -1713,9 +1597,8 @@ mod tests {
     }
 
     /// Regression: resuming a stopped download must NOT count the prefix the peer
-    /// already had. Progress events carry the absolute blob offset, so the first
-    /// one after a resume lands at the resume point; counting it produced a fake
-    /// multi-hundred-MB "instant upload" spike on the seeder's graph.
+    /// already had. Progress events carry the absolute blob offset, so the first one
+    /// after a resume lands at the resume point — counting it produced a fake spike.
     #[test]
     fn resumed_upload_does_not_count_the_prefix_the_peer_already_had() {
         let metrics = IrohMetrics::default();
@@ -1745,10 +1628,9 @@ mod tests {
     }
 
     /// Regression: a peer that quits a pull mid-stream often leaves no
-    /// `TransferAborted` on our side (iroh pools its connection), so without the
-    /// idle sweep its slot pins the "N peers pulling" count up forever. The
-    /// reaper must reclaim a slot gone silent past the window — and leave a still
-    /// active one alone.
+    /// `TransferAborted` on our side (iroh pools its connection), so without the idle
+    /// sweep its slot pins the count up forever. The reaper must reclaim a slot gone
+    /// silent past the window — and leave a still-active one alone.
     #[test]
     fn reaper_reclaims_a_pull_whose_peer_vanished_without_a_final_event() {
         let metrics = IrohMetrics::default();
@@ -1791,11 +1673,9 @@ mod tests {
         assert_eq!(metrics.active_uploads_for_hex(&hex), 1);
     }
 
-    /// The whole self-exclusion / self-withdraw scheme relies on
-    /// `node_id_from_store` producing the *exact same string* as a live node's
-    /// `node_id()`. If these ever diverged, the tracker would treat our offline
-    /// identity as a different peer and our own announces would leak back as
-    /// phantom peers / self-download sources. Pin the invariant.
+    /// The whole self-exclusion / self-withdraw scheme relies on `node_id_from_store`
+    /// producing the *exact same string* as a live node's `node_id()`; if they
+    /// diverged, our own announces would leak back as phantom peers. Pin the invariant.
     #[tokio::test]
     async fn derived_node_id_matches_live_node_id() {
         let dir = std::env::temp_dir().join(format!("noema-iroh-id-test-{}", std::process::id()));

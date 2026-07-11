@@ -1,5 +1,6 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod readme_ui;
 mod transport_ui;
 mod updater;
 
@@ -86,22 +87,12 @@ impl ThemeMode {
     }
 }
 
-/// A modern theme (light or dark) layered on top of egui's stock visuals.
-///
-/// This is *pure styling*. egui is immediate-mode, so the entire "theme" is a
-/// handful of colors, roundings and paddings stored in one `Style` struct and
-/// handed to the renderer that already runs every frame. It allocates nothing
-/// per-frame and adds no textures — so it costs essentially zero extra RAM,
-/// which is exactly why we can modernize the look (and offer both modes) without
-/// giving up the low-memory property that made us choose egui over a webview in
-/// the first place. (A custom font would be the one thing with a real cost; we
-/// deliberately keep the stock font so the default footprint is unchanged.)
+/// A light/dark theme layered on egui's stock visuals: pure styling (colors,
+/// roundings, paddings) in one `Style` struct, no per-frame allocation.
 fn apply_theme(ctx: &egui::Context, dark: bool) {
     use egui::{Color32, Margin, Rounding, Shadow, Stroke};
 
-    // Two coordinated surface ramps. Dark is a cool blue-charcoal; light is a
-    // soft near-white that avoids harsh pure #fff. The accent (brand blue) is
-    // shared but darkened in light mode so it stays legible on pale surfaces.
+    // Accent (brand blue) is shared but darkened in light mode to stay legible.
     let rgb = Color32::from_rgb;
     let (accent, panel, window, extreme, surface, surface_hi, surface_on, line, text, text_hi) =
         if dark {
@@ -162,7 +153,6 @@ fn apply_theme(ctx: &egui::Context, dark: bool) {
     v.selection.bg_fill = sel_bg;
     v.selection.stroke = Stroke::new(1.0, sel_stroke);
 
-    // Softer, rounder window/menu chrome with gentle drop shadows.
     v.window_rounding = Rounding::same(12.0);
     v.menu_rounding = Rounding::same(10.0);
     v.window_stroke = Stroke::new(1.0, line);
@@ -179,11 +169,9 @@ fn apply_theme(ctx: &egui::Context, dark: bool) {
         color: Color32::from_black_alpha((shadow_alpha as f32 * 0.8) as u8),
     };
 
-    // Widget states: a consistent 8px radius, subtle layered surfaces, and an
-    // accent edge that lights up on hover/press instead of the stock flat gray.
     let r = Rounding::same(8.0);
-    // Text on a pressed widget: white reads on the dark active fill, but would
-    // vanish on light mode's pale active fill — use the near-black emphasis there.
+    // Pressed-widget text: white on the dark active fill, near-black emphasis on
+    // light mode's pale active fill (white would vanish there).
     let on_active = if dark { Color32::WHITE } else { text_hi };
     let w = &mut v.widgets;
     w.noninteractive.bg_fill = panel;
@@ -218,7 +206,6 @@ fn apply_theme(ctx: &egui::Context, dark: bool) {
     w.open.fg_stroke = Stroke::new(1.0, text_hi);
     w.open.rounding = r;
 
-    // A little more air than the cramped stock defaults (item 8×3, button 4×1).
     let s = &mut style.spacing;
     s.item_spacing = egui::vec2(8.0, 6.0);
     s.button_padding = egui::vec2(10.0, 6.0);
@@ -228,12 +215,9 @@ fn apply_theme(ctx: &egui::Context, dark: bool) {
     ctx.set_style(style);
 }
 
-/// Semantic colors for the app's *custom-painted* UI (status-banner cards,
-/// badges, toasts, accents) that egui's `Style` doesn't reach. Each entry has a
-/// dark and a light value so the whole UI — not just the chrome — flips cleanly.
-///
-/// Fetch it at the top of a draw fn with [`pal_of`]; it's `Copy`, so nested
-/// closures capture it for free. No allocation, no per-frame cost.
+/// Semantic colors for the app's custom-painted UI (cards, badges, toasts) that
+/// egui's `Style` doesn't reach. Each entry has a dark and light value; fetch it
+/// with [`pal_of`].
 #[derive(Clone, Copy)]
 struct Palette {
     // Accents (foreground / icon / badge background).
@@ -597,7 +581,7 @@ fn download_pref_label(pref: noema_core::DownloadPreference) -> &'static str {
     use noema_core::DownloadPreference as P;
     match pref {
         P::Auto => "Auto",
-        P::PreferP2p => "Prefer peer-to-peer",
+        P::PreferP2p => "Prefer peers (Iroh + BitTorrent)",
         P::PreferBittorrent => "Prefer BitTorrent",
         P::SaveData => "Save data",
     }
@@ -736,11 +720,8 @@ impl Settings {
     }
 }
 
-/// Messages from background tasks back to the UI thread.
-/// How a download task finished, sent to the UI thread. Carries the *typed*
-/// interruption so the UI never classifies pause-vs-stop by sniffing error text:
-/// a peer disconnect whose message merely contains "stopped" must not read as a
-/// user Stop. Built from the engine's typed `Error` at the spawn site.
+/// How a download task finished, from the engine's typed `Error` — so the UI
+/// classifies pause-vs-stop by variant, never by sniffing error text.
 enum DownloadEnd {
     /// Completed and verified — (manifest_id, bytes).
     Ok(String, u64),
@@ -764,7 +745,26 @@ impl DownloadEnd {
 }
 
 enum Msg {
-    Models(Result<Vec<HfModel>, String>),
+    /// One page of Discover results (search, browse, or a cursor continuation).
+    Page {
+        result: Result<noema_core::hf::ModelPage, String>,
+        append: bool,
+    },
+    /// Community conversions (GGUF/MLX) of `for_id`, for the detail view.
+    Conversions {
+        for_id: String,
+        result: Result<Vec<HfModel>, String>,
+    },
+    /// The "import from other apps" scan finished.
+    ScanDone {
+        imported: usize,
+        skipped: usize,
+        failed: usize,
+    },
+    /// A runtime handoff (LM Studio / Ollama) finished.
+    RuntimeHandoff(Result<String, String>),
+    /// Library update check: manifest id -> HF repo with a newer revision.
+    ModelUpdates(Result<HashMap<String, String>, String>),
     Detail(Result<HfModelDetail, String>),
     /// sha256 -> worldwide peer count (from the tracker).
     WorldwidePeers {
@@ -806,6 +806,12 @@ enum Msg {
     },
     /// The update finished applying (or couldn't be applied).
     UpdateApplied(Result<updater::ApplyOutcome, String>),
+    /// A model-card (README) fetch finished for `key` (`repo@revision`).
+    /// `Ok(None)` = the repo has no README.
+    Readme {
+        key: String,
+        result: Result<Option<noema_core::readme::Readme>, String>,
+    },
 }
 
 enum Action {
@@ -813,6 +819,29 @@ enum Action {
     Suggest(String),
     OpenModel(String),
     Back,
+    /// Fetch the next page of the current Discover listing.
+    LoadMore,
+    /// Scan other local-LLM apps' folders and import their GGUFs (no re-download).
+    ScanImport,
+    /// Place a downloaded model where LM Studio finds it, then open LM Studio.
+    OpenInLmStudio {
+        path: String,
+        name: String,
+    },
+    /// Register a downloaded GGUF with Ollama (`ollama create`).
+    AddToOllama {
+        path: String,
+        name: String,
+    },
+    /// Check every HF-sourced Library model for a newer upstream revision.
+    CheckModelUpdates,
+    /// Jump to the Discover tab (e.g. "Update available ›" on a Library row).
+    GoDiscover,
+    /// Fetch + parse the model card (README) for the open detail view.
+    FetchReadme {
+        id: String,
+        revision: String,
+    },
     Download(String),
     /// One-click download of an entire sharded safetensors/MLX model.
     DownloadBundle,
@@ -991,11 +1020,12 @@ struct ActiveDownload {
     /// against counting a resumed transfer's already-present prefix as an instant
     /// spike on the graph. See [`fold_download_progress`].
     dl_baselined: bool,
-    /// Bytes attributed to each source id so far — the multi-source story made
-    /// visible ("Hugging Face 1.2 GB · worldwide peer 380 MB"). The engine fetches one
-    /// source at a time (with failover), so each byte delta is attributed to the
-    /// source that reported it.
+    /// Bytes attributed to each source id so far. The engine fetches one source
+    /// at a time (with failover), so each delta goes to the reporting source.
     by_source: HashMap<String, u64>,
+    /// Live per-source download rate (EMA), keyed like `by_source` — drives the
+    /// per-protocol rows under the progress bar.
+    source_rates: HashMap<String, SourceRate>,
     /// When this transfer started — used for a "calculating…" ETA grace period.
     started: Instant,
     route_history: Vec<RouteLeg>,
@@ -1044,6 +1074,7 @@ fn active_download(
         dl_samples: VecDeque::with_capacity(64),
         dl_baselined: false,
         by_source: HashMap::new(),
+        source_rates: HashMap::new(),
         started: Instant::now(),
         route_history: Vec::new(),
         switched_at: None,
@@ -1057,10 +1088,8 @@ fn active_download(
 }
 
 /// Clear a card's stale per-attempt progress before re-spawning it (resume or
-/// retry). Without this a re-run briefly renders the previous attempt's
-/// near-full bar or "Verifying… 100%", and the first real delta undercounts
-/// throughput. The download baseline rebuilds from the engine's next event, so
-/// reset the byte/verify/speed marks back to a fresh-attempt state.
+/// retry); otherwise the re-run briefly shows the old bar and undercounts the
+/// first throughput delta. The baseline rebuilds from the engine's next event.
 fn reset_attempt_progress(card: &mut ActiveDownload) {
     card.done = 0;
     card.prev_done = 0;
@@ -1071,6 +1100,7 @@ fn reset_attempt_progress(card: &mut ActiveDownload) {
     card.verify_done = 0;
     card.phase.clear();
     card.by_source.clear();
+    card.source_rates.clear();
     card.started = Instant::now();
     card.route_history.clear();
     card.switched_at = None;
@@ -1295,6 +1325,18 @@ struct App {
     query: String,
     results: Vec<HfModel>,
     searching: bool,
+    /// Discover ordering + facets for the browse/search listing.
+    browse_sort: BrowseSort,
+    browse_gguf_only: bool,
+    /// Cursor URL of the next result page, when the Hub has more.
+    browse_next: Option<String>,
+    loading_more: bool,
+    /// The automatic home feed only fires once per session (not after errors).
+    home_attempted: bool,
+    /// Community GGUF/MLX conversions of the open (non-GGUF) detail repo.
+    conversions: Vec<HfModel>,
+    conversions_for: Option<String>,
+    conversions_loading: bool,
     /// Set when the last Discover search failed, so we can show a retry block
     /// instead of silently falling back to the empty-state hero.
     last_search_error: Option<String>,
@@ -1385,6 +1427,84 @@ struct App {
     bt_status: HashMap<String, BlobNetStatus>,
     /// In-app auto-update state (banner, in-flight check/apply, progress).
     update: updater::UpdateUi,
+    /// Model-card (README) fetch state for the open Discover detail, keyed by
+    /// `repo@revision` so a stale response can't attach to another model.
+    readme: ReadmeState,
+    /// Library models with a newer Hugging Face revision (manifest id -> repo).
+    model_updates: HashMap<String, String>,
+    checking_updates: bool,
+    scanning_import: bool,
+    /// Runtimes detected on this machine at launch (cheap dir/binary probes).
+    lmstudio_present: bool,
+    ollama_present: bool,
+    /// Provenance receipts for downloads completed this session, keyed by manifest
+    /// id (e.g. "fetched from Iroh peer 1.2 GB + BitTorrent swarm 800 MB —
+    /// verified"). Kept on the Library row so it survives status-line updates.
+    receipts: HashMap<String, String>,
+}
+
+/// Lifecycle of the lazily-fetched model card for the open detail view.
+pub enum ReadmeState {
+    Idle,
+    Loading {
+        key: String,
+    },
+    Ready {
+        key: String,
+        doc: noema_core::readme::Readme,
+    },
+    /// The repo has no README.md.
+    Missing {
+        key: String,
+    },
+    Failed {
+        key: String,
+        error: String,
+    },
+}
+
+fn readme_key(id: &str, revision: &str) -> String {
+    format!("{id}@{revision}")
+}
+
+/// How Discover orders its results. `Best` = the Hub's relevance ranking
+/// (search only); everything else maps onto a Hub sort key.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BrowseSort {
+    Best,
+    Trending,
+    Downloads,
+    Likes,
+    Updated,
+}
+
+impl BrowseSort {
+    const ALL: [BrowseSort; 5] = [
+        BrowseSort::Best,
+        BrowseSort::Trending,
+        BrowseSort::Downloads,
+        BrowseSort::Likes,
+        BrowseSort::Updated,
+    ];
+    fn label(self) -> &'static str {
+        match self {
+            BrowseSort::Best => "Best match",
+            BrowseSort::Trending => "Trending",
+            BrowseSort::Downloads => "Most downloaded",
+            BrowseSort::Likes => "Most liked",
+            BrowseSort::Updated => "Recently updated",
+        }
+    }
+    fn to_core(self) -> noema_core::hf::ModelSort {
+        match self {
+            // Best match without a query has no relevance signal; trending is
+            // the natural browse default.
+            BrowseSort::Best | BrowseSort::Trending => noema_core::hf::ModelSort::Trending,
+            BrowseSort::Downloads => noema_core::hf::ModelSort::Downloads,
+            BrowseSort::Likes => noema_core::hf::ModelSort::Likes,
+            BrowseSort::Updated => noema_core::hf::ModelSort::Updated,
+        }
+    }
 }
 
 /// Cached live network status for a single blob — read by the Library/Transfers
@@ -1503,6 +1623,14 @@ impl App {
             query: String::new(),
             results: Vec::new(),
             searching: false,
+            browse_sort: BrowseSort::Best,
+            browse_gguf_only: false,
+            browse_next: None,
+            loading_more: false,
+            home_attempted: false,
+            conversions: Vec::new(),
+            conversions_for: None,
+            conversions_loading: false,
             last_search_error: None,
             focus_search: false,
             applied_connection: conn_snapshot(&settings),
@@ -1553,6 +1681,13 @@ impl App {
             toasts: Vec::new(),
             bt_status: HashMap::new(),
             update: updater::UpdateUi::default(),
+            readme: ReadmeState::Idle,
+            model_updates: HashMap::new(),
+            checking_updates: false,
+            scanning_import: false,
+            lmstudio_present: detect_lmstudio(),
+            ollama_present: detect_ollama(),
+            receipts: HashMap::new(),
         };
         if settings_dirty {
             app.save_settings();
@@ -1856,23 +1991,102 @@ impl App {
         }
         self.save_settings();
         self.status =
-            "BitTorrent settings saved. Ratio, sequential, and schedule apply now; port, protocol, discovery, and seeding changes take effect after a restart.".into();
+            "BitTorrent settings saved. Ratio, sequential, and schedule apply now; port, protocol, discovery, seeding, and concurrency changes take effect after a restart.".into();
     }
 
     fn start_search(&mut self) {
         let Some(engine) = &self.engine else { return };
         let q = self.query.trim().to_string();
-        if q.is_empty() {
-            return;
-        }
         self.searching = true;
         self.last_search_error = None;
         self.detail = None;
-        self.status = format!("Searching Hugging Face for “{q}”…");
+        self.browse_next = None;
+        self.loading_more = false;
+        self.status = if q.is_empty() {
+            "Browsing Hugging Face…".to_string()
+        } else {
+            format!("Searching Hugging Face for “{q}”…")
+        };
+        let (eng, tx, ctx) = (engine.clone(), self.tx.clone(), self.egui_ctx.clone());
+        // Hub relevance ranking only exists for a plain search; any explicit
+        // sort or facet goes through the listing API instead.
+        let relevance =
+            !q.is_empty() && self.browse_sort == BrowseSort::Best && !self.browse_gguf_only;
+        if relevance {
+            self.rt.spawn(async move {
+                let result = eng
+                    .hf_search(&q, 30)
+                    .await
+                    .map(|models| noema_core::hf::ModelPage { models, next: None })
+                    .map_err(|e| e.to_string());
+                let _ = tx.send(Msg::Page {
+                    result,
+                    append: false,
+                });
+                ctx.request_repaint();
+            });
+        } else {
+            let query = noema_core::hf::ModelListQuery {
+                search: (!q.is_empty()).then_some(q),
+                sort: self.browse_sort.to_core(),
+                filters: if self.browse_gguf_only {
+                    vec!["gguf".to_string()]
+                } else {
+                    Vec::new()
+                },
+                limit: 30,
+                ..Default::default()
+            };
+            self.rt.spawn(async move {
+                let result = eng.hf_list(&query).await.map_err(|e| e.to_string());
+                let _ = tx.send(Msg::Page {
+                    result,
+                    append: false,
+                });
+                ctx.request_repaint();
+            });
+        }
+    }
+
+    fn start_load_more(&mut self) {
+        let Some(engine) = &self.engine else { return };
+        let Some(next) = self.browse_next.clone() else {
+            return;
+        };
+        if self.loading_more {
+            return;
+        }
+        self.loading_more = true;
         let (eng, tx, ctx) = (engine.clone(), self.tx.clone(), self.egui_ctx.clone());
         self.rt.spawn(async move {
-            let res = eng.hf_search(&q, 30).await.map_err(|e| e.to_string());
-            let _ = tx.send(Msg::Models(res));
+            let result = eng.hf_list_page(&next).await.map_err(|e| e.to_string());
+            let _ = tx.send(Msg::Page {
+                result,
+                append: true,
+            });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Community GGUF/MLX conversions of a non-GGUF repo (the model-tree hop).
+    fn start_conversions(&mut self, base_id: String) {
+        let Some(engine) = &self.engine else { return };
+        if self.conversions_for.as_deref() == Some(base_id.as_str()) {
+            return;
+        }
+        self.conversions_for = Some(base_id.clone());
+        self.conversions.clear();
+        self.conversions_loading = true;
+        let (eng, tx, ctx) = (engine.clone(), self.tx.clone(), self.egui_ctx.clone());
+        self.rt.spawn(async move {
+            let result = eng
+                .hf_conversions(&base_id, 6)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(Msg::Conversions {
+                for_id: base_id,
+                result,
+            });
             ctx.request_repaint();
         });
     }
@@ -1881,6 +2095,7 @@ impl App {
         let Some(engine) = &self.engine else { return };
         self.loading_detail = true;
         self.detail = None;
+        self.readme = ReadmeState::Idle;
         self.worldwide_peers.clear();
         self.worldwide_bt.clear();
         self.status = format!("Loading {id}…");
@@ -1888,6 +2103,179 @@ impl App {
         self.rt.spawn(async move {
             let res = eng.hf_model_detail(&id).await.map_err(|e| e.to_string());
             let _ = tx.send(Msg::Detail(res));
+            ctx.request_repaint();
+        });
+    }
+
+    fn start_readme(&mut self, id: String, revision: String) {
+        let Some(engine) = &self.engine else { return };
+        let key = readme_key(&id, &revision);
+        // Failed stays retryable; everything else with this key is settled or
+        // already in flight.
+        match &self.readme {
+            ReadmeState::Loading { key: k }
+            | ReadmeState::Ready { key: k, .. }
+            | ReadmeState::Missing { key: k }
+                if *k == key =>
+            {
+                return;
+            }
+            _ => {}
+        }
+        self.readme = ReadmeState::Loading { key: key.clone() };
+        let (eng, tx, ctx) = (engine.clone(), self.tx.clone(), self.egui_ctx.clone());
+        self.rt.spawn(async move {
+            // Parse on the worker too — markdown parsing is heavy enough to
+            // jank a frame.
+            let result = eng
+                .hf_model_readme(&id, &revision)
+                .await
+                .map(|opt| opt.map(|raw| noema_core::readme::parse(&raw)))
+                .map_err(|e| e.to_string());
+            let _ = tx.send(Msg::Readme { key, result });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Import GGUFs other local-LLM apps already have on disk (LM Studio,
+    /// llama.cpp, GPT4All, the HF cache) — verified and reshared, no re-download.
+    fn start_scan_import(&mut self) {
+        let Some(engine) = self.engine.clone() else {
+            return;
+        };
+        if self.scanning_import {
+            return;
+        }
+        self.scanning_import = true;
+        self.status = "Scanning other apps' model folders…".into();
+        let (tx, ctx) = (self.tx.clone(), self.egui_ctx.clone());
+        self.rt.spawn(async move {
+            let mut files = Vec::new();
+            for dir in common_model_dirs() {
+                find_gguf_files(&dir, &mut files, 6);
+            }
+            let (mut imported, mut skipped, mut failed) = (0usize, 0usize, 0usize);
+            for f in files {
+                match engine.import_local_file(&f).await {
+                    Ok(_) => imported += 1,
+                    Err(e) => {
+                        // Already-imported duplicates land here too; only count
+                        // real failures.
+                        if e.to_string().to_lowercase().contains("already") {
+                            skipped += 1;
+                        } else {
+                            failed += 1;
+                        }
+                    }
+                }
+            }
+            let _ = tx.send(Msg::ScanDone {
+                imported,
+                skipped,
+                failed,
+            });
+            ctx.request_repaint();
+        });
+    }
+
+    fn start_lmstudio_handoff(&mut self, path: String, name: String) {
+        self.status = format!("Adding {name} to LM Studio…");
+        let (tx, ctx) = (self.tx.clone(), self.egui_ctx.clone());
+        self.rt.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || lmstudio_place(&path, &name))
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r);
+            let _ = tx.send(Msg::RuntimeHandoff(result));
+            ctx.request_repaint();
+        });
+    }
+
+    fn start_ollama_handoff(&mut self, path: String, name: String) {
+        self.status = format!("Registering {name} with Ollama…");
+        let (tx, ctx) = (self.tx.clone(), self.egui_ctx.clone());
+        self.rt.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || ollama_create(&path, &name))
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r);
+            let _ = tx.send(Msg::RuntimeHandoff(result));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Compare each HF-sourced Library model's pinned revision against the live
+    /// repo. Manifests pin the exact commit, so this is a cheap equality check.
+    fn start_model_update_check(&mut self) {
+        let Some(engine) = self.engine.clone() else {
+            return;
+        };
+        if self.checking_updates {
+            return;
+        }
+        let mut targets: Vec<(String, String, String)> = Vec::new();
+        for m in &self.installed {
+            if !m.from_hf {
+                continue;
+            }
+            if let Ok(Some(man)) = engine.get_manifest(&m.manifest_id) {
+                'outer: for a in &man.artifacts {
+                    for src in &a.sources {
+                        if let noema_core::Source::Huggingface {
+                            repo_id, revision, ..
+                        } = src
+                        {
+                            targets.push((
+                                m.manifest_id.clone(),
+                                repo_id.clone(),
+                                revision.clone(),
+                            ));
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+        if targets.is_empty() {
+            self.status = "No Hugging Face models to check.".into();
+            return;
+        }
+        self.checking_updates = true;
+        self.status = format!("Checking {} model(s) for updates…", targets.len());
+        let (tx, ctx) = (self.tx.clone(), self.egui_ctx.clone());
+        self.rt.spawn(async move {
+            // One detail fetch per unique repo, not per model.
+            let mut live: HashMap<String, Option<String>> = HashMap::new();
+            for (_, repo, _) in &targets {
+                if !live.contains_key(repo) {
+                    let rev = engine.hf_model_detail(repo).await.ok().map(|d| d.revision);
+                    live.insert(repo.clone(), rev);
+                }
+            }
+            let mut updates = HashMap::new();
+            for (manifest_id, repo, pinned) in targets {
+                if let Some(Some(rev)) = live.get(&repo) {
+                    if *rev != pinned {
+                        updates.insert(manifest_id, repo);
+                    }
+                }
+            }
+            let _ = tx.send(Msg::ModelUpdates(Ok(updates)));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Live (iroh, bt) availability for one file — used by the routes popup so
+    /// Explore/Library-opened popups get real counts, not click-time snapshots.
+    fn start_single_availability_check(&mut self, sha: String) {
+        let Some(engine) = &self.engine else { return };
+        let (eng, tx, ctx) = (engine.clone(), self.tx.clone(), self.egui_ctx.clone());
+        self.rt.spawn(async move {
+            let (iroh, bt) = eng.worldwide_availability(&sha).await;
+            let _ = tx.send(Msg::WorldwidePeers {
+                iroh: HashMap::from([(sha.clone(), iroh)]),
+                bt: HashMap::from([(sha, bt)]),
+            });
             ctx.request_repaint();
         });
     }
@@ -1934,10 +2322,8 @@ impl App {
         });
     }
 
-    /// Spawn the off-UI-thread `run_download` task for an already-registered
-    /// transfer, wiring its progress/Done back to the UI by id. Shared by the
-    /// initial download, resume, and retry paths so they drive the engine the
-    /// same way.
+    /// Spawn the off-UI-thread `run_download` task for a registered transfer,
+    /// routing progress/Done back by id. Shared by the download/resume/retry paths.
     fn run_download_task(
         &self,
         engine: Arc<Engine>,
@@ -1987,13 +2373,9 @@ impl App {
         });
     }
 
-    /// Register a transfer for an already-imported manifest, add its download card,
-    /// and run it off the UI thread. Progress/Done are routed back by transfer id,
-    /// so any number of these run concurrently (extra ones queue in the engine).
-    ///
-    /// `total` seeds the card's byte total. `bundle` = a multi-artifact model whose
-    /// per-artifact progress is summed against the fixed `total`; a single artifact
-    /// instead tracks the engine's reported per-artifact total.
+    /// Register a transfer for an imported manifest, add its card, and run it off
+    /// the UI thread (routed by id; concurrency-safe). `bundle` sums per-artifact
+    /// progress against the fixed `total`; a single artifact tracks the engine's total.
     fn spawn_transfer(&mut self, manifest_id: String, name: String, total: u64, bundle: bool) {
         let Some(engine) = self.engine.clone() else {
             return;
@@ -2017,10 +2399,8 @@ impl App {
         self.tab = Tab::Transfers;
     }
 
-    /// Whether the engine currently has a live run driving this transfer — used as
-    /// a second guard before spawning a resume/retry so a stale card flag can't race
-    /// two writers onto the same partial. A `Queued`/`Paused`/finished control is not
-    /// executing, so a genuinely parked transfer still resumes.
+    /// Whether the engine has a live run driving this transfer — a second guard so a
+    /// stale card flag can't race two writers onto the same partial on resume/retry.
     fn engine_executing(&self, id: &noema_core::transfer::TransferId) -> bool {
         use noema_core::transfer::TransferState as Ts;
         let Some(engine) = &self.engine else {
@@ -2080,10 +2460,12 @@ impl App {
         let Some(engine) = self.engine.clone() else {
             return;
         };
+        // Queued transfers must pause too: pausing only the running ones frees
+        // their queue slots and the queued ones would immediately start.
         let ids: Vec<_> = self
             .active
             .iter()
-            .filter(|a| a.running)
+            .filter(|a| a.running || a.queued)
             .map(|a| a.id.clone())
             .collect();
         if ids.is_empty() {
@@ -2116,11 +2498,9 @@ impl App {
         self.status = format!("Resuming {n} {}…", plural(n, "transfer"));
     }
 
-    /// Re-sample the per-blob live network status (BitTorrent/Iroh seeding +
-    /// magnet) for every blob the Library and Transfers currently show, but only
-    /// for entries older than [`BLOB_STATUS_TTL`]. This keeps the expensive engine
-    /// / librqbit lookups off the per-frame repaint path — they run at most once
-    /// every few seconds per blob instead of dozens of times a second.
+    /// Re-sample per-blob network status (BT/Iroh seeding + magnet) for shown blobs
+    /// older than [`BLOB_STATUS_TTL`], keeping the expensive lookups off the
+    /// per-frame repaint path.
     fn refresh_blob_status(&mut self) {
         let Some(engine) = self.engine.clone() else {
             return;
@@ -2204,11 +2584,9 @@ impl App {
         self.run_download_task(engine, id, total, bundle);
     }
 
-    /// On startup, rebuild a Paused download card for each transfer the engine
-    /// preserved across the last run (its `.part` temp + a resumable DB row are
-    /// still on disk). Without this the user has no card to Resume from after a
-    /// relaunch. Rows come back per-artifact; group them by manifest so a
-    /// multi-file bundle is a single card with summed progress.
+    /// On startup, rebuild a Paused card for each transfer the engine preserved
+    /// across the last run (`.part` temp + resumable DB row on disk); rows come
+    /// back per-artifact, grouped by manifest into one card with summed progress.
     fn load_resumable_cards(&mut self) {
         let Some(engine) = self.engine.clone() else {
             return;
@@ -2317,7 +2695,7 @@ impl App {
             .copied()
             .unwrap_or(0);
         self.status = if wpeers > 0 {
-            format!("Downloading {name} — {wpeers} worldwide peer(s) available…")
+            format!("Downloading {name} — {wpeers} Iroh peer(s) available…")
         } else if hf_download_live(self) {
             format!("Downloading {name} — Hugging Face is available as a last resort…")
         } else {
@@ -2328,10 +2706,9 @@ impl App {
         self.spawn_transfer(imported.manifest_id, name, size, true);
     }
 
-    /// One-click download of the whole sharded safetensors/MLX model: every shard
-    /// together with its config/tokenizer sidecars, as a single multi-artifact
-    /// manifest. The progress bar is driven by the *sum* of per-artifact bytes so
-    /// it advances smoothly across files instead of resetting at each one.
+    /// One-click download of the whole sharded safetensors/MLX model (all shards +
+    /// config/tokenizer sidecars) as one multi-artifact manifest; progress is the
+    /// sum of per-artifact bytes so it advances smoothly across files.
     fn start_download_bundle(&mut self) {
         let (Some(engine), Some(detail)) = (&self.engine, &self.detail) else {
             return;
@@ -2363,7 +2740,7 @@ impl App {
         let total = detail.bundle_total_size();
         let name = format!("{} · {}", detail.name(), detail.bundle_variant_label());
         self.status = if shard_count > 0 && iroh_covered == shard_count {
-            format!("Downloading {name} — worldwide peers cover every file…")
+            format!("Downloading {name} — Iroh peers cover every file…")
         } else if iroh_covered > 0 {
             format!(
                 "Downloading {name} — peer coverage {iroh_covered}/{shard_count} file(s); Atlas will fill gaps from the next eligible route…"
@@ -2675,7 +3052,7 @@ impl App {
                 format!("“{}” is already in your Library.", bundle.name)
             } else {
                 format!(
-                    "Fetching “{}” — {added} file{} from worldwide peers{}.",
+                    "Fetching “{}” — {added} file{} from Iroh peers{}.",
                     bundle.name,
                     if added == 1 { "" } else { "s" },
                     if skipped > 0 {
@@ -2729,11 +3106,9 @@ impl App {
             || (!target.blake3.is_empty() && self.cached_blake3.contains(&target.blake3))
     }
 
-    /// Download a resolved share target over P2P (verified by content hash). The
-    /// content id determines a stable transfer id (the same `mdl_p2p_…` id the
-    /// engine's `content_manifest` derives) before the download starts, so it runs
-    /// as its own card alongside any other transfers. `add_by_content` re-registers
-    /// idempotently under that same id.
+    /// Download a resolved share target over P2P (verified by content hash), under
+    /// the stable `mdl_p2p_…` id `content_manifest` derives so it runs as its own
+    /// card; `add_by_content` re-registers idempotently under that id.
     fn download_share_target(&mut self, target: noema_core::ShareTarget) {
         let Some(engine) = self.engine.clone() else {
             return;
@@ -2754,7 +3129,7 @@ impl App {
         let mut card = active_download(id.clone(), name.clone(), size, false);
         card.launched = true;
         self.active.push(card);
-        self.status = format!("Fetching {name} from worldwide peers…");
+        self.status = format!("Fetching {name} from Iroh peers…");
         self.tab = Tab::Transfers;
 
         let (tx_p, tx_d, ctx) = (self.tx.clone(), self.tx.clone(), self.egui_ctx.clone());
@@ -2847,27 +3222,102 @@ impl App {
                     // it's eligible (permissive license) or already opted-in.
                     self.refresh_worldwide();
                 }
-                Msg::Models(res) => {
+                Msg::Page { result, append } => {
                     self.searching = false;
-                    match res {
-                        Ok(mut models) => {
+                    self.loading_more = false;
+                    match result {
+                        Ok(page) => {
                             self.last_search_error = None;
-                            self.status = if models.is_empty() {
+                            self.browse_next = page.next;
+                            let mut models = page.models;
+                            // Atlas is GGUF-first: on a relevance search,
+                            // surface repos that actually carry GGUF quants
+                            // ahead of base/safetensors-only ones (stable, so
+                            // HF's ranking is preserved within each group). An
+                            // explicit sort is the user's order — keep it.
+                            if !append
+                                && self.browse_sort == BrowseSort::Best
+                                && !self.query.trim().is_empty()
+                            {
+                                models.sort_by_key(|m| !m.has_gguf());
+                            }
+                            if append {
+                                // Cursor pages can overlap after catalog shifts.
+                                let seen: HashSet<String> =
+                                    self.results.iter().map(|m| m.id.clone()).collect();
+                                self.results
+                                    .extend(models.into_iter().filter(|m| !seen.contains(&m.id)));
+                            } else {
+                                self.results = models;
+                            }
+                            self.status = if self.results.is_empty() {
                                 "No models found — try a different search.".into()
                             } else {
-                                format!("{} result(s)", models.len())
+                                format!("{} result(s)", self.results.len())
                             };
-                            // Atlas is GGUF-first: surface repos that actually
-                            // carry GGUF quants ahead of base/safetensors-only
-                            // ones, without hiding the latter. Stable, so HF's
-                            // relevance ranking is preserved within each group.
-                            models.sort_by_key(|m| !m.has_gguf());
-                            self.results = models;
                         }
                         Err(e) => {
-                            self.last_search_error = Some(friendly_error(&e));
+                            if !append {
+                                self.last_search_error = Some(friendly_error(&e));
+                            }
                             self.status = friendly_error(&e);
                         }
+                    }
+                }
+                Msg::Conversions { for_id, result } => {
+                    if self.conversions_for.as_deref() == Some(for_id.as_str()) {
+                        self.conversions_loading = false;
+                        self.conversions = result.unwrap_or_default();
+                    }
+                }
+                Msg::ScanDone {
+                    imported,
+                    skipped,
+                    failed,
+                } => {
+                    self.scanning_import = false;
+                    let msg = if imported == 0 && skipped == 0 && failed == 0 {
+                        "No GGUF files found in other apps' folders.".to_string()
+                    } else {
+                        let mut parts = vec![format!(
+                            "{imported} model file(s) verified into your library"
+                        )];
+                        if skipped > 0 {
+                            parts.push(format!("{skipped} already present"));
+                        }
+                        if failed > 0 {
+                            parts.push(format!("{failed} failed"));
+                        }
+                        format!("Import scan done — {}.", parts.join(", "))
+                    };
+                    self.status = msg.clone();
+                    self.push_toast(msg, ToastKind::Info);
+                    self.refresh();
+                    self.refresh_worldwide();
+                }
+                Msg::RuntimeHandoff(result) => match result {
+                    Ok(msg) => {
+                        self.status = msg.clone();
+                        self.push_toast(msg, ToastKind::Success);
+                    }
+                    Err(e) => {
+                        let msg = format!("Handoff failed: {e}");
+                        self.status = msg.clone();
+                        self.push_toast(msg, ToastKind::Error);
+                    }
+                },
+                Msg::ModelUpdates(result) => {
+                    self.checking_updates = false;
+                    match result {
+                        Ok(updates) => {
+                            self.status = if updates.is_empty() {
+                                "All Hugging Face models are up to date.".into()
+                            } else {
+                                format!("{} model(s) have newer revisions.", updates.len())
+                            };
+                            self.model_updates = updates;
+                        }
+                        Err(e) => self.status = friendly_error(&e),
                     }
                 }
                 Msg::Detail(res) => {
@@ -2876,14 +3326,40 @@ impl App {
                         Ok(detail) => {
                             self.start_seeder_check(&detail);
                             self.status = format!("{} — choose a version", detail.name());
+                            // The model-tree hop: a repo without GGUF quants
+                            // gets its community conversions fetched so the
+                            // user never has to guess "<name> GGUF" searches.
+                            if detail.gguf_quants().is_empty() {
+                                self.start_conversions(detail.id.clone());
+                            } else {
+                                self.conversions_for = None;
+                                self.conversions.clear();
+                                self.conversions_loading = false;
+                            }
                             self.detail = Some(detail);
                         }
                         Err(e) => self.status = friendly_error(&e),
                     }
                 }
                 Msg::WorldwidePeers { iroh, bt } => {
-                    self.worldwide_peers = iroh;
-                    self.worldwide_bt = bt;
+                    // Merge, don't replace: single-file popup checks and the
+                    // Discover detail sweep share these maps.
+                    self.worldwide_peers.extend(iroh);
+                    self.worldwide_bt.extend(bt);
+                }
+                Msg::Readme { key, result } => {
+                    // Only land the result if this fetch is still the one the
+                    // UI is waiting on (the user may have opened another model).
+                    if matches!(&self.readme, ReadmeState::Loading { key: k } if *k == key) {
+                        self.readme = match result {
+                            Ok(Some(doc)) => ReadmeState::Ready { key, doc },
+                            Ok(None) => ReadmeState::Missing { key },
+                            Err(e) => ReadmeState::Failed {
+                                key,
+                                error: friendly_error(&e),
+                            },
+                        };
+                    }
                 }
                 Msg::Progress {
                     id,
@@ -2939,10 +3415,27 @@ impl App {
                             effective_start,
                         );
                         // Attribute the newly downloaded bytes to the reporting
-                        // source for the per-source breakdown.
+                        // source for the per-source breakdown + live rate.
                         if delta > 0 {
                             if let Some(sid) = &source {
                                 *a.by_source.entry(sid.clone()).or_insert(0) += delta;
+                                let now = Instant::now();
+                                let r = a
+                                    .source_rates
+                                    .entry(sid.clone())
+                                    .or_insert_with(|| SourceRate::new(now));
+                                r.pending += delta;
+                                let dt = now.duration_since(r.last_at).as_secs_f64();
+                                if dt >= 0.5 {
+                                    let inst = r.pending as f64 / dt;
+                                    r.bps = if r.bps <= 0.0 {
+                                        inst
+                                    } else {
+                                        r.bps * 0.6 + inst * 0.4
+                                    };
+                                    r.pending = 0;
+                                    r.last_at = now;
+                                }
                             }
                         }
                     }
@@ -3052,6 +3545,7 @@ impl App {
                     match res {
                         Ok(Some(info)) => {
                             self.status = format!("Atlas {} is available.", info.version);
+                            self.update.last_check = Some(Ok(()));
                             // A freshly-offered version clears any earlier dismissal.
                             if self.update.dismissed.as_deref() != Some(info.version.as_str()) {
                                 self.update.dismissed = None;
@@ -3059,12 +3553,14 @@ impl App {
                             self.update.available = Some(info);
                         }
                         Ok(None) => {
+                            self.update.last_check = Some(Ok(()));
                             // Only chirp on an explicit check; the startup ping stays quiet.
                             if !self.update.silent {
                                 self.status = "You're on the latest version.".into();
                             }
                         }
                         Err(e) => {
+                            self.update.last_check = Some(Err(friendly_error(&e)));
                             if !self.update.silent {
                                 self.status = format!("Update check failed: {e}");
                             }
@@ -3222,6 +3718,9 @@ impl App {
         let card = self.active.iter().find(|a| &a.id == id);
         let name = card.map(|a| a.name.clone()).unwrap_or_default();
         let provenance = card.map(route_summary).filter(|s| !s.is_empty());
+        if let Some(p) = &provenance {
+            self.receipts.insert(manifest_id.to_string(), p.clone());
+        }
         let Some(engine) = self.engine.clone() else {
             return;
         };
@@ -3251,8 +3750,16 @@ impl App {
             Action::Back => {
                 self.detail = None;
                 self.loading_detail = false;
+                self.readme = ReadmeState::Idle;
                 self.status = format!("{} result(s)", self.results.len());
             }
+            Action::FetchReadme { id, revision } => self.start_readme(id, revision),
+            Action::LoadMore => self.start_load_more(),
+            Action::ScanImport => self.start_scan_import(),
+            Action::OpenInLmStudio { path, name } => self.start_lmstudio_handoff(path, name),
+            Action::AddToOllama { path, name } => self.start_ollama_handoff(path, name),
+            Action::CheckModelUpdates => self.start_model_update_check(),
+            Action::GoDiscover => self.tab = Tab::Discover,
             Action::Download(f) => self.start_download(f),
             Action::DownloadBundle => self.start_download_bundle(),
             Action::PauseTransfer(id) => {
@@ -3393,6 +3900,12 @@ deleted: {}",
                     if self.last_peer_check.is_none() {
                         self.start_seeder_check(&detail);
                     }
+                }
+                // Popups opened from Explore/Library aren't covered by the
+                // Discover detail check — fetch this file's live counts so the
+                // popup never shows a frozen click-time snapshot.
+                if !q.sha256.is_empty() {
+                    self.start_single_availability_check(q.sha256.clone());
                 }
                 self.quant_detail = Some(q);
             }
@@ -3637,9 +4150,7 @@ deleted: {}",
             }
             Action::SaveSettings => self.save_settings(),
             Action::SetHfDownload(on) => {
-                // Apply immediately to the running engine and keep the startup
-                // snapshot in sync so this never shows up as a "needs restart"
-                // change. Catalog search is unaffected.
+                // Apply live and sync the startup snapshot so this isn't flagged "needs restart".
                 if let Some(engine) = &self.engine {
                     engine.set_hf_download_enabled(on);
                 }
@@ -3665,12 +4176,9 @@ deleted: {}",
                     }
                     self.status = "Now also sharing gated/licensed models you download.".into();
                 } else {
-                    // Opting out must sever promptly (consent): clear every
-                    // confirmed-gated override so `is_blob_shareable` flips false,
-                    // then withdraw + unseed each dropped blob right now rather than
-                    // waiting for the ~5-min background reconcile. `revoke_gated_shares`
-                    // flips the DB overrides and tears down BT seeding (unseed + clear
-                    // magnet) itself; we mirror `apply_share_off` for the Iroh half.
+                    // Opting out must sever promptly (consent): revoke overrides + withdraw/unseed
+                    // each dropped blob now rather than waiting for the ~5-min background reconcile.
+                    // `revoke_gated_shares` handles the BT half; we mirror `apply_share_off` for Iroh.
                     engine.set_share_gated_enabled(false);
                     self.settings.share_gated = false;
                     self.save_settings();
@@ -3754,11 +4262,8 @@ deleted: {}",
                             human(r.freed_bytes),
                             r.removed.len()
                         );
-                        // Stop announcing the deleted blobs so they leave Explore
-                        // at once instead of lingering for their TTL, and unseed
-                        // each from both routes (Iroh + BitTorrent) so peers
-                        // mid-transfer are severed rather than served a blob we
-                        // just dropped from disk.
+                        // Stop announcing + unseed (Iroh + BitTorrent) so deleted blobs leave
+                        // Explore at once and mid-transfer peers are severed, not served a gone blob.
                         if !removed.is_empty() {
                             for b3 in &removed {
                                 self.forget_network_share(b3);
@@ -3784,16 +4289,12 @@ deleted: {}",
 }
 
 impl eframe::App for App {
-    /// Closing the app (window close or quit) withdraws this device's announces
-    /// from the tracker and stops the seeder, so it stops showing as a peer in
-    /// others' Explore right away instead of lingering until the announce TTL.
-    /// Bounded so a slow or unreachable tracker can't hang the quit.
+    /// On quit, withdraw tracker announces and stop the seeder (time-bounded so a slow
+    /// tracker can't hang the quit) so this device leaves others' Explore right away.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         if let Some(engine) = self.engine.clone() {
-            // Pause every live transfer first, so the in-flight partials are
-            // cleanly marked paused (recoverable next launch) before the runtime
-            // that drives them drops on quit — otherwise they'd be abandoned
-            // mid-write as stale `running` rows.
+            // Pause live transfers first so in-flight partials are marked paused (recoverable
+            // next launch) before the runtime drops, not left as stale `running` rows.
             engine.request_pause();
             let _ = self.rt.block_on(async move {
                 tokio::time::timeout(Duration::from_secs(3), engine.withdraw_from_tracker(&[]))
@@ -3809,6 +4310,18 @@ impl eframe::App for App {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll();
+        // Load the trending feed once per session when nothing else is on screen.
+        if self.tab == Tab::Discover
+            && !self.home_attempted
+            && self.engine.is_some()
+            && self.results.is_empty()
+            && self.query.trim().is_empty()
+            && !self.searching
+            && self.detail.is_none()
+        {
+            self.home_attempted = true;
+            self.start_search();
+        }
         self.sync_transfer_states();
         self.refresh_blob_status();
         self.sample_speeds();
@@ -3840,9 +4353,8 @@ impl eframe::App for App {
             self.loading_detail = false;
         }
 
-        // Drag-and-drop a model file anywhere onto the window to share it — the
-        // most natural "I have this file" gesture. Ignored while busy or when a
-        // modal already owns the screen.
+        // Drag-and-drop a model file onto the window to share it. Ignored while busy
+        // or when a modal already owns the screen.
         if self.composer.is_none()
             && self.pending_download.is_none()
             && self.pending_delete.is_none()
@@ -3894,11 +4406,9 @@ impl eframe::App for App {
             }
         }
 
-        // While a model's detail is open, re-sample its peer availability on a
-        // timer so a remote peer that deleted/withdrew the file (or just went
-        // offline) stops lingering as a phantom seeder, and a newly-online peer
-        // shows up — without the user having to hit Refresh. Repaint to keep the
-        // timer ticking even when the window is otherwise idle.
+        // While a detail is open, re-sample peer availability on a timer so offline/withdrawn
+        // peers stop lingering and new ones appear without a manual Refresh. Repaint to keep
+        // the timer ticking while idle.
         if self.tab == Tab::Discover && self.detail.is_some() {
             let stale = self
                 .last_peer_check
@@ -3958,8 +4468,7 @@ fn top_bar(app: &mut App, ctx: &egui::Context, actions: &mut Vec<Action>) {
                 if ui.button(tok).clicked() {
                     app.show_token = true;
                 }
-                // tiny live speed readout in the header (painted arrows so they
-                // always render).
+                // Live speed readout; painted arrows so they always render.
                 dir_arrow(ui, true, pal.blue_dl);
                 ui.label(
                     egui::RichText::new(format!("{}/s", human(app.cur_dl_bps as u64)))
@@ -4024,9 +4533,7 @@ fn top_bar(app: &mut App, ctx: &egui::Context, actions: &mut Vec<Action>) {
     });
 }
 
-/// A small sun/moon button in the header that flips between light and dark. The
-/// glyph is painted (not a font emoji) so it always renders regardless of the
-/// loaded fonts, matching the painted speed arrows next to it.
+/// Header sun/moon button that flips light/dark; glyph is painted so it always renders.
 fn theme_toggle(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) {
     let dark = app.settings.theme.is_dark();
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(28.0, 24.0), egui::Sense::click());
@@ -4093,9 +4600,8 @@ fn network_status_pill(ui: &mut egui::Ui, app: &App) {
 fn bottom_bar(app: &App, ctx: &egui::Context) {
     egui::TopBottomPanel::bottom("bottom").show(ctx, |ui| {
         ui.add_space(3.0);
-        // The single bottom bar only makes sense for one running transfer; with
-        // several it would whipsaw between them (it tracks the last-updated one).
-        // The route strip already shows the aggregate count, so hide the bar then.
+        // The single progress bar only makes sense for one running transfer; with several it
+        // would whipsaw between them, and the route strip already shows the aggregate, so hide it.
         let running = app.active.iter().filter(|a| a.running).count();
         if running <= 1 {
             if let Some((frac, label)) = &app.progress {
@@ -4116,7 +4622,7 @@ fn route_status_strip(ui: &mut egui::Ui, app: &App) {
     ui.horizontal_wrapped(|ui| {
         let running = app.active.iter().filter(|a| a.running).count();
         if running == 1 {
-            // Single download: show its live route, like before.
+            // Single download: show its live route.
             let active = app.active.iter().find(|a| a.running).unwrap();
             if let Some(source) = &active.source {
                 let kind = TransportKind::from_source_id(source);
@@ -4130,11 +4636,26 @@ fn route_status_strip(ui: &mut egui::Ui, app: &App) {
                     .small(),
                 );
             } else {
-                transport_chip(ui, "Resolving", Some(TransportKind::Iroh), false);
+                // Neutral glyph: no route chosen yet, so no protocol brand.
+                transport_chip(ui, "Resolving", Some(TransportKind::Unknown), false);
                 ui.label(egui::RichText::new("Choosing a verified route").small());
             }
         } else if running > 1 {
-            transport_chip(ui, "Downloading", Some(TransportKind::Iroh), false);
+            // Brand the aggregate chip only when every active transfer is on the same protocol.
+            let mut kinds = app
+                .active
+                .iter()
+                .filter(|a| a.running)
+                .filter_map(|a| a.source.as_deref())
+                .map(TransportKind::from_source_id);
+            let first = kinds.next();
+            let uniform = first.filter(|f| kinds.all(|k| k == *f));
+            transport_chip(
+                ui,
+                "Downloading",
+                Some(uniform.unwrap_or(TransportKind::Unknown)),
+                false,
+            );
             ui.label(
                 egui::RichText::new(format!(
                     "{running} transfers · {}/s · see Transfers",
@@ -4276,9 +4797,7 @@ fn token_modal(app: &mut App, ctx: &egui::Context, actions: &mut Vec<Action>) {
     }
 }
 
-/// Confirmation before fetching a model from a share link or Explore. Shows what
-/// you're about to pull (name, size, content id, peers) so a click is a decision,
-/// not a surprise. A "don't ask again" toggle mirrors the Settings option.
+/// Confirmation before fetching a model, showing name/size/content id/peers before the pull.
 fn confirm_download_modal(app: &mut App, ctx: &egui::Context, actions: &mut Vec<Action>) {
     let Some(pending) = app.pending_download.clone() else {
         return;
@@ -4295,9 +4814,7 @@ fn confirm_download_modal(app: &mut App, ctx: &egui::Context, actions: &mut Vec<
         .show(ctx, |ui| {
             let pal = pal_of(ui);
             ui.set_width(406.0);
-            // The sender's human title. A bare-content-id link substitutes the
-            // literal "shared-model.gguf" — flag that as a placeholder, not a
-            // confident name.
+            // The sender's title; a bare-content-id link yields a placeholder, not a real name.
             let title = target.display_title();
             let is_placeholder =
                 title.is_empty() || title == "shared-model.gguf" || title == "shared model";
@@ -4329,13 +4846,11 @@ fn confirm_download_modal(app: &mut App, ctx: &egui::Context, actions: &mut Vec<
                 }
             });
             ui.add_space(6.0);
-            // Plain wrapped label (no inline chip — mixing an exact-sized chip with
-            // wrapping text overlaps them). The peer badge above already shows the
-            // route.
+            // Plain wrapped label: an inline exact-sized chip would overlap wrapping text.
             let route_text = match pending.peers {
-                Some(1) => "1 worldwide peer available — Atlas picks the fastest route and switches automatically if it stalls.",
+                Some(1) => "1 Iroh peer available — Atlas picks the fastest route and switches automatically if it stalls.",
                 Some(n) if n > 1 => "Worldwide peers available — Atlas picks the fastest route and switches automatically if one stalls.",
-                _ => "P2P-first — Atlas looks for worldwide peers and verifies every byte against the content ID.",
+                _ => "P2P-first — Atlas looks for Iroh peers and verifies every byte against the content ID.",
             };
             ui.label(egui::RichText::new(route_text).small().weak());
             ui.add_space(8.0);
@@ -4474,9 +4989,7 @@ fn confirm_download_modal(app: &mut App, ctx: &egui::Context, actions: &mut Vec<
     }
 }
 
-/// Confirmation before removing a Library model. This is destructive because it
-/// unlinks the materialized file and the cache blob, then withdraws the content
-/// from peers.
+/// Confirmation before removing a Library model: unlinks the file and cache blob, then withdraws from peers.
 fn confirm_delete_modal(app: &mut App, ctx: &egui::Context, actions: &mut Vec<Action>) {
     let Some(pending) = app.pending_delete.clone() else {
         return;
@@ -4555,9 +5068,7 @@ fn confirm_delete_modal(app: &mut App, ctx: &egui::Context, actions: &mut Vec<Ac
     }
 }
 
-/// Confirmation before turning worldwide sharing off while peers are mid-transfer.
-/// Stopping severs their connections, so we ask first (torrent clients do the
-/// same when you quit with active uploads).
+/// Confirmation before turning worldwide sharing off while peers are mid-transfer (it severs them).
 fn confirm_stop_share_modal(app: &mut App, ctx: &egui::Context, actions: &mut Vec<Action>) {
     let Some(pending) = app.pending_share_off.clone() else {
         return;
@@ -4622,9 +5133,7 @@ fn confirm_stop_share_modal(app: &mut App, ctx: &egui::Context, actions: &mut Ve
     }
 }
 
-/// Confirmation before turning a *single file's* open-mesh share off while peers
-/// are mid-transfer of that file. Stopping severs them from it, so we ask first —
-/// the per-file counterpart of [`confirm_stop_share_modal`].
+/// Per-file counterpart of [`confirm_stop_share_modal`]: confirm before severing peers pulling this file.
 fn confirm_stop_file_share_modal(app: &mut App, ctx: &egui::Context, actions: &mut Vec<Action>) {
     let Some(pending) = app.pending_file_share_off.clone() else {
         return;
@@ -4695,8 +5204,7 @@ fn confirm_stop_file_share_modal(app: &mut App, ctx: &egui::Context, actions: &m
     }
 }
 
-/// Confirm sharing a gated / restrictively-licensed model. Such content is never
-/// auto-shared, so toggling it on prompts before redistributing licensed weights.
+/// Confirm sharing a gated / restrictively-licensed model, which is never auto-shared.
 fn confirm_gated_share_modal(app: &mut App, ctx: &egui::Context, actions: &mut Vec<Action>) {
     let Some(pending) = app.pending_gated_share.clone() else {
         return;
@@ -4752,8 +5260,7 @@ fn confirm_gated_share_modal(app: &mut App, ctx: &egui::Context, actions: &mut V
     }
 }
 
-/// One transport row inside the routes popup: glyph + name + a live status, with
-/// a soft tint when the route is currently usable. This is the visual heart of
+/// One transport row inside the routes popup: glyph, name, live status, tinted when usable.
 fn route_row(ui: &mut egui::Ui, kind: TransportKind, status: &str, detail: &str, live: bool) {
     let pal = pal_of(ui);
     let base = kind.color_on(ui.visuals().dark_mode);
@@ -4793,27 +5300,28 @@ fn route_row(ui: &mut egui::Ui, kind: TransportKind, status: &str, detail: &str,
     ui.add_space(5.0);
 }
 
-/// Per-quant routes & peers popup — opened by tapping a quant in Discover or a
-/// model in Explore. Shows every transport Atlas can pull from, with live peer
-/// counts where it has them (worldwide Iroh) and failover status for the
-/// rest, so the resilience story is visible instead of a bare "Iroh live" badge.
+/// Per-quant routes & peers popup: every transport Atlas can pull from, with live peer counts and failover status.
 fn quant_detail_modal(app: &mut App, ctx: &egui::Context, actions: &mut Vec<Action>) {
     let Some(q) = app.quant_detail.clone() else {
         return;
     };
     let sha = q.sha256.clone();
-    // Live worldwide peer count from the tracker. A network-catalog row already
-    // carries its own count.
-    let worldwide = match &q.download {
-        QuantDownload::Network(m) => m.peers,
-        _ if sha.is_empty() => 0,
-        _ => app.worldwide_peers.get(&sha).copied().unwrap_or(0),
+    // Live worldwide peer count: prefer the tracker cache (see OpenQuantDetail), else the
+    // snapshot the network-catalog row carried at click time.
+    let worldwide = match (&q.download, app.worldwide_peers.get(&sha)) {
+        (_, Some(n)) if !sha.is_empty() => *n,
+        (QuantDownload::Network(m), _) => m.peers,
+        _ => 0,
     };
-    let hf = hf_download_live(app);
-    // BitTorrent: a magnet for this blob means it can be fetched/seeded over the
-    // swarm. `is_seeding` (≈ a persisted magnet) also tells us we're a seeder.
-    let bt_enabled = app.settings.bt_enabled;
-    let bt_magnet = if bt_enabled && !q.blake3.is_empty() {
+    // Only items with a real HF source may advertise an HF fallback; mesh-only content must not.
+    let has_hf_source = matches!(q.download, QuantDownload::Hf(_) | QuantDownload::Bundle);
+    let hf = has_hf_source && hf_download_live(app);
+    // Route availability honors the same switches the engine does: master AND download sub-switch.
+    let iroh_route_on = app.settings.iroh_enabled && app.settings.iroh_download;
+    let bt_route_on = app.settings.bt_enabled && app.settings.bt_download;
+    // A magnet means this blob is on the swarm; fall back to the mesh-advertised magnet
+    // when the local engine hasn't persisted one (e.g. a network-catalog row).
+    let bt_magnet = if app.settings.bt_enabled && !q.blake3.is_empty() {
         app.engine
             .as_ref()
             .map(|e| e.bt_magnet(&q.blake3))
@@ -4821,13 +5329,20 @@ fn quant_detail_modal(app: &mut App, ctx: &egui::Context, actions: &mut Vec<Acti
     } else {
         String::new()
     };
+    let bt_magnet = if bt_magnet.is_empty() {
+        match &q.download {
+            QuantDownload::Network(m) => m.magnet.clone(),
+            _ => String::new(),
+        }
+    } else {
+        bt_magnet
+    };
     let bt_available = !bt_magnet.is_empty();
-    // Live BitTorrent seeder count, symmetric with the Iroh peer count: a
-    // network-catalog row carries its own, Discover rows read the tracker cache.
-    let bt_seeders = match &q.download {
-        QuantDownload::Network(m) => m.bt_seeders,
-        _ if sha.is_empty() => 0,
-        _ => app.worldwide_bt.get(&sha).copied().unwrap_or(0),
+    // Live BitTorrent seeder count, symmetric with the Iroh peer count.
+    let bt_seeders = match (&q.download, app.worldwide_bt.get(&sha)) {
+        (_, Some(n)) if !sha.is_empty() => *n,
+        (QuantDownload::Network(m), _) => m.bt_seeders,
+        _ => 0,
     };
     let mut open = true;
     egui::Window::new("Routes & peers")
@@ -4853,14 +5368,22 @@ fn quant_detail_modal(app: &mut App, ctx: &egui::Context, actions: &mut Vec<Acti
 
             ui.add_space(8.0);
             let green = pal.green;
-            if worldwide > 0 {
+            // Count both protocols side by side, never summed (different units).
+            if worldwide > 0 || bt_seeders > 0 {
+                let mut bits = Vec::new();
+                if worldwide > 0 {
+                    bits.push(format!("{worldwide} Iroh {}", plural(worldwide, "peer")));
+                }
+                if bt_seeders > 0 {
+                    bits.push(format!(
+                        "{bt_seeders} BitTorrent {}",
+                        plural(bt_seeders, "seeder")
+                    ));
+                }
                 ui.label(
-                    egui::RichText::new(format!(
-                        "Live now: {worldwide} worldwide {}",
-                        plural(worldwide, "peer")
-                    ))
-                    .strong()
-                    .color(green),
+                    egui::RichText::new(format!("Live now: {}", bits.join(" · ")))
+                        .strong()
+                        .color(green),
                 );
             } else if hf {
                 ui.label(
@@ -4870,7 +5393,7 @@ fn quant_detail_modal(app: &mut App, ctx: &egui::Context, actions: &mut Vec<Acti
                     .small()
                     .weak(),
                 );
-            } else {
+            } else if has_hf_source {
                 ui.label(
                     egui::RichText::new(
                         "No P2P peers right now, and Hugging Face is off — turn it on in \
@@ -4879,24 +5402,37 @@ fn quant_detail_modal(app: &mut App, ctx: &egui::Context, actions: &mut Vec<Acti
                     .small()
                     .weak(),
                 );
+            } else {
+                ui.label(
+                    egui::RichText::new("No peers are online for this file right now.")
+                        .small()
+                        .weak(),
+                );
             }
 
             ui.add_space(8.0);
             ui.label(egui::RichText::new("Where you can get it").strong());
             ui.add_space(4.0);
 
+            let iroh_status = if iroh_route_on {
+                peer_count_label(worldwide)
+            } else {
+                "Off".to_string()
+            };
             route_row(
                 ui,
                 TransportKind::Iroh,
-                &peer_count_label(worldwide),
-                if worldwide > 0 {
-                    "Worldwide P2P over Iroh — NAT-traversing, no ports to open"
+                &iroh_status,
+                if !iroh_route_on {
+                    "Off — enable Iroh downloads in Settings"
+                } else if worldwide > 0 {
+                    "Noema's worldwide peer network — verified pieces striped from many peers at once"
                 } else {
-                    "No worldwide peers announced yet"
+                    "No Iroh peers announced yet"
                 },
-                worldwide > 0,
+                iroh_route_on && worldwide > 0,
             );
-            let bt_status = if !bt_enabled {
+            let bt_status = if !bt_route_on {
                 "Off".to_string()
             } else if bt_seeders > 0 {
                 format!("{bt_seeders} {}", plural(bt_seeders, "seeder"))
@@ -4909,14 +5445,14 @@ fn quant_detail_modal(app: &mut App, ctx: &egui::Context, actions: &mut Vec<Acti
                 ui,
                 TransportKind::BitTorrent,
                 &bt_status,
-                if !bt_enabled {
-                    "Off — enable BitTorrent in Settings"
+                if !bt_route_on {
+                    "Off — enable BitTorrent downloads in Settings"
                 } else if bt_available {
-                    "BitTorrent swarm (DHT + µTP) — a magnet is available for this file"
+                    "Public torrent network — a magnet link is available for this file"
                 } else {
                     "No magnet announced for this file yet"
                 },
-                bt_enabled && (bt_available || bt_seeders > 0),
+                bt_route_on && (bt_available || bt_seeders > 0),
             );
             if bt_available {
                 ui.horizontal(|ui| {
@@ -4933,17 +5469,20 @@ fn quant_detail_modal(app: &mut App, ctx: &egui::Context, actions: &mut Vec<Acti
                     }
                 });
             }
-            route_row(
-                ui,
-                TransportKind::HuggingFace,
-                if hf { "On" } else { "Off" },
-                if hf {
-                    "Origin download, verified against the hash"
-                } else {
-                    "Off — turn on in Settings to allow as a fallback"
-                },
-                hf,
-            );
+            // Mesh-only content has no HF source, so don't show an HF row it can't serve.
+            if has_hf_source {
+                route_row(
+                    ui,
+                    TransportKind::HuggingFace,
+                    if hf { "On" } else { "Off" },
+                    if hf {
+                        "Origin download, verified against the hash"
+                    } else {
+                        "Off — turn on in Settings to allow as a fallback"
+                    },
+                    hf,
+                );
+            }
 
             ui.add_space(4.0);
             ui.label(
@@ -4955,8 +5494,7 @@ fn quant_detail_modal(app: &mut App, ctx: &egui::Context, actions: &mut Vec<Acti
             );
 
             ui.add_space(8.0);
-            // Prefer the sha256 content id; fall back to the BLAKE3 (Iroh's
-            // address) when the sha isn't known yet (e.g. a network-catalog row).
+            // Prefer the sha256 content id; fall back to BLAKE3 when the sha isn't known yet.
             let (id_label, id_value) = if !sha.is_empty() {
                 ("Content ID (sha256)", sha.clone())
             } else if !q.blake3.is_empty() {
@@ -5251,9 +5789,7 @@ fn composer_modal(app: &mut App, ctx: &egui::Context, actions: &mut Vec<Action>)
         actions.push(Action::ComposerCancel);
     }
 }
-/// One-time intro shown on first launch: what makes Atlas different, plus an
-/// upfront note that worldwide sharing is on by default (a consent disclosure,
-/// not buried in Settings). Dismissed permanently once acknowledged.
+/// First-launch intro; discloses upfront that worldwide sharing is on by default (consent).
 fn first_run_card(ui: &mut egui::Ui, actions: &mut Vec<Action>) {
     let pal = pal_of(ui);
     egui::Frame::group(ui.style())
@@ -5334,6 +5870,35 @@ fn draw_discover(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
         }
     });
     ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Sort").small().weak());
+        let mut changed = false;
+        egui::ComboBox::from_id_source("browse_sort")
+            .selected_text(app.browse_sort.label())
+            .show_ui(ui, |ui| {
+                for sort in BrowseSort::ALL {
+                    if ui
+                        .selectable_value(&mut app.browse_sort, sort, sort.label())
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                }
+            });
+        let gguf = ui
+            .selectable_label(app.browse_gguf_only, "GGUF only")
+            .on_hover_text(
+                "Only repos that publish GGUF quants — the format local runtimes load directly.",
+            );
+        if gguf.clicked() {
+            app.browse_gguf_only = !app.browse_gguf_only;
+            changed = true;
+        }
+        if changed && !app.searching {
+            actions.push(Action::Search);
+        }
+    });
+    ui.add_space(4.0);
 
     egui::CollapsingHeader::new("Add by Content ID / share link")
         .default_open(false)
@@ -5374,8 +5939,7 @@ fn draw_discover(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
         draw_model_detail(ui, app, &detail, actions);
         return;
     }
-    // A model is being opened: show a spinner instead of flashing the empty-state
-    // hero (which reads as "the click did nothing").
+    // A model is being opened: show a spinner instead of flashing the empty-state hero.
     if app.loading_detail {
         ui.add_space(28.0);
         ui.vertical_centered(|ui| {
@@ -5444,10 +6008,31 @@ fn draw_discover(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
         });
         return;
     }
+    if app.query.trim().is_empty() {
+        let heading = match app.browse_sort {
+            BrowseSort::Best | BrowseSort::Trending => "Trending on Hugging Face",
+            BrowseSort::Downloads => "Most downloaded on Hugging Face",
+            BrowseSort::Likes => "Most liked on Hugging Face",
+            BrowseSort::Updated => "Recently updated on Hugging Face",
+        };
+        ui.label(egui::RichText::new(heading).small().weak());
+        ui.add_space(4.0);
+    }
     egui::ScrollArea::vertical().show(ui, |ui| {
         for m in &app.results {
             draw_model_row(ui, m, actions);
             ui.add_space(6.0);
+        }
+        if app.browse_next.is_some() {
+            ui.add_space(4.0);
+            ui.vertical_centered(|ui| {
+                if app.loading_more {
+                    ui.spinner();
+                } else if ui.button("Load more").clicked() {
+                    actions.push(Action::LoadMore);
+                }
+            });
+            ui.add_space(8.0);
         }
     });
 }
@@ -5485,12 +6070,16 @@ fn draw_model_row(ui: &mut egui::Ui, m: &HfModel, actions: &mut Vec<Action>) {
                     );
                     ui.label(
                         egui::RichText::new(format!(
-                            "{} downloads   ·   {} likes   ·   {}{}",
+                            "{} downloads   ·   {} likes   ·   {}{}{}",
                             compact(m.downloads),
                             compact(m.likes),
                             m.pipeline_tag.clone().unwrap_or_else(|| "—".into()),
                             m.license()
                                 .map(|l| format!("   ·   {l}"))
+                                .unwrap_or_default(),
+                            m.last_modified
+                                .as_deref()
+                                .map(|d| format!("   ·   updated {}", &d[..d.len().min(10)]))
                                 .unwrap_or_default(),
                         ))
                         .small()
@@ -5506,16 +6095,31 @@ fn draw_model_row(ui: &mut egui::Ui, m: &HfModel, actions: &mut Vec<Action>) {
         });
 }
 
-fn draw_best_route_line(ui: &mut egui::Ui, app: &App, wpeers: usize, actions: &mut Vec<Action>) {
+fn draw_best_route_line(
+    ui: &mut egui::Ui,
+    app: &App,
+    wpeers: usize,
+    wbt: usize,
+    actions: &mut Vec<Action>,
+) {
     ui.horizontal_wrapped(|ui| {
-        if wpeers > 0 {
-            transport_chip(ui, "Worldwide", Some(TransportKind::Iroh), false);
+        // Either protocol having peers means P2P is live — a populated
+        // BitTorrent swarm must not read as "no peers yet".
+        if wpeers > 0 || wbt > 0 {
+            if wpeers > 0 {
+                transport_chip(ui, "Worldwide (Iroh)", Some(TransportKind::Iroh), false);
+            } else {
+                transport_chip(ui, "BitTorrent", Some(TransportKind::BitTorrent), false);
+            }
+            let mut bits = Vec::new();
+            if wpeers > 0 {
+                bits.push(format!("{wpeers} Iroh {}", plural(wpeers, "peer")));
+            }
+            if wbt > 0 {
+                bits.push(format!("{wbt} BitTorrent {}", plural(wbt, "seeder")));
+            }
             ui.label(
-                egui::RichText::new(format!(
-                    "Best now: {wpeers} worldwide {}",
-                    plural(wpeers, "peer")
-                ))
-                .small(),
+                egui::RichText::new(format!("Best now: {}", bits.join(" · "))).small(),
             );
         } else if hf_download_live(app) {
             transport_chip(ui, "HF fallback", Some(TransportKind::HuggingFace), false);
@@ -5564,7 +6168,13 @@ fn hf_download_pending(app: &App) -> bool {
     app.settings.allow_hf_download != app.applied_connection.allow_hf_download
 }
 
-fn draw_route_list(ui: &mut egui::Ui, app: &App, wpeers: usize, actions: &mut Vec<Action>) {
+fn draw_route_list(
+    ui: &mut egui::Ui,
+    app: &App,
+    wpeers: usize,
+    wbt: usize,
+    actions: &mut Vec<Action>,
+) {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Routes").small().strong());
         if ui.small_button("Refresh routes").clicked() {
@@ -5572,12 +6182,38 @@ fn draw_route_list(ui: &mut egui::Ui, app: &App, wpeers: usize, actions: &mut Ve
         }
     });
     ui.horizontal_wrapped(|ui| {
-        transport_chip(ui, "Worldwide", Some(TransportKind::Iroh), wpeers == 0);
+        transport_chip(
+            ui,
+            "Worldwide (Iroh)",
+            Some(TransportKind::Iroh),
+            wpeers == 0,
+        );
         if wpeers > 0 {
-            ui.label(egui::RichText::new(format!("{wpeers} seeding worldwide")).small());
+            ui.label(
+                egui::RichText::new(format!("{wpeers} Iroh {} seeding", plural(wpeers, "peer")))
+                    .small(),
+            );
         } else {
             ui.label(
-                egui::RichText::new("No worldwide peers announced yet")
+                egui::RichText::new("No Iroh peers announced yet")
+                    .small()
+                    .weak(),
+            );
+        }
+    });
+    ui.horizontal_wrapped(|ui| {
+        transport_chip(ui, "BitTorrent", Some(TransportKind::BitTorrent), wbt == 0);
+        if wbt > 0 {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{wbt} {} on the public torrent network",
+                    plural(wbt, "seeder")
+                ))
+                .small(),
+            );
+        } else {
+            ui.label(
+                egui::RichText::new("No BitTorrent seeders announced yet")
                     .small()
                     .weak(),
             );
@@ -5617,6 +6253,43 @@ fn draw_route_list(ui: &mut egui::Ui, app: &App, wpeers: usize, actions: &mut Ve
     });
 }
 
+/// "Get this as GGUF": community conversions of a non-GGUF repo, ranked by downloads.
+fn draw_conversions_section(
+    ui: &mut egui::Ui,
+    app: &App,
+    detail: &HfModelDetail,
+    actions: &mut Vec<Action>,
+) {
+    let relevant = app.conversions_for.as_deref() == Some(detail.id.as_str());
+    if !relevant || (!app.conversions_loading && app.conversions.is_empty()) {
+        return;
+    }
+    ui.label(egui::RichText::new("Get this as GGUF").strong());
+    ui.label(
+        egui::RichText::new(
+            "This repo has no GGUF quants; these community conversions do — ready for local runtimes.",
+        )
+        .small()
+        .weak(),
+    );
+    ui.add_space(4.0);
+    if app.conversions_loading {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(
+                egui::RichText::new("Looking for conversions…")
+                    .small()
+                    .weak(),
+            );
+        });
+    }
+    for m in &app.conversions {
+        draw_model_row(ui, m, actions);
+        ui.add_space(4.0);
+    }
+    ui.add_space(8.0);
+}
+
 fn draw_model_detail(
     ui: &mut egui::Ui,
     app: &App,
@@ -5641,6 +6314,32 @@ fn draw_model_detail(
             format!("https://huggingface.co/{}", detail.id),
         );
     });
+    // Structured evaluation facts, so "should I download this?" doesn't need
+    // a trip back to the website.
+    {
+        let mut meta: Vec<String> = Vec::new();
+        if let Some(p) = detail.params_label() {
+            meta.push(format!("{p} params"));
+        }
+        if let Some(c) = detail.context_label() {
+            meta.push(format!("{c} context"));
+        }
+        if let Some(a) = &detail.architecture {
+            meta.push(a.clone());
+        }
+        if detail.downloads > 0 {
+            meta.push(format!("{} downloads", compact(detail.downloads)));
+        }
+        if detail.likes > 0 {
+            meta.push(format!("{} likes", compact(detail.likes)));
+        }
+        if let Some(d) = &detail.last_modified {
+            meta.push(format!("updated {}", &d[..d.len().min(10)]));
+        }
+        if !meta.is_empty() {
+            ui.label(egui::RichText::new(meta.join("   ·   ")).small().weak());
+        }
+    }
     if detail.gated {
         ui.add_space(6.0);
         egui::Frame::group(ui.style())
@@ -5677,9 +6376,17 @@ fn draw_model_detail(
         if app.loading_detail {
             ui.spinner();
         }
+        ui.add_space(10.0);
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            draw_conversions_section(ui, app, detail, actions);
+            readme_ui::draw_readme_section(ui, app, detail, actions);
+        });
         return;
     }
     egui::ScrollArea::vertical().show(ui, |ui| {
+        draw_conversions_section(ui, app, detail, actions);
+        readme_ui::draw_readme_section(ui, app, detail, actions);
+        ui.add_space(8.0);
         // The whole-model bundle (safetensors / MLX): one button, no quants.
         if has_bundle {
             draw_bundle_row(ui, app, detail, actions);
@@ -5754,6 +6461,11 @@ fn draw_bundle_row(
         .filter_map(|s| app.worldwide_peers.get(*s).copied())
         .max()
         .unwrap_or(0);
+    let wbt: usize = shard_shas
+        .iter()
+        .filter_map(|s| app.worldwide_bt.get(*s).copied())
+        .max()
+        .unwrap_or(0);
     egui::Frame::group(ui.style())
         .inner_margin(egui::Margin::symmetric(12.0, 10.0))
         .show(ui, |ui| {
@@ -5818,6 +6530,13 @@ fn draw_bundle_row(
                                 Some(TransportKind::Iroh),
                             );
                         }
+                        if wbt > 0 {
+                            transport_badge(
+                                ui,
+                                format!("{wbt} BitTorrent {}", plural(wbt, "seeder")),
+                                Some(TransportKind::BitTorrent),
+                            );
+                        }
                     });
                     if shard_total > 0 && iroh_covered > 0 && iroh_covered < shard_total {
                         ui.horizontal_wrapped(|ui| {
@@ -5830,7 +6549,7 @@ fn draw_bundle_row(
                             );
                         });
                     } else {
-                        draw_best_route_line(ui, app, wpeers, actions);
+                        draw_best_route_line(ui, app, wpeers, wbt, actions);
                     }
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -5854,7 +6573,7 @@ fn draw_bundle_row(
             egui::CollapsingHeader::new(egui::RichText::new("What's included").small())
                 .id_source(format!("bundle::{}", detail.id))
                 .show(ui, |ui| {
-                    draw_route_list(ui, app, wpeers, actions);
+                    draw_route_list(ui, app, wpeers, wbt, actions);
                     ui.add_space(4.0);
                     ui.label(
                         egui::RichText::new(
@@ -5949,13 +6668,48 @@ fn draw_quant_row(
                 .unwrap_or(false)
         });
     let first = files[0].rfilename.clone();
+    // Same availability treatment as single-file rows: a sharded quant is not
+    // HF-only, and hiding its P2P signal implied exactly that.
+    let shard_shas: Vec<&String> = files.iter().filter_map(|f| f.sha256.as_ref()).collect();
+    let wpeers: usize = shard_shas
+        .iter()
+        .filter_map(|s| app.worldwide_peers.get(*s).copied())
+        .max()
+        .unwrap_or(0);
+    let wbt: usize = shard_shas
+        .iter()
+        .filter_map(|s| app.worldwide_bt.get(*s).copied())
+        .max()
+        .unwrap_or(0);
+    let rep_sha = shard_shas
+        .first()
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    let quant_detail = QuantDetail {
+        title: label.to_string(),
+        subtitle: format!("{} shards, downloaded as one model", files.len()),
+        size: total,
+        sha256: rep_sha,
+        blake3: String::new(),
+        download: QuantDownload::Hf(first.clone()),
+        cached,
+    };
     egui::Frame::group(ui.style())
         .inner_margin(egui::Margin::symmetric(12.0, 10.0))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(label).strong().size(15.0));
+                        if ui
+                            .add(
+                                egui::Label::new(egui::RichText::new(label).strong().size(15.0))
+                                    .sense(egui::Sense::click()),
+                            )
+                            .on_hover_text("Show routes & peers for this quant")
+                            .clicked()
+                        {
+                            actions.push(Action::OpenQuantDetail(quant_detail.clone()));
+                        }
                         if recommended {
                             badge(ui, "Recommended", pal.blue);
                         }
@@ -5967,10 +6721,28 @@ fn draw_quant_row(
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(human(total)).small());
                         format_badge(ui, files.first().and_then(|f| f.format()).as_deref());
+                        if let Some((tier, blurb)) = noema_core::hf::quant_quality_tier(label) {
+                            badge(ui, tier, pal.muted).on_hover_text(blurb);
+                        }
+                        fit_badge(ui, &pal, total, app.mem_budget);
                         if hf_download_live(app) {
                             transport_badge(ui, "Hugging Face", Some(TransportKind::HuggingFace));
                         } else {
                             transport_chip(ui, "HF off", Some(TransportKind::HuggingFace), true);
+                        }
+                        if wpeers > 0 {
+                            transport_badge(
+                                ui,
+                                format!("{wpeers} Iroh {} seeding", plural(wpeers, "peer")),
+                                Some(TransportKind::Iroh),
+                            );
+                        }
+                        if wbt > 0 {
+                            transport_badge(
+                                ui,
+                                format!("{wbt} BitTorrent {}", plural(wbt, "seeder")),
+                                Some(TransportKind::BitTorrent),
+                            );
                         }
                     });
                     ui.label(
@@ -5978,6 +6750,7 @@ fn draw_quant_row(
                             .small()
                             .weak(),
                     );
+                    draw_best_route_line(ui, app, wpeers, wbt, actions);
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if cached {
@@ -5995,6 +6768,23 @@ fn draw_quant_row(
                     }
                 });
             });
+            ui.add_space(2.0);
+            egui::CollapsingHeader::new(egui::RichText::new("Sources & verification").small())
+                .id_source(("quant", &files[0].rfilename))
+                .show(ui, |ui| {
+                    draw_route_list(ui, app, wpeers, wbt, actions);
+                    ui.add_space(2.0);
+                    for f in files {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "    {} — {} · verified by sha256",
+                                f.rfilename,
+                                human(f.size)
+                            ))
+                            .small(),
+                        );
+                    }
+                });
         });
 }
 
@@ -6065,6 +6855,12 @@ fn draw_file_row(
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(human(f.size)).small());
                         format_badge(ui, f.format().as_deref());
+                        if let Some((tier, blurb)) =
+                            noema_core::hf::quant_quality_tier(&f.variant_label())
+                        {
+                            badge(ui, tier, pal.muted).on_hover_text(blurb);
+                        }
+                        fit_badge(ui, &pal, f.size, app.mem_budget);
                         if hf_download_live(app) {
                             transport_badge(ui, "Hugging Face", Some(TransportKind::HuggingFace));
                         } else if hf_download_pending(app) {
@@ -6080,19 +6876,19 @@ fn draw_file_row(
                         if wpeers > 0 {
                             transport_badge(
                                 ui,
-                                format!("{wpeers} seeding worldwide"),
+                                format!("{wpeers} Iroh {} seeding", plural(wpeers, "peer")),
                                 Some(TransportKind::Iroh),
                             );
                         }
                         if wbt > 0 {
                             transport_badge(
                                 ui,
-                                format!("{wbt} BitTorrent {}", plural(wbt, "seed")),
+                                format!("{wbt} BitTorrent {}", plural(wbt, "seeder")),
                                 Some(TransportKind::BitTorrent),
                             );
                         }
                     });
-                    draw_best_route_line(ui, app, wpeers, actions);
+                    draw_best_route_line(ui, app, wpeers, wbt, actions);
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if cached {
@@ -6118,7 +6914,7 @@ fn draw_file_row(
                 .show(ui, |ui| {
                     ui.label(egui::RichText::new(&f.rfilename).small().weak());
                     ui.add_space(2.0);
-                    draw_route_list(ui, app, wpeers, actions);
+                    draw_route_list(ui, app, wpeers, wbt, actions);
                     ui.add_space(4.0);
                     // The content fingerprint *is* the P2P address.
                     if let Some(sha) = &f.sha256 {
@@ -6163,7 +6959,7 @@ fn draw_network(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
     ui.horizontal_wrapped(|ui| {
         transport_chip(
             ui,
-            "Iroh mesh",
+            "Worldwide (Iroh)",
             Some(TransportKind::Iroh),
             app.worldwide.is_none(),
         );
@@ -6356,7 +7152,7 @@ fn network_row(ui: &mut egui::Ui, m: &NetworkModel, actions: &mut Vec<Action>) {
                         ui.label(egui::RichText::new("In library").small().weak());
                     } else if ui
                         .button("Download")
-                        .on_hover_text("Fetches from worldwide peers and verifies every byte.")
+                        .on_hover_text("Fetches from Iroh peers and verifies every byte.")
                         .clicked()
                     {
                         actions.push(Action::AddFromNetwork(m.clone()));
@@ -6581,18 +7377,20 @@ fn draw_transfers(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) {
             ui.label(human(app.session_uploaded));
             ui.end_row();
             ui.label("Sharing");
-            ui.label(if app.worldwide.is_some() {
-                "Worldwide (Iroh)"
-            } else {
-                "off"
+            // BitTorrent seeding runs independently of the Iroh session — saying
+            // "off" while blobs seed over BT would misreport upload activity.
+            let bt_live = app.bt_status.values().any(|s| s.bt_seeding);
+            ui.label(match (app.worldwide.is_some(), bt_live) {
+                (true, true) => "Worldwide (Iroh) + BitTorrent",
+                (true, false) => "Worldwide (Iroh)",
+                (false, true) => "BitTorrent only",
+                (false, false) => "off",
             });
             ui.end_row();
         });
 }
 
-/// The user-facing phase of a *running* card, collapsed from the engine's last
-/// phase string + live transfer state into the few states the card renders
-/// distinctly.
+/// The user-facing phase of a running card, derived from the engine's state.
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum RunningState {
     WaitingForPeers,
@@ -6600,11 +7398,7 @@ enum RunningState {
     Downloading,
 }
 
-/// Classify a running card. The engine's `WaitingForPeers` state (set before a
-/// BitTorrent `open()`, before any byte) and the "discovering peers" phase both
-/// surface as "Waiting for peers…"; the local verify re-read as "Verifying…";
-/// everything else is a live download. (`verifying` is handled by its own branch
-/// upstream; this only decides waiting-vs-downloading for the live case.)
+/// Classify a running card into waiting-for-peers, verifying, or downloading.
 fn download_state(a: &ActiveDownload) -> RunningState {
     use noema_core::transfer::TransferState as Ts;
     if a.verifying {
@@ -6653,8 +7447,17 @@ fn transfer_card(ui: &mut egui::Ui, app: &App, a: &ActiveDownload, actions: &mut
                         actions.push(Action::RemoveTransfer(a.id.clone()));
                     }
                     // A failed card retries; a genuinely paused card resumes. A
-                    // still-queued card offers neither — the engine starts it on
-                    // its own, so a manual resume would only duplicate the run.
+                    // still-queued card offers Pause (engine.pause works on a
+                    // queued transfer) — otherwise there is no way to stop it
+                    // short of Remove.
+                    if a.queued
+                        && ui
+                            .button("Pause")
+                            .on_hover_text("Take this download out of the queue. It won't auto-start until you resume it.")
+                            .clicked()
+                    {
+                        actions.push(Action::PauseTransfer(a.id.clone()));
+                    }
                     if a.failed.is_some() {
                         if ui
                             .button("Retry")
@@ -6947,6 +7750,14 @@ fn transfer_card(ui: &mut egui::Ui, app: &App, a: &ActiveDownload, actions: &mut
                         let used = a.by_source.iter().any(|(sid, b)| {
                             *b > 0 && TransportKind::from_source_id(sid) == kind
                         });
+                        // Live per-path telemetry: rate summed over this
+                        // path's sources, plus swarm peers for BitTorrent.
+                        let bps: f64 = a
+                            .source_rates
+                            .iter()
+                            .filter(|(sid, _)| TransportKind::from_source_id(sid) == kind)
+                            .map(|(_, r)| r.live_bps())
+                            .sum();
                         let resp = transport_chip(ui, kind.display_name(), Some(kind), !active);
                         if active {
                             resp.on_hover_text("Downloading on this path now");
@@ -6957,11 +7768,22 @@ fn transfer_card(ui: &mut egui::Ui, app: &App, a: &ActiveDownload, actions: &mut
                                 "On standby — switches over automatically if the active path stalls",
                             );
                         }
+                        if a.running && bps > 1024.0 {
+                            let mut line = format!("{}/s", human(bps as u64));
+                            if kind == TransportKind::BitTorrent && a.peers > 0 {
+                                line.push_str(&format!(
+                                    " · {} {}",
+                                    a.peers,
+                                    plural(a.peers as usize, "peer")
+                                ));
+                            }
+                            ui.label(egui::RichText::new(line).small());
+                        }
                     }
                 });
             }
         }
-        // Per-source breakdown — the multi-source story made visible.
+        // Per-source breakdown.
         let mut by_source: Vec<(&String, &u64)> =
             a.by_source.iter().filter(|(_, b)| **b > 0).collect();
         if by_source.len() > 1 {
@@ -6975,11 +7797,8 @@ fn transfer_card(ui: &mut egui::Ui, app: &App, a: &ActiveDownload, actions: &mut
     });
 }
 
-/// The live BitTorrent swarm peers for a transfer, in a collapsed section: each
-/// peer's address, its connection kind (TCP/uTP), and the bytes we've exchanged.
-/// The (potentially expensive) `bt_peers` engine call only runs while the section
-/// is expanded — a collapsed header never queries the session, so a screen full of
-/// cards doesn't poll peers every repaint.
+/// Live BitTorrent swarm peers for a transfer, in a collapsed section. The
+/// `bt_peers` engine call only runs while expanded, to avoid polling every repaint.
 fn bt_peer_list(
     ui: &mut egui::Ui,
     engine: &Engine,
@@ -7042,9 +7861,8 @@ fn bt_peer_list(
         });
 }
 
-/// A smoothed download rate (bytes/s) for ETA: the mean of the most recent
-/// speed samples. The instantaneous 0.5 s sample whipsaws on any momentary
-/// stall, which makes a raw ETA jump around; averaging a short window steadies it.
+/// A smoothed download rate (bytes/s) for ETA: mean of recent samples, so a
+/// momentary stall doesn't whipsaw the ETA.
 fn smoothed_bps(samples: &VecDeque<f64>) -> f64 {
     if samples.is_empty() {
         return 0.0;
@@ -7122,6 +7940,30 @@ fn draw_library(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) {
             {
                 actions.push(Action::OpenComposer);
             }
+            let scan_label = if app.scanning_import {
+                "Scanning…"
+            } else {
+                "Import from other apps"
+            };
+            if ui
+                .add_enabled(!app.scanning_import, egui::Button::new(scan_label))
+                .on_hover_text("Find GGUFs that LM Studio, llama.cpp, GPT4All, or the Hugging Face cache already downloaded and add them to your library — no re-download, and they can seed to peers.")
+                .clicked()
+            {
+                actions.push(Action::ScanImport);
+            }
+            let upd_label = if app.checking_updates {
+                "Checking…"
+            } else {
+                "Check for updates"
+            };
+            if ui
+                .add_enabled(!app.checking_updates, egui::Button::new(upd_label))
+                .on_hover_text("Compare each Hugging Face model against its repo — Atlas pins the exact revision it downloaded, so this spots new uploads.")
+                .clicked()
+            {
+                actions.push(Action::CheckModelUpdates);
+            }
         });
     });
     ui.label(
@@ -7183,6 +8025,25 @@ fn draw_library(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) {
                                 } else {
                                     badge(ui, "Local import", pal.muted);
                                 }
+                                if let Some(repo) = app.model_updates.get(&m.manifest_id) {
+                                    if ui
+                                        .add(
+                                            egui::Label::new(
+                                                egui::RichText::new("Update available ›")
+                                                    .small()
+                                                    .color(pal.blue),
+                                            )
+                                            .sense(egui::Sense::click()),
+                                        )
+                                        .on_hover_text(
+                                            "The Hugging Face repo has a newer revision — open it in Discover to fetch the latest.",
+                                        )
+                                        .clicked()
+                                    {
+                                        actions.push(Action::OpenModel(repo.clone()));
+                                        actions.push(Action::GoDiscover);
+                                    }
+                                }
                                 if m.shareable {
                                     let status = app.blob_status(&m.blake3);
                                     // "Iroh live" only when THIS blob is actually being
@@ -7226,10 +8087,15 @@ fn draw_library(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) {
                                     badge(ui, "Not shared", pal.muted);
                                 }
                             });
-                            // Provenance line — the product's reason to exist,
-                            // made visible per model: verified, with a copyable
-                            // content fingerprint.
+                            // Provenance line: verified, with a copyable content fingerprint.
                             ui.add_space(1.0);
+                            if let Some(receipt) = app.receipts.get(&m.manifest_id) {
+                                ui.label(
+                                    egui::RichText::new(receipt)
+                                        .small()
+                                        .color(pal.green),
+                                );
+                            }
                             ui.horizontal(|ui| {
                                 ui.label(
                                     egui::RichText::new(format!(
@@ -7441,6 +8307,36 @@ fn draw_library(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) {
                                     }
                                 }
                             }
+                            // Runtime handoff: the download shouldn't end at a
+                            // file browser. GGUF + a known on-disk path only.
+                            let gguf_path = m
+                                .install_path
+                                .as_deref()
+                                .filter(|p| p.to_ascii_lowercase().ends_with(".gguf"));
+                            if let Some(path) = gguf_path {
+                                if app.ollama_present
+                                    && ui
+                                        .button("Ollama")
+                                        .on_hover_text("Register this model with Ollama (`ollama create`) so `ollama run` can use it.")
+                                        .clicked()
+                                {
+                                    actions.push(Action::AddToOllama {
+                                        path: path.to_string(),
+                                        name: m.name.clone(),
+                                    });
+                                }
+                                if app.lmstudio_present
+                                    && ui
+                                        .button("LM Studio")
+                                        .on_hover_text("Add this model to LM Studio's models folder and open LM Studio.")
+                                        .clicked()
+                                {
+                                    actions.push(Action::OpenInLmStudio {
+                                        path: path.to_string(),
+                                        name: m.name.clone(),
+                                    });
+                                }
+                            }
                         });
                     });
                 });
@@ -7449,10 +8345,8 @@ fn draw_library(ui: &mut egui::Ui, app: &App, actions: &mut Vec<Action>) {
     });
 }
 
-/// The BitTorrent Settings section. Download and seed are independent toggles under
-/// the "Use BitTorrent" master; this also controls the inbound listen port,
-/// per-direction caps, and the concurrency limit. The librqbit session is built
-/// once at startup, so these apply on the next launch.
+/// The BitTorrent Settings section: download/seed toggles, listen port, per-direction
+/// caps, and concurrency, all under the "Use BitTorrent" master. Applied on next launch.
 fn bittorrent_settings(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
     let pal = pal_of(ui);
     ui.add_space(14.0);
@@ -7484,9 +8378,8 @@ fn bittorrent_settings(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Actio
             .weak(),
         );
     }
-    // The BitTorrent-specific rows are greyed out while BT is disabled (they have
-    // no effect then) and indent under "Use BitTorrent"; the download/seed switches
-    // + caps + port all read as that master's options rather than separate settings.
+    // BitTorrent-specific rows grey out while BT is disabled (no effect then) and
+    // indent under the master switch.
     let bt_changed = ui
         .add_enabled_ui(app.settings.bt_enabled, |ui| {
           ui.indent("bt_sub", |ui| {
@@ -7669,7 +8562,7 @@ fn bittorrent_settings(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Actio
     // stays enabled even with BitTorrent off.
     ui.horizontal(|ui| {
         ui.label("Max concurrent transfers (all routes)")
-            .on_hover_text("How many transfers run at once across every route — Iroh, BitTorrent, and Hugging Face; the rest queue. Not BitTorrent-only.");
+            .on_hover_text("How many transfers run at once across every route — Iroh, BitTorrent, and Hugging Face; the rest queue. Not BitTorrent-only. Takes effect next time Atlas starts.");
         let mut c = app.settings.max_concurrent as f64;
         if ui
             .add(egui::DragValue::new(&mut c).range(1.0..=16.0).speed(0.1))
@@ -7874,7 +8767,7 @@ fn draw_settings(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
         ui.add_space(14.0);
         ui.label(egui::RichText::new("Iroh").strong());
         ui.label(
-            egui::RichText::new("NAT-traversing peer-to-peer networking — no ports to open. Turn it off to disable Iroh entirely; while it's on, the options below choose whether Atlas downloads models from peers, seeds the open-licensed ones back to the mesh (where anyone can find them in Explore), or both.")
+            egui::RichText::new("NAT-traversing peer-to-peer networking — no ports to open. Turn it off to disable Iroh entirely; while it's on, the options below choose whether Atlas downloads models from peers, seeds the open-licensed ones back over Iroh (where anyone can find them in Explore), or both.")
                 .small()
                 .weak(),
         );
@@ -7896,9 +8789,7 @@ fn draw_settings(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
                     .weak(),
             );
         }
-        // Sub-switches grey out while the master is off (they have no effect then)
-        // and indent under it, so they read as the master's download / seed options
-        // rather than competing top-level settings.
+        // Sub-switches grey out while the master is off (no effect then) and indent under it.
         ui.add_enabled_ui(app.settings.iroh_enabled, |ui| {
           ui.indent("iroh_sub", |ui| {
             let mut dl = app.settings.iroh_download;
@@ -8218,11 +9109,27 @@ fn draw_settings(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
             } else if app.update.checking {
                 ui.label(egui::RichText::new("Checking…").small().weak());
             } else {
-                ui.label(
-                    egui::RichText::new("You're up to date.")
-                        .small()
-                        .weak(),
-                );
+                // Only claim freshness a finished check actually established.
+                match &app.update.last_check {
+                    Some(Ok(())) => {
+                        ui.label(egui::RichText::new("You're up to date.").small().weak());
+                    }
+                    Some(Err(e)) => {
+                        ui.label(
+                            egui::RichText::new("Last check failed.")
+                                .small()
+                                .color(pal.amber),
+                        )
+                        .on_hover_text(e);
+                    }
+                    None => {
+                        ui.label(
+                            egui::RichText::new("Not checked yet this session.")
+                                .small()
+                                .weak(),
+                        );
+                    }
+                }
             }
         });
 
@@ -8251,11 +9158,7 @@ fn badge(ui: &mut egui::Ui, text: &str, color: egui::Color32) -> egui::Response 
 }
 
 /// Theme-aware accent for a model-format chip, keyed by the canonical format id
-/// from [`noema_core::hf::HfModel::model_formats`]. Maps each format onto the
-/// semantic palette (so chips flip cleanly between light and dark); the lead
-/// formats Atlas runs — GGUF, MLX, Safetensors — each get a distinct hue, which
-/// approximates (it doesn't byte-match) Studio's per-format CSS accents. An
-/// unrecognized id reads neutral, matching Studio's fallback pill.
+/// from [`noema_core::hf::HfModel::model_formats`]. Unrecognized ids read neutral.
 fn format_color(pal: &Palette, fmt: &str) -> egui::Color32 {
     match fmt {
         "gguf" | "ggml" => pal.blue_dl,
@@ -8271,11 +9174,9 @@ fn format_color(pal: &Palette, fmt: &str) -> egui::Color32 {
     }
 }
 
-/// A small pill showing a model's recognized weight format (GGUF, Safetensors,
-/// ONNX, MLX, …) via [`noema_core::inspect::pretty_format`], color-coded per format
-/// by [`format_color`] so the badge reads the same everywhere it appears (Discover
-/// cards and variants, Library, Transfers). No-op when the format is unknown, so
-/// rows for unrecognized files stay clean.
+/// A small pill showing a model's recognized weight format via
+/// [`noema_core::inspect::pretty_format`], color-coded by [`format_color`].
+/// No-op when the format is unknown.
 fn format_badge(ui: &mut egui::Ui, format: Option<&str>) {
     let Some(fmt) = format.map(str::trim).filter(|f| !f.is_empty()) else {
         return;
@@ -8371,6 +9272,55 @@ fn note_route_progress(
     }
 }
 
+/// Hardware-fit badge for a quant row. Uses the same 1.2x runtime headroom as the recommender.
+fn fit_badge(ui: &mut egui::Ui, pal: &Palette, size: u64, budget: u64) {
+    if budget == 0 || size == 0 {
+        return;
+    }
+    let need = (size as f64 * 1.2) as u64;
+    if need <= budget {
+        badge(ui, "Fits this device", pal.green).on_hover_text(format!(
+            "~{} needed with runtime headroom; this device has ~{} for models.",
+            human(need),
+            human(budget)
+        ));
+    } else {
+        badge(ui, "Too big for this device", pal.amber_dim).on_hover_text(format!(
+            "~{} needed with runtime headroom, but this device has ~{} — expect heavy swapping or a failed load.",
+            human(need),
+            human(budget)
+        ));
+    }
+}
+
+/// EMA-smoothed live rate for one source of a transfer.
+#[derive(Clone)]
+struct SourceRate {
+    /// Bytes accumulated since `last_at` (progress ticks arrive in bursts).
+    pending: u64,
+    last_at: Instant,
+    bps: f64,
+}
+
+impl SourceRate {
+    fn new(now: Instant) -> Self {
+        SourceRate {
+            pending: 0,
+            last_at: now,
+            bps: 0.0,
+        }
+    }
+    /// The rate to display: zero once the source has been quiet for a while,
+    /// so a failed-over path doesn't keep showing its old speed.
+    fn live_bps(&self) -> f64 {
+        if self.last_at.elapsed().as_secs_f64() > 4.0 {
+            0.0
+        } else {
+            self.bps
+        }
+    }
+}
+
 fn route_summary(active: &ActiveDownload) -> String {
     let mut by_source: Vec<(&String, &u64)> =
         active.by_source.iter().filter(|(_, b)| **b > 0).collect();
@@ -8387,7 +9337,7 @@ fn route_summary(active: &ActiveDownload) -> String {
 
 fn transport_source_label(source_id: &str) -> &'static str {
     match TransportKind::from_source_id(source_id) {
-        TransportKind::Iroh => "worldwide peer",
+        TransportKind::Iroh => "Iroh peer",
         TransportKind::Https => "HTTPS mirror",
         TransportKind::HuggingFace => "Hugging Face",
         TransportKind::BitTorrent => "BitTorrent swarm",
@@ -8400,13 +9350,168 @@ fn source_label(source: Option<&str>) -> String {
     match source {
         Some(s) => match TransportKind::from_source_id(s) {
             TransportKind::HuggingFace => "Hugging Face".into(),
-            TransportKind::Iroh => "a worldwide peer".into(),
+            TransportKind::Iroh => "an Iroh peer".into(),
             TransportKind::Https => "an HTTPS mirror".into(),
             TransportKind::BitTorrent => "the BitTorrent swarm".into(),
             TransportKind::File => "a local file".into(),
             TransportKind::Unknown => s.to_string(),
         },
         None => "—".into(),
+    }
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+/// Common locations other local-LLM tools keep GGUF models (mirrors the CLI's
+/// scan-import). Only existing directories are returned.
+fn common_model_dirs() -> Vec<PathBuf> {
+    let Some(h) = home_dir() else {
+        return Vec::new();
+    };
+    let candidates = [
+        h.join(".lmstudio").join("models"),
+        h.join(".cache").join("lm-studio").join("models"),
+        h.join(".cache").join("llama.cpp"),
+        h.join("Library")
+            .join("Application Support")
+            .join("nomic.ai")
+            .join("GPT4All"),
+        h.join(".cache").join("gpt4all"),
+        h.join(".cache").join("huggingface").join("hub"),
+    ];
+    candidates.into_iter().filter(|d| d.is_dir()).collect()
+}
+
+fn find_gguf_files(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
+    if depth == 0 || !dir.is_dir() {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            find_gguf_files(&path, out, depth - 1);
+        } else if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("gguf"))
+            .unwrap_or(false)
+        {
+            out.push(path);
+        }
+    }
+}
+
+fn detect_lmstudio() -> bool {
+    if let Some(h) = home_dir() {
+        if h.join(".lmstudio").is_dir() || h.join(".cache").join("lm-studio").is_dir() {
+            return true;
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if Path::new("/Applications/LM Studio.app").exists() {
+        return true;
+    }
+    false
+}
+
+fn detect_ollama() -> bool {
+    let path_hit = std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths)
+            .any(|d| d.join("ollama").is_file() || d.join("ollama.exe").is_file())
+    });
+    path_hit
+        || Path::new("/usr/local/bin/ollama").is_file()
+        || Path::new("/opt/homebrew/bin/ollama").is_file()
+}
+
+/// Link (or copy) a verified model file into LM Studio's models folder layout
+/// (`models/<publisher>/<model>/file.gguf`), then open LM Studio if possible.
+fn lmstudio_place(path: &str, name: &str) -> Result<String, String> {
+    let src = Path::new(path);
+    if !src.is_file() {
+        return Err("the model file isn't on disk anymore".into());
+    }
+    let home = home_dir().ok_or("no home directory")?;
+    let folder = sanitize_handoff_name(name);
+    let base = home
+        .join(".lmstudio")
+        .join("models")
+        .join("noema-atlas")
+        .join(&folder);
+    std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
+    let file_name = src.file_name().ok_or("bad file name")?;
+    let dest = base.join(file_name);
+    if !dest.exists() {
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(src, &dest).is_ok();
+        #[cfg(windows)]
+        let linked = std::fs::hard_link(src, &dest).is_ok();
+        if !linked {
+            std::fs::copy(src, &dest).map_err(|e| e.to_string())?;
+        }
+    }
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open")
+        .arg("-a")
+        .arg("LM Studio")
+        .spawn();
+    Ok(format!(
+        "Added to LM Studio under noema-atlas/{folder} — pick it from LM Studio's model list."
+    ))
+}
+
+/// Register a GGUF with Ollama via `ollama create` and a minimal Modelfile.
+fn ollama_create(path: &str, name: &str) -> Result<String, String> {
+    let src = Path::new(path);
+    if !src.is_file() {
+        return Err("the model file isn't on disk anymore".into());
+    }
+    let tag = sanitize_handoff_name(name).to_lowercase();
+    let modelfile = std::env::temp_dir().join(format!("noema-modelfile-{tag}"));
+    std::fs::write(&modelfile, format!("FROM {}\n", src.display())).map_err(|e| e.to_string())?;
+    let out = std::process::Command::new("ollama")
+        .arg("create")
+        .arg(&tag)
+        .arg("-f")
+        .arg(&modelfile)
+        .output()
+        .map_err(|e| format!("couldn't run ollama: {e}"))?;
+    let _ = std::fs::remove_file(&modelfile);
+    if out.status.success() {
+        Ok(format!("Registered with Ollama — run `ollama run {tag}`."))
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .last()
+            .unwrap_or("ollama create failed")
+            .to_string())
+    }
+}
+
+/// A safe folder/tag name for runtime handoffs.
+fn sanitize_handoff_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches('-');
+    if trimmed.is_empty() {
+        "model".to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -8568,10 +9673,8 @@ fn reveal(path: &Path) {
 
 /// Open a URL in the user's default browser (release-notes page, etc.).
 ///
-/// Only `http(s)://` URLs are opened. The release-notes URL comes from the signed
-/// update manifest, but refusing other schemes is cheap and keeps a stray `file://`
-/// or shell-metachar string from reaching the platform opener (notably Windows'
-/// `cmd /C start`).
+/// Only `http(s)://` URLs are opened, to keep a stray `file://` or shell-metachar
+/// string from reaching the platform opener (notably Windows' `cmd /C start`).
 fn open_url(url: &str) -> std::io::Result<()> {
     let u = url.trim();
     if !(u.starts_with("https://") || u.starts_with("http://")) {
@@ -8666,12 +9769,10 @@ mod download_progress_tests {
         v
     }
 
-    /// Regression (the phantom second download): an in-`open()` transfer (Iroh)
-    /// reports the network download live as "downloading", and the engine then
-    /// re-reads the local file as "verifying" to check integrity. That verify
-    /// sweep runs at disk speed (~250 MB/s) but must not be counted — it would
-    /// otherwise double the session total — and must not spike the graph. Only
-    /// the real network download counts, less one baseline chunk.
+    /// Regression (the phantom second download): an in-`open()` Iroh transfer reports
+    /// the network download as "downloading", then the engine re-reads the file as
+    /// "verifying". The verify sweep must not be counted (it would double the total)
+    /// or spike the graph.
     #[test]
     fn iroh_verify_sweep_counts_nothing_and_does_not_spike() {
         let total = 512 * MIB;

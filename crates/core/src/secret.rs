@@ -15,11 +15,7 @@ pub trait SecretStore: Send + Sync {
 /// Service namespace used for all Noema secrets in the OS keystore.
 pub const SERVICE_PREFIX: &str = "noema-atlas";
 
-/// Read-only credential resolution from environment variables. Used as the
-/// fallback when no OS keystore backend is available, and always consulted
-/// first so callers can override stored credentials per-process.
-///
-/// Lookup order for `(service, account)`:
+/// Read-only credential resolution from environment variables; consulted before the persistent store so callers can override per-process.
 pub struct EnvStore;
 
 impl EnvStore {

@@ -1,10 +1,8 @@
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-/// Read an HTTP response body, refusing more than `max` bytes. External servers
-/// (registry, tracker, Hugging Face, update endpoint) are untrusted, so a body
-/// read must be bounded or a hostile/compromised server could stream an unbounded
-/// response and exhaust client memory.
+/// Read an HTTP response body, refusing more than `max` bytes — bounds untrusted
+/// servers that could otherwise stream an unbounded response and exhaust memory.
 #[cfg(feature = "http")]
 pub async fn read_body_capped(
     mut resp: reqwest::Response,

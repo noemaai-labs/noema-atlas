@@ -447,11 +447,84 @@ select:focus {
   gap: 4px;
   margin-top: 4px;
 }
+/* Per-transport accent (protocol identity, mirrors Atlas). BitTorrent is
+   deliberately NOT green — green stays the success color. Light values are
+   darkened for AA on the light card surface; dark theme uses the brand hexes. */
+.t-iroh { --tp: #2563eb; }
+.t-bt { --tp: #a21caf; }
+.t-hf { --tp: #b45309; }
+.t-https { --tp: #0369a1; }
+:root[data-theme="dark"] .t-iroh { --tp: #6c9cff; }
+:root[data-theme="dark"] .t-bt { --tp: #d87ade; }
+:root[data-theme="dark"] .t-hf { --tp: #ffb347; }
+:root[data-theme="dark"] .t-https { --tp: #5db0ff; }
+.pill.t-iroh, .pill.t-bt, .pill.t-hf, .pill.t-https {
+  border-color: var(--tp);
+  color: var(--tp);
+}
+.rname.t-iroh, .rname.t-bt, .rname.t-hf, .rname.t-https {
+  color: var(--tp);
+}
+/* Transfer Paths row: the pill carrying bytes right now gets a faint fill. */
+.paths .pill:not(.standby) {
+  background: color-mix(in srgb, currentColor 9%, transparent);
+}
+/* ~2s attention pulse on the newly-active path after a failover. */
+.pill.pulse {
+  animation: pathpulse 1s ease-out 2;
+}
+@keyframes pathpulse {
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, currentColor 55%, transparent); }
+  100% { box-shadow: 0 0 0 7px color-mix(in srgb, currentColor 0%, transparent); }
+}
+/* Sidebar ambient transport chips: dimmed when the transport is off, tinted
+   brighter while actively seeding. */
+.side-chips {
+  display: flex;
+  gap: 6px;
+  margin-top: 10px;
+}
+.side-chips .pill.dim {
+  border-color: var(--border);
+  color: var(--text-3);
+  opacity: 0.6;
+}
+.side-chips .pill.hot {
+  background: color-mix(in srgb, var(--tp) 14%, transparent);
+}
 
 .detail {
   margin-top: 14px;
   border-top: 1px solid var(--border);
   padding-top: 12px;
+}
+.readme-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0 8px;
+  cursor: pointer;
+  user-select: none;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-family: var(--font-mono);
+  color: var(--text-2);
+}
+.readme-head:hover {
+  color: var(--text);
+}
+.readme-caret {
+  width: 10px;
+}
+.readme-body {
+  max-height: 60vh;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  padding: 12px 16px;
+  margin-bottom: 12px;
 }
 .variant {
   display: flex;
@@ -907,4 +980,79 @@ textarea:focus {
   background: var(--warn-bg);
   border-radius: 8px;
   font-size: 13px;
+}
+
+/* Discover's browse controls: sort order + the GGUF-only facet. */
+.disc-controls {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin: 0 0 14px;
+}
+.disc-controls select {
+  width: auto;
+  height: 30px;
+  font-size: 11px;
+}
+.pill.toggle {
+  cursor: pointer;
+  padding: 6px 10px;
+}
+.pill.toggle:hover {
+  border-color: var(--accent);
+}
+.pill.toggle.on {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+}
+
+.load-more {
+  display: flex;
+  justify-content: center;
+  margin: 14px 0;
+}
+
+/* Expanded-card metadata line (params / context / downloads / updated). */
+.meta-line {
+  margin: 0 0 10px;
+}
+
+/* "Get this as GGUF" community-conversion hop for repos without quants. */
+.conv {
+  border: 1px solid var(--border);
+  padding: 10px 12px;
+  margin: 0 0 12px;
+}
+.conv-title {
+  font-size: 12px;
+  font-weight: 600;
+}
+.conv .muted {
+  margin: 4px 0 8px;
+}
+.conv-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  padding: 4px 0;
+  font-size: 12px;
+}
+.conv-row .muted {
+  margin: 0;
+}
+
+/* A link-styled inline control (Library's "Update available ›"). */
+.linklike {
+  border: none;
+  background: none;
+  padding: 0;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+  font-family: var(--font-mono);
+  cursor: pointer;
+}
+.linklike:hover {
+  text-decoration: underline;
 }

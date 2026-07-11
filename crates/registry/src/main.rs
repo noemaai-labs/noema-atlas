@@ -16,38 +16,19 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-/// How long a peer's "I have this content" announcement is trusted before it
-/// must re-announce. Keeps the index fresh as nodes go offline: a peer that
-/// removed a model (or crashed/force-quit without withdrawing) drops out of peer
-/// counts within this window. Sized to comfortably outlast the client re-announce
-/// cadence — 5 min for current clients, 10 min for older ones — so a live peer is
-/// never dropped for a single missed beat, while halving the stale-entry window
-/// from the original 30 min.
+/// How long a peer's content announcement is trusted before it must re-announce.
 const PROVIDER_TTL_MS: i64 = 15 * 60 * 1000;
 
-/// Hard cap on stored manifests. `/manifests` is unauthenticated and accepts any
-/// self-signed manifest, so without a ceiling an attacker could fill disk/heap with
-/// an unbounded stream of distinct ids. Updates to an existing id are still allowed
-/// past the cap; only *new* ids are refused once it is reached.
+/// Hard cap on stored manifests (bounds the unauthenticated `/manifests` endpoint);
+/// only *new* ids are refused past the cap — updates to existing ids still store.
 const MAX_STORED_MANIFESTS: usize = 50_000;
 
-/// Per-request body cap for the publish/verify endpoints. Real manifests are a few
-/// KB; this bounds the largest single POST a client can force the registry to buffer.
+/// Per-request body cap for the publish/verify endpoints (bounds a single buffered POST).
 const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 
-/// Worldwide content index. Providers are keyed by the file's **blake3** (Iroh's
-/// content address); a `sha256 -> blake3` alias lets a client that only knows the
-/// Hugging Face sha256 resolve the blake3 it needs to fetch over Iroh.
-///
-/// Browse metadata (name/size/license/listable/group/device) lives on **each
-/// provider record**, not as a single content-global field. Public visibility
-/// and group membership are therefore derived from the *currently-live* set of
-/// providers: one peer cannot promote, hijack, or rewrite another peer's
-/// listing, and a flag reverts as soon as its provider expires. Announces are
-/// authenticated — each is keyed on a signature-verified NodeId — so no one can
-/// publish under another node's id; a peer can still mislabel a hash *it* serves,
-/// but bytes are always blake3/sha256-verified on fetch, so a bad label can never
-/// deliver wrong content.
+/// Worldwide content index: providers keyed by blake3, with a sha256 -> blake3 alias
+/// for HF-sha lookups. Browse metadata lives per-provider, so visibility/group derive
+/// from the live provider set — one peer can't rewrite another's listing.
 #[derive(Default)]
 struct Tracker {
     providers: HashMap<String, Vec<Provider>>,
@@ -58,10 +39,7 @@ struct Tracker {
 struct Provider {
     /// The current reachable node ticket (addresses change over time).
     node: String,
-    /// The peer's *stable* identity (hex NodeId), cryptographically verified on
-    /// announce. This — not the ticket — is the de-duplication key, so one device
-    /// that re-announces with changed addresses stays a single peer instead of
-    /// inflating the count.
+    /// The peer's *stable* identity (hex NodeId), verified on announce; the de-dup key.
     node_id: String,
     device: String,
     group: Option<String>,
@@ -97,11 +75,9 @@ struct CatalogRow {
     quant: String,
     license: String,
     magnet: String,
-    /// Distinct live peers seeding this over Iroh (the mesh dedup key is the
-    /// NodeId, and every announcer runs the Iroh seeder), minus yourself.
+    /// Distinct live peers seeding this over Iroh, minus yourself.
     peers: usize,
-    /// Distinct live peers advertising a BitTorrent swarm for this blob (those
-    /// with a non-empty magnet — set only when actually BT-seeding), minus you.
+    /// Distinct live peers advertising a BitTorrent swarm (non-empty magnet), minus you.
     bt_seeders: usize,
     devices: Vec<String>,
     mine: bool,
@@ -118,8 +94,7 @@ impl Tracker {
     ) {
         let now = now_unix_millis();
         let exp = now + PROVIDER_TTL_MS;
-        // Rows are keyed on the cryptographically-verified stable NodeId (the caller
-        // proves ownership before this is reached), never an attacker-supplied value.
+        // Keyed on the verified stable NodeId (ownership proven before this point).
         let id = node_id.to_string();
         for it in items {
             let b3 = it.blake3.to_lowercase();
@@ -162,15 +137,13 @@ impl Tracker {
             if v.is_empty() {
                 return false;
             }
-            // Distinct peers are counted by stable NodeId, so one device that
-            // re-announced under a changed ticket isn't double-counted.
+            // Count distinct peers by stable NodeId (no double-count on re-announce).
             let distinct: std::collections::HashSet<&str> =
                 v.iter().map(|p| p.node_id.as_str()).collect();
             peers_by_b3.insert(b3.clone(), distinct.len());
             true
         });
-        // The alias map is the one unbounded structure otherwise — keep only
-        // aliases whose target blake3 still has live providers.
+        // Keep only aliases whose target blake3 still has live providers (bound growth).
         self.alias.retain(|_, b3| peers_by_b3.contains_key(b3));
         peers_by_b3
     }
@@ -189,9 +162,7 @@ impl Tracker {
     }
 
     /// Resolve a query hash (blake3 or sha256) to (blake3, live providers).
-    /// `exclude` drops a caller's own NodeId, so a peer never discovers *itself*
-    /// as a provider (which would both inflate its "seeding worldwide" count and
-    /// make it try to fetch a file from its own node).
+    /// `exclude` drops the caller's own NodeId so a peer never discovers itself.
     fn get(&mut self, hash: &str, exclude: Option<&str>) -> (String, Vec<Provider>) {
         let now = now_unix_millis();
         let h = hash.to_lowercase();
@@ -209,16 +180,10 @@ impl Tracker {
         (blake3, providers)
     }
 
-    /// Browse the catalog, deriving each row from a file's live providers. A row
-    /// is public if **any live provider** announced it as `listable`; it is
-    /// `mine` if the querier is itself one of the providers (matched on its own
-    /// `self_id` NodeId) *or* a provider announced it under the querier's group id.
-    /// Displayed metadata comes from a representative live provider (preferring a
-    /// listable one for public rows), so an expired or non-listable announcer
-    /// can't dictate a public listing's labels.
-    ///
-    /// `self_id` is excluded from `peers`, so your own device is not shown as a
-    /// downloadable peer.
+    /// Browse the catalog, deriving each row from a file's live providers: a row is
+    /// public if any live provider announced it `listable`, and `mine` if the querier
+    /// is a provider (by `self_id`) or matches the querier's group. `self_id` is
+    /// excluded from `peers`.
     fn browse(
         &mut self,
         q: &str,
@@ -232,16 +197,14 @@ impl Tracker {
         let mut rows: Vec<CatalogRow> = Vec::new();
         for (b3, provs) in self.providers.iter() {
             let public = provs.iter().any(|p| p.listable);
-            // You are "mine" if you're one of the live providers (by NodeId) or a
-            // provider matches your device group.
+            // "mine": you're a live provider (by NodeId) or a provider matches your group.
             let self_is_provider = self_id.is_some_and(|s| provs.iter().any(|p| p.node_id == s));
             let mine = self_is_provider
                 || (group.is_some() && provs.iter().any(|p| p.group.as_deref() == group));
             if !public && !mine {
                 continue;
             }
-            // Pick a representative provider for the displayed metadata: prefer a
-            // listable one (for public rows), most-recently-seen.
+            // Representative provider for displayed metadata: prefer listable, newest.
             let rep = provs
                 .iter()
                 .filter(|p| !public || p.listable)
@@ -256,21 +219,17 @@ impl Tracker {
                 .filter(|p| !p.device.is_empty())
                 .map(|p| p.device.clone())
                 .collect();
-            // Distinct live peers for this file, minus yourself: "peers" means
-            // *other* devices you could fetch it from.
+            // Distinct live peers minus yourself — *other* devices you could fetch from.
             let total = peers_by_b3.get(b3).copied().unwrap_or(provs.len());
             let peers = total.saturating_sub(usize::from(self_is_provider));
-            // Distinct *other* peers seeding over BitTorrent: those whose live
-            // record carries a non-empty magnet (set only when actually BT-seeding).
-            // Deduped on NodeId and excluding yourself, exactly like `peers`.
+            // Distinct *other* peers BT-seeding (non-empty magnet), deduped on NodeId.
             let bt_seeders = provs
                 .iter()
                 .filter(|p| !p.magnet.is_empty() && self_id.is_none_or(|s| p.node_id != s))
                 .map(|p| p.node_id.as_str())
                 .collect::<std::collections::HashSet<_>>()
                 .len();
-            // Magnet from any live provider that has one (a single seeding peer is
-            // enough to advertise the swarm), falling back to the representative's.
+            // Magnet from any live provider that has one, else the representative's.
             let magnet = provs
                 .iter()
                 .map(|p| p.magnet.as_str())
@@ -335,36 +294,27 @@ struct Args {
     /// Directory to persist manifests.
     #[arg(long, default_value = "./registry-data")]
     dir: PathBuf,
-    /// This registry's own canonical public base URL. It's bound into every
-    /// announce/withdraw signature as the *audience*, so a request captured for one
-    /// registry can't be replayed against another. Recomputed from this value — not
-    /// from an attacker-controllable `Host` header — so it must match the URL clients
-    /// post to. Defaults to the well-known Atlas tracker URL.
+    /// This registry's canonical public base URL, bound into every announce/withdraw
+    /// signature as the *audience* (cross-registry replay protection); must match the
+    /// URL clients post to.
     #[arg(long, default_value = noema_core::DEFAULT_TRACKER)]
     public_url: String,
     /// Require a signed ownership proof on every announce/withdraw. Off by default
-    /// for a transition window: already-released, *unsigned* clients keep working,
-    /// while signed clients are still cryptographically verified (a present-but-bad
-    /// signature is always rejected). Flip this on once clients have upgraded, to
-    /// reject all unsigned requests.
+    /// (transition window): unsigned legacy clients keep working, but any present
+    /// signature is still verified. Flip on once clients have upgraded.
     #[arg(long)]
     require_signed: bool,
-    /// Path to the signed auto-update manifest (`release-manifest.json`) served at
-    /// `/update/latest` and `/studio/update/...`. Defaults to
-    /// `<dir>/release-manifest.json`. The release process scp's the signed file here;
-    /// the registry re-reads it on restart. A missing file just means "no update
-    /// available" — the endpoints stay up.
+    /// Path to the signed auto-update manifest (`release-manifest.json`), served at
+    /// `/update/latest` and `/studio/update/...`. Defaults to `<dir>/release-manifest.json`;
+    /// re-read on restart. A missing file just means "no update available".
     #[arg(long)]
     update_manifest: Option<PathBuf>,
-    /// Ed25519 public key(s) (64-hex) the registry will accept as valid signers of
-    /// the update manifest. If any are given and the manifest doesn't verify against
-    /// them, the registry refuses to serve it (serves "no update" instead).
+    /// Ed25519 public key(s) (64-hex) accepted as valid signers of the update manifest;
+    /// if given and the manifest doesn't verify, the registry serves "no update".
     #[arg(long = "update-trust", value_name = "HEX")]
     update_trust: Vec<String>,
-    /// Serve the update manifest WITHOUT a registry-side signature check when no
-    /// `--update-trust` keys are configured. Off by default (fail closed) — clients
-    /// still verify against their baked-in keys, but the registry won't hand out an
-    /// unverified manifest unless you opt in here.
+    /// Serve the update manifest WITHOUT a registry-side signature check (only when no
+    /// `--update-trust` keys are set). Off by default (fail closed); clients still verify.
     #[arg(long)]
     update_trust_none: bool,
 }
@@ -437,12 +387,9 @@ struct AppState {
     update_etag: Arc<str>,
 }
 
-/// Load and (optionally) verify the signed update manifest. Fails *safe*: any
-/// problem — missing file, bad JSON, or a signature that doesn't match the
-/// registry's configured trust set — yields an empty manifest so the endpoints
-/// answer "no update available" instead of erroring or serving garbage. The
-/// client is the real trust root (it verifies against its baked-in keys); this
-/// check is operational hygiene so a corrupt file on the VPS isn't handed out.
+/// Load and (optionally) verify the signed update manifest. Fails *safe*: any problem
+/// (missing file, bad JSON, untrusted signature) yields an empty manifest, so endpoints
+/// answer "no update available". The client is the real trust root; this is hygiene.
 fn load_release_manifest(
     path: &std::path::Path,
     trust: &[String],
@@ -469,10 +416,8 @@ fn load_release_manifest(
         }
     };
     if trust.is_empty() {
-        // Fail closed by default: without configured trust keys we don't serve an
-        // unverified manifest. The operator must either pass --update-trust <key> or
-        // explicitly opt into unverified serving with --update-trust-none (clients
-        // still verify against their baked-in keys regardless).
+        // Fail closed: without trust keys, don't serve an unverified manifest unless
+        // the operator opts in with --update-trust-none.
         if allow_untrusted {
             tracing::warn!(
                 "serving update manifest from {} WITHOUT registry-side signature check \
@@ -623,15 +568,11 @@ async fn health() -> impl IntoResponse {
 
 /// Auto-update endpoint for the Atlas (egui) client.
 ///
-/// Serves the **whole** signed release manifest, unfiltered. The client does all the
-/// selection (app/os/arch), version comparison, signature verification (against its
-/// baked-in key), and SHA-256 pinning itself — so the bytes served are exactly the
-/// bytes the release key signed. Filtering server-side would invalidate that
-/// signature, so query parameters are intentionally ignored here (kept loggable-free).
-/// Anonymous: a plain GET, no per-user state, no identifying parameters required.
+/// Serves the **whole** signed release manifest, unfiltered: the client does all
+/// selection, version comparison, and signature verification itself. Filtering
+/// server-side would invalidate the signature, so query params are ignored.
 async fn update_latest(State(state): State<AppState>, headers: header::HeaderMap) -> Response {
-    // Collapse startup-ping stampedes: a client (or CDN) that already has this
-    // version gets a 304 instead of the body.
+    // Collapse startup-ping stampedes: an unchanged client gets a 304, not the body.
     if let Some(inm) = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
@@ -665,12 +606,9 @@ async fn update_latest(State(state): State<AppState>, headers: header::HeaderMap
 
 /// Auto-update endpoint for the Studio (Tauri) client.
 ///
-/// Tauri's updater calls a dynamic endpoint and expects its own JSON dialect, doing
-/// its own minisign verification over the asset (the `signature` field is the `.sig`
-/// file's *contents*). Because that signature — not this response shape — is the trust
-/// root for Studio, we can freely reshape the manifest here. Returns **204** when
-/// there's no newer release or no Tauri-installable asset for the platform (the
-/// updater treats 204 as "up to date"); never a 4xx/5xx for unknown platforms.
+/// Returns Tauri-updater-shaped JSON (`signature` is the `.sig` file's contents, which
+/// is Studio's trust root). Returns **204** — which the updater treats as "up to date" —
+/// when there's no newer release or no Tauri-installable asset for the platform.
 async fn studio_update(
     State(state): State<AppState>,
     Path((target, arch, current)): Path<(String, String, String)>,
@@ -684,9 +622,8 @@ async fn studio_update(
         return no_update();
     }
     let os = noema_core::update::normalize_os(&target);
-    // Only offer artifacts Tauri's updater can actually install in place. Notably
-    // .deb is excluded (Tauri can't self-update a system package) and macOS must be
-    // the `.app.tar.gz`, never the `.dmg`.
+    // Only offer artifacts Tauri can install in place: no .deb (system package), and
+    // macOS must be `.app.tar.gz`, never `.dmg`.
     let allowed: &[&str] = match os.as_str() {
         "macos" => &["app_tar_gz"],
         "windows" => &["nsis", "msi", "installer"],
@@ -764,8 +701,7 @@ async fn search(
 ) -> Response {
     let q = params.get("q").cloned().unwrap_or_default().to_lowercase();
     let store = state.store.lock().unwrap();
-    // Cap the response: an empty query would otherwise dump the entire store in one
-    // body (response amplification). Clients paginate/refine to see more.
+    // Cap the response: an empty query would otherwise dump the entire store.
     const SEARCH_LIMIT: usize = 200;
     let results: Vec<Manifest> = store
         .manifests
@@ -839,12 +775,9 @@ struct AnnounceItem {
 
 #[derive(Deserialize)]
 struct AnnounceReq {
-    /// The announcer's Iroh node ticket (reachable worldwide via relays). Bound into
-    /// the signature, so a MITM can't swap it for an address it controls.
+    /// The announcer's Iroh node ticket; bound into the signature (MITM can't swap it).
     node: String,
-    /// The announcer's *stable* NodeId (hex/base32) — the peer de-dup key, and the
-    /// public key the signature is verified against. Mandatory: an announce without a
-    /// proven NodeId is rejected.
+    /// The announcer's *stable* NodeId (hex/base32): peer de-dup key + signature pubkey.
     #[serde(default)]
     node_id: Option<String>,
     /// Human device name (for "from your devices").
@@ -857,21 +790,17 @@ struct AnnounceReq {
     #[serde(default)]
     items: Vec<AnnounceItem>,
     /// Ownership-proof timestamp (ms) + base64 Ed25519 signature over the canonical
-    /// payload, signed with the node secret key (see `noema_core::announce_auth`).
-    /// Both are mandatory — an unsigned announce is rejected.
+    /// payload (see `noema_core::announce_auth`).
     #[serde(default)]
     ts: Option<i64>,
     #[serde(default)]
     sig: Option<String>,
 }
 
-/// A peer announces the content it shares so others can find it worldwide. The
-/// announce carries a NodeId and, for upgraded clients, a ts + signature over the
-/// canonical payload (binding the node ticket, this registry's audience, and the
-/// announced blake3s), verified *before* any state mutation. During the transition
-/// window an unsigned legacy client is still accepted (see `--require-signed`); a
-/// signature that IS present is always verified, so a forged/replayed proof is
-/// rejected. Catalog/provider rows are keyed on the announced NodeId.
+/// A peer announces the content it shares so others can find it worldwide. Carries a
+/// NodeId and (for upgraded clients) a ts + signature over the canonical payload,
+/// verified *before* any state mutation. See `--require-signed` for the transition
+/// window; a present signature is always verified.
 async fn announce(State(state): State<AppState>, Json(req): Json<AnnounceReq>) -> Response {
     if req.node.trim().is_empty() || req.items.is_empty() {
         return err(StatusCode::BAD_REQUEST, "node and items are required");
@@ -883,10 +812,8 @@ async fn announce(State(state): State<AppState>, Json(req): Json<AnnounceReq>) -
             "announce requires a signed node_id",
         );
     };
-    // Verify the Ed25519 signature over the announced blake3s — bound to the received
-    // ticket and this registry's own canonical URL as the audience — against the
-    // claimed NodeId (which *is* the public key), BEFORE touching any state. Reject a
-    // spoofed, unsigned, MITM-rewritten, or cross-registry-replayed request.
+    // Verify the Ed25519 signature over the announced blake3s (bound to the ticket and
+    // this registry's audience) against the claimed NodeId, BEFORE touching any state.
     let item_ids: Vec<String> = req.items.iter().map(|i| i.blake3.clone()).collect();
     if !announce_authorized(
         state.require_signed,
@@ -972,27 +899,22 @@ struct WithdrawReq {
     #[serde(default)]
     items: Vec<String>,
     /// Ownership-proof timestamp (ms) + base64 Ed25519 signature over the canonical
-    /// payload. Without it a registry can't tell a real owner from an attacker
-    /// trying to wipe a victim's records.
+    /// payload (prevents an attacker wiping a victim's records).
     #[serde(default)]
     ts: Option<i64>,
     #[serde(default)]
     sig: Option<String>,
 }
 
-/// A peer un-announces content it no longer serves (deleted, stopped sharing, or
-/// shutting down), so it drops out of the catalog and provider lists right away
-/// rather than lingering until its TTL.
+/// A peer un-announces content it no longer serves, so it drops out of the catalog
+/// and provider lists right away rather than lingering until its TTL.
 async fn withdraw(State(state): State<AppState>, Json(req): Json<WithdrawReq>) -> Response {
     if req.node_id.trim().is_empty() {
         return err(StatusCode::BAD_REQUEST, "node_id is required");
     }
-    // Withdraw is the dangerous verb (it deletes records). When present, the signature
-    // over the requested item ids is verified against the claimed NodeId so no one can
-    // wipe another peer's entries; during the transition window an unsigned legacy
-    // withdraw is still honored (a stale entry would otherwise just TTL out anyway).
-    // Withdraw carries no node ticket, so the bound ticket is empty; the audience is
-    // this registry's own URL (cross-registry replay protection).
+    // Withdraw deletes records, so a present signature is verified against the claimed
+    // NodeId (no wiping another peer's entries). It carries no node ticket, so the bound
+    // ticket is empty; the audience is this registry's URL.
     if !announce_authorized(
         state.require_signed,
         "withdraw",
@@ -1016,11 +938,9 @@ async fn withdraw(State(state): State<AppState>, Json(req): Json<WithdrawReq>) -
     (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
 }
 
-/// Verify an announce/withdraw ownership proof: the `ts` + `sig` must be a valid,
-/// fresh Ed25519 signature over the canonical payload — bound to `ticket` (the
-/// node ticket the registry received) and `audience` (this registry's own canonical
-/// URL) — signed by the secret key whose public key *is* `node_id`. Missing `ts`/`sig`
-/// is a rejection (no proof).
+/// Verify an announce/withdraw ownership proof: `ts` + `sig` must be a fresh Ed25519
+/// signature over the canonical payload (bound to `ticket` and `audience`) by the key
+/// whose public key *is* `node_id`. Missing `ts`/`sig` is a rejection.
 #[allow(clippy::too_many_arguments)]
 fn verify_announce_auth(
     method: &str,
@@ -1046,13 +966,9 @@ fn verify_announce_auth(
     )
 }
 
-/// Authorize an announce/withdraw under the registry's auth mode.
-/// - A request carrying a `ts` + `sig` is ALWAYS cryptographically verified; a
-///   present-but-invalid proof (forged, tampered, replayed) is rejected regardless
-///   of mode.
-/// - A request with no proof is accepted only during the transition window
-///   (`require_signed == false`), so already-released unsigned clients keep working;
-///   with `require_signed == true` it is rejected.
+/// Authorize an announce/withdraw under the registry's auth mode: a present `ts`+`sig`
+/// is ALWAYS verified (invalid proof rejected in any mode); a request with no proof is
+/// accepted only during the transition window (`require_signed == false`).
 #[allow(clippy::too_many_arguments)]
 fn announce_authorized(
     require_signed: bool,
@@ -1085,9 +1001,8 @@ async fn providers(
         .filter(|s| !s.is_empty());
     let (blake3, ps) = state.tracker.lock().unwrap().get(&hash, exclude);
     let now = now_unix_millis();
-    // Peers actually BitTorrent-seeding this file (they announced a non-empty magnet),
-    // mirroring the /catalog `bt_seeders` derivation. Lets a client show worldwide BT
-    // availability per file — not just the Iroh provider count — without a second call.
+    // Peers actually BT-seeding this file (non-empty magnet), mirroring /catalog's
+    // `bt_seeders` — lets a client show BT availability without a second call.
     let bt_seeders = ps.iter().filter(|p| !p.magnet.is_empty()).count();
     Json(serde_json::json!({
         "hash": hash,
@@ -1125,8 +1040,7 @@ mod tests {
     fn item(b3: &str, name: &str, listable: bool) -> AnnouncedItem {
         AnnouncedItem {
             blake3: b3.to_string(),
-            // A valid 64-hex sha256 distinct from the blake3 (digit-substituted),
-            // so the alias only stores well-formed shas.
+            // A valid 64-hex sha256 distinct from the blake3, so aliases stay well-formed.
             sha256: Some(fake_sha(b3)),
             name: name.to_string(),
             size: 100,
@@ -1228,9 +1142,8 @@ mod tests {
         // Anonymous browse must not see it at all.
         assert!(t.browse("", None, None, 100).is_empty());
 
-        // A second peer B announces the SAME content publicly (a spoof or a
-        // genuine public re-share). Now the hash is publicly browsable — but the
-        // public row must show B's label, never A's private one.
+        // A second peer B announces the SAME content publicly. The hash is now browsable,
+        // but the public row must show B's label, never A's private one.
         t.announce(
             "B",
             "B",
@@ -1277,8 +1190,7 @@ mod tests {
     fn same_device_reannouncing_with_a_changed_ticket_stays_one_peer() {
         let mut t = Tracker::default();
         let b3 = "ff".repeat(32);
-        // One device announces, then re-announces after its addresses changed:
-        // same stable NodeId, but a *different* node ticket string.
+        // One device re-announces after its addresses changed: same NodeId, new ticket.
         t.announce(
             "ticket-v1",
             "node-1",
@@ -1337,8 +1249,7 @@ mod tests {
         assert_eq!(anon[0].peers, 1);
         assert!(!anon[0].mine);
 
-        // Browsing as yourself: 0 *other* peers, and flagged mine — so the app
-        // shows "on your devices", never "1 peer seeding your file".
+        // Browsing as yourself: 0 *other* peers, flagged mine.
         let me = t.browse("", None, Some("node-self"), 100);
         assert_eq!(me.len(), 1);
         assert_eq!(me[0].peers, 0);
@@ -1391,8 +1302,7 @@ mod tests {
         assert_eq!(ps.len(), 1);
         assert_eq!(ps[0].node_id, "node-b");
 
-        // B withdraws everything: the file disappears from the catalog entirely,
-        // and its sha256 alias is cleaned up too.
+        // B withdraws everything: the file and its sha256 alias disappear entirely.
         t.withdraw("node-b", &[]);
         assert!(t.browse("", None, None, 100).is_empty());
         assert_eq!(t.stats(), (0, 0));

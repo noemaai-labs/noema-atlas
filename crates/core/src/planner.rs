@@ -3,14 +3,8 @@ use crate::manifest::{Artifact, Manifest, Source, SourceClass};
 use crate::platform::PlatformProfile;
 use crate::policy::PolicyEngine;
 
-/// How the user wants downloads routed across transports. Folds into
-/// [`score_source`] as a per-class bias on top of the base priorities, so it
-/// nudges source selection without overriding health/integrity signals.
-///
-/// `Auto` is the default and keeps the historical weighting. The others express a
-/// deliberate trade-off: favor peer-to-peer swarms (less load on origin mirrors),
-/// favor BitTorrent specifically, or save data by funneling through a single
-/// mirror instead of a high-fanout P2P swarm.
+/// How the user wants downloads routed across transports; biases per-class scoring
+/// in [`score_source`] without overriding health/integrity signals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DownloadPreference {
     /// Balanced default: the existing class weighting, unbiased.
@@ -77,13 +71,9 @@ impl Plan {
     }
 }
 
-/// Build a fetch plan for `artifact`. `health` maps a `source_id` to its
-/// recorded health (callers typically pass a closure over the DB).
-///
-/// `preference` biases the ranking toward the user's chosen routing (P2P /
-/// BitTorrent / save-data); `peers` is an optional known live-peer count for this
-/// file (from the tracker/catalog) that adds a small bonus favoring better-seeded
-/// sources. See [`plan_artifact_with`] for the back-compat `Auto`/no-peers form.
+/// Build a fetch plan for `artifact`. `health` maps a `source_id` to its recorded
+/// health (callers typically pass a closure over the DB). See [`plan_artifact_with`]
+/// for the form with an explicit preference + peer-count hint.
 pub fn plan_artifact<F>(
     manifest: &Manifest,
     artifact: &Artifact,
@@ -169,33 +159,25 @@ where
     Plan { eligible, excluded }
 }
 
-/// Class-tier offset applied per preference. Large enough that the preferred class
-/// tier always orders above the others regardless of health/latency/peers: the base
-/// class-priority spread (~75) plus every positive within-tier signal (success +30,
-/// latency +10, Iroh +5, peers ~+7) sums to well under `200`, so a one-tier gap is
-/// never closed by health alone. Health/latency/peers therefore only break ties
-/// *within* a tier. (Integrity-failed sources are still sunk by their own penalty —
-/// or excluded as `banned` — independent of the preference, by design.)
+/// Class-tier offset applied per preference. Large enough (base spread ~75 + all
+/// within-tier signals: success +30, latency +10, Iroh +5, peers ~+7, sum well under
+/// 200) that a preferred tier always outranks the others; health only breaks ties
+/// within a tier.
 const TIER_OFFSET: f64 = 200.0;
 
 /// How long an integrity ban keeps a source out of the plan. After this window the
-/// source is retried (its integrity penalty still sinks it far down the ranking, and
-/// the full-file hash gate still guards the CAS), so a transient — or mis-attributed
-/// — corruption is not a permanent exclusion. A later success clears the ban outright
-/// (see `Db::record_source_result`).
+/// source is retried (its integrity penalty still ranks it low); a later success
+/// clears the ban outright (see `Db::record_source_result`).
 const BAN_COOLDOWN_HOURS: i64 = 6;
 
 /// Whether `h` is banned AND still cooling down — the one predicate every ban check
-/// must use. The engine's mid-loop re-check goes through this too: a raw `banned`
-/// test would make integrity bans permanent once the cooldown has expired.
+/// must use; a raw `banned` test would make integrity bans permanent past cooldown.
 pub(crate) fn ban_active(h: &SourceHealth) -> bool {
     h.banned && ban_in_cooldown(h)
 }
 
 /// Whether a banned source is still within its cooldown window (→ keep excluding it).
-/// A ban with no timestamp is treated as active/still-banned to stay conservative;
-/// real DB rows always carry one (stamped on ban, backfilled on migration), so this
-/// only affects a synthetic in-memory [`SourceHealth`].
+/// A ban with no timestamp is treated as still-banned to stay conservative.
 fn ban_in_cooldown(h: &SourceHealth) -> bool {
     let Some(ts) = h.banned_at.as_deref() else {
         return true;
@@ -210,11 +192,9 @@ fn ban_in_cooldown(h: &SourceHealth) -> bool {
     }
 }
 
-/// Compute a source's score. The user's download `preference` is applied as a
-/// decisive class-tier offset ([`preference_tier`] × [`TIER_OFFSET`]) so the
-/// preferred transport class always outranks the others; the platform base class
-/// priority, recorded health (success ratio, integrity failures, latency), and a
-/// small live-`peers` bonus then only reorder sources *within* the same tier.
+/// Compute a source's score. `preference` applies a decisive class-tier offset
+/// ([`preference_tier`] × [`TIER_OFFSET`]); base priority, health, and the peer
+/// bonus then only reorder sources within the same tier.
 fn score_source(
     class: SourceClass,
     h: &SourceHealth,
@@ -250,10 +230,8 @@ fn score_source(
     score
 }
 
-/// The preference's class tier (higher = a more-preferred class group). Multiplied
-/// by [`TIER_OFFSET`] in [`score_source`] so the preference is *decisive*: a fresh
-/// source in the preferred tier outranks a healthy one in a lower tier. `Auto` puts
-/// every class in one tier so the base priority + health alone decide.
+/// The preference's class tier (higher = more preferred). Multiplied by [`TIER_OFFSET`]
+/// in [`score_source`] so preference is decisive; `Auto` puts every class in one tier.
 fn preference_tier(preference: DownloadPreference, class: SourceClass) -> i32 {
     use DownloadPreference::*;
     use SourceClass::*;
@@ -282,14 +260,10 @@ fn preference_tier(preference: DownloadPreference, class: SourceClass) -> i32 {
     }
 }
 
-/// A small monotonic bonus that favors a better-seeded source, scoped to the Iroh
-/// class. The live-peer count threaded into the plan is the *Iroh provider* count
-/// the tracker reports (see `Engine::download_artifact`); crediting it to a
-/// BitTorrent source too would wrongly boost a dead BT swarm, so only Iroh gets it.
-///
-/// NOTE: a fresh magnet / bare manifest has no known peer count before `open()`
-/// (the swarm is only probed once we join it), so `peers` is `None` there and this
-/// is neutral — the count is known only for tracker/catalog-discovered downloads.
+/// A small monotonic bonus favoring a better-seeded source, scoped to Iroh: the
+/// threaded peer count is the tracker's *Iroh provider* count, so crediting a
+/// BitTorrent source would wrongly boost a dead BT swarm. `peers` is `None` for a
+/// fresh magnet (swarm not yet probed), where this is neutral.
 fn peer_bonus(class: SourceClass, peers: Option<usize>) -> f64 {
     let Some(n) = peers else { return 0.0 };
     if !matches!(class, SourceClass::Iroh) {
@@ -321,9 +295,8 @@ mod tests {
                 url: "https://m/x".into(),
                 auth: AuthPolicy::None,
             },
-            // LAN peering has been removed: a LanPeer source is never eligible
-            // (it deserializes for back-compat but `fetch_enabled` is false), so
-            // it must be excluded from the plan rather than ranked.
+            // LAN peering has been removed: a LanPeer source deserializes for
+            // back-compat but is never eligible, so it must be excluded, not ranked.
             Source::LanPeer {
                 url: "http://peer/x".into(),
                 auth: AuthPolicy::None,
@@ -610,9 +583,8 @@ mod tests {
         assert_eq!(mirror_none, mirror_peers);
     }
 
-    /// A pristine source: many clean successes, fast, no integrity failures — the
-    /// strongest possible within-tier health signal, used to prove the preference
-    /// tier still dominates a *fresh* source of the preferred class.
+    /// A pristine source (many clean successes, fast, no integrity failures): the
+    /// strongest within-tier health signal, to prove the preference tier dominates.
     fn healthy() -> SourceHealth {
         SourceHealth {
             success_count: 100,
