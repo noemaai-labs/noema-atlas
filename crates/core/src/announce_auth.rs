@@ -1,39 +1,20 @@
-//! Signed-announce authentication for the worldwide content tracker.
-//!
-//! Announce/withdraw are keyed on a peer's stable NodeId (its Ed25519 public
-//! key). Without a proof of ownership anyone could announce a spoofed peer entry
-//! under another node's id, or withdraw a victim's records. To prevent that, the
-//! client signs a canonical payload with its node SECRET key and sends the
-//! signature + a timestamp; the registry rebuilds the same payload and verifies
-//! it against the *claimed* NodeId's public key, rejecting on mismatch.
-//!
-//! The NodeId is the Ed25519 public key, so verification needs no extra key
-//! distribution: the id the client claims *is* the verifying key. This module is
-//! unconditionally compiled (no `iroh` feature) so the registry — which links
-//! `noema-core` without iroh — can verify. The signing side lives in
-//! [`crate::iroh_node`], which already holds the node secret key.
+//! Signed-announce authentication: the client signs a canonical payload with its
+//! node secret key; the registry verifies it against the claimed NodeId (the
+//! Ed25519 public key itself, so no extra key distribution). Compiled without the
+//! `iroh` feature so the registry can verify; the signing side lives in
+//! [`crate::iroh_node`].
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
-/// How far an announce/withdraw timestamp may lag the registry's clock before the
-/// request is rejected as stale (replay limiting). Tight enough to bound a captured
-/// signature's reuse window, generous enough to absorb request latency and modest
-/// clock skew.
+/// Max lag of a timestamp behind the registry clock before it's rejected as stale (replay limiting).
 pub const FRESHNESS_WINDOW_MS: i64 = 5 * 60 * 1000;
 
-/// How far an announce/withdraw timestamp may sit in the *future* (clock skew on
-/// the signer) before rejection. Generous enough to tolerate a modestly fast
-/// consumer clock (a too-tight bound silently rejects all of that node's shares);
-/// the past window already bounds replay, so pre-dating buys little extra.
+/// Max a timestamp may sit in the future (signer clock skew) before rejection.
 pub const FUTURE_SKEW_MS: i64 = 3 * 60 * 1000;
 
-/// Canonicalize a registry base URL into the audience token bound by the signature.
-/// The client (its `tracker_url`) and registry (its `--public-url`) must agree on
-/// this string, so we normalize the parts that are semantically equal but textually
-/// vary: lowercase the scheme + host (case-insensitive per RFC 3986), drop a default
-/// port (`:443` for https, `:80` for http), and strip a trailing slash. The path (if
-/// any) is left as-is since paths are case-sensitive. Scheme stays significant
-/// (http vs https is a real audience difference).
+/// Canonicalize a registry base URL into the audience token bound by the signature:
+/// lowercase scheme+host, drop a default port, strip a trailing slash. Scheme and
+/// path stay significant. Client `tracker_url` and registry `--public-url` must agree.
 fn canonical_audience(url: &str) -> String {
     let s = url.trim().trim_end_matches('/');
     let Some((scheme, rest)) = s.split_once("://") else {
@@ -57,10 +38,8 @@ fn canonical_audience(url: &str) -> String {
     }
 }
 
-/// True only for a well-formed content id: exactly 64 lowercase hex chars. Rejecting
-/// anything else before it enters the signed payload kills newline/delimiter
-/// ambiguity (an id can't smuggle a `\n` to forge extra fields). Applied on both the
-/// sign and verify sides so they never disagree on which ids are in the payload.
+/// True only for a canonical content id: exactly 64 lowercase hex chars (rejecting
+/// others stops an id smuggling a `\n` to forge extra payload fields).
 pub fn is_canonical_id(id: &str) -> bool {
     id.len() == 64
         && id
@@ -68,16 +47,11 @@ pub fn is_canonical_id(id: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// Build the canonical payload bytes that both client and registry sign/verify, or
-/// `None` if any item id is not a canonical 64-hex string (rejected before signing).
-///
-/// Deterministic and order-independent: item ids are sorted so the two sides agree
-/// regardless of send order, and the method name scopes a signature to its operation
-/// (an `announce` signature can't be replayed as a `withdraw`). The payload also
-/// binds the node `ticket` (so a MITM can't rewrite the reachable address while
-/// keeping the signature valid) and an `audience` — the registry base URL the client
-/// is posting to — so a captured request can't be replayed against a different
-/// registry. Shape: `"<method>\n<node_id>\n<ts>\n<audience>\n<ticket>\n<sorted id>\n…"`.
+/// Build the canonical payload both sides sign/verify, or `None` if any item id isn't
+/// canonical 64-hex. Ids are sorted (order-independent) and the payload binds `method`
+/// (an announce sig can't replay as withdraw), `ticket` (MITM can't rewrite the
+/// address), and `audience` (no cross-registry replay).
+/// Shape: `"<method>\n<node_id>\n<ts>\n<audience>\n<ticket>\n<sorted id>\n…"`.
 pub fn canonical_payload(
     method: &str,
     node_id: &str,
@@ -115,9 +89,8 @@ pub fn canonical_payload(
     Some(s.into_bytes())
 }
 
-/// Decode a NodeId string to its 32 raw Ed25519 public-key bytes. A 64-char input
-/// is hex (lowercase, as some clients emit); anything else is RFC 4648 base32
-/// (case-insensitive, no padding) — exactly iroh's `PublicKey` string encoding.
+/// Decode a NodeId to its 32 raw Ed25519 public-key bytes: 64-char input is hex,
+/// otherwise RFC 4648 base32 (iroh's `PublicKey` string encoding).
 fn decode_node_id(node_id: &str) -> Option<[u8; 32]> {
     let s = node_id.trim();
     if s.len() == 64 {
@@ -128,25 +101,17 @@ fn decode_node_id(node_id: &str) -> Option<[u8; 32]> {
     bytes.as_slice().try_into().ok()
 }
 
-/// True if `ts_ms` is fresh relative to `now_ms`: not more than [`FUTURE_SKEW_MS`]
-/// in the future, nor older than [`FRESHNESS_WINDOW_MS`]. Uses saturating math so an
-/// attacker-controlled extreme `ts` (e.g. `i64::MIN`) can never overflow/panic, and
-/// bounds future-dating tightly so a client can't pre-date to double its replay
-/// window.
+/// True if `ts_ms` is fresh: within [`FUTURE_SKEW_MS`] ahead and [`FRESHNESS_WINDOW_MS`]
+/// behind `now_ms`. Saturating math so an extreme `ts` (e.g. `i64::MIN`) can't panic.
 fn ts_is_fresh(ts_ms: i64, now_ms: i64) -> bool {
     let delta = now_ms.saturating_sub(ts_ms); // >0 = ts in the past, <0 = in the future
     (-FUTURE_SKEW_MS..=FRESHNESS_WINDOW_MS).contains(&delta)
 }
 
-/// Verify an announce/withdraw signature against the claimed NodeId.
-///
-/// Returns `true` only when `ts_ms` is fresh (see [`ts_is_fresh`]), every item id is
-/// a canonical 64-hex string, the NodeId decodes to a valid Ed25519 key, and the
-/// signature over the canonical payload — recomputed with the `ticket` and
-/// `audience` the registry actually received/serves — checks out. `ticket` and
-/// `audience` bind the reachable address and the target registry, so a MITM can't
-/// rewrite the address and a captured request can't replay cross-registry. Any
-/// malformed input (including a non-canonical id) is a rejection, never a panic.
+/// Verify an announce/withdraw signature against the claimed NodeId. Returns `true`
+/// only when `ts_ms` is fresh, every id is canonical 64-hex, the NodeId is a valid
+/// Ed25519 key, and the signature over the canonical payload checks out. Any
+/// malformed input is a rejection, never a panic.
 #[allow(clippy::too_many_arguments)]
 pub fn verify(
     method: &str,
@@ -184,9 +149,8 @@ pub fn verify(
     vk.verify(&payload, &sig).is_ok()
 }
 
-/// Decode an RFC 4648 base32 string (no padding, case-insensitive) to bytes. Used
-/// for NodeIds, which iroh `Display`s as lowercase base32. Returns `None` on any
-/// character outside the alphabet or an invalid bit-length tail.
+/// Decode an RFC 4648 base32 string (no padding, case-insensitive) to bytes, or
+/// `None` on a bad character or invalid bit-length tail.
 fn base32_decode(input: &str) -> Option<Vec<u8>> {
     fn val(c: u8) -> Option<u32> {
         match c {
@@ -418,8 +382,7 @@ mod tests {
         let items = vec![id_a()];
         // Sign with a mixed-case host, an explicit default :443, and a trailing
         // slash — all semantically equal to the plain canonical form a registry
-        // verifies against. This is the brittleness fix: textual-but-equal URLs
-        // must not 401 a legitimate share.
+        // verifies against, so a legitimate share must not 401.
         let sig_b64 = sign(
             &sk,
             "announce",

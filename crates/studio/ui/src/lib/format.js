@@ -18,8 +18,7 @@ export function fmtRate(bps) {
   return fmtSize(n) + "/s";
 }
 
-// Seed ratio = bytes uploaded to peers / bytes of the file downloaded. Returns a
-// short string ("0.00", "1.4×") or "" when there's nothing downloaded yet.
+// Seed ratio = bytes uploaded to peers / bytes downloaded. "" when nothing downloaded yet.
 export function fmtRatio(uploaded, downloaded) {
   const up = Number(uploaded) || 0;
   const down = Number(downloaded) || 0;
@@ -27,9 +26,28 @@ export function fmtRatio(uploaded, downloaded) {
   return (up / down).toFixed(2) + "×";
 }
 
-// Human label for a model format tag — mirrors noema_core::inspect::pretty_format
-// so a badge reads "Core ML" / "Safetensors" rather than a bare lowercase tag.
-// Unknown tags uppercase.
+// Route class ("iroh" / "bt" / "https" / "hf" / "file") of a raw engine source id
+// (iroh:<hash> / btv2:<magnet> / hf:… / https:… / file:…). "" when unrecognized.
+export function routeClassOf(src) {
+  if (!src) return "";
+  const s = String(src).trim().toLowerCase();
+  if (s.startsWith("iroh:")) return "iroh";
+  if (s.startsWith("https:")) return "https";
+  if (s.startsWith("hf:")) return "hf";
+  if (s.startsWith("btv2:") || s.startsWith("bittorrent") || s.startsWith("magnet:")) return "bt";
+  if (s.startsWith("file:")) return "file";
+  return "";
+}
+
+// One hover blurb per transport, shared across all transport pills/names.
+export const TRANSPORT_HINTS = {
+  iroh: "Noema's worldwide peer network — verified pieces striped from many peers at once.",
+  bt: "The public torrent network — extra seeders beyond Noema users.",
+  hf: "The original host — fallback route, verified against the same hash.",
+  https: "A direct mirror download, verified against the same hash.",
+};
+
+// Human label for a model format tag — mirrors noema_core::inspect::pretty_format. Unknown tags uppercase.
 const FORMAT_LABELS = {
   gguf: "GGUF",
   safetensors: "Safetensors",
@@ -52,10 +70,7 @@ export function prettyFormat(format) {
   return FORMAT_LABELS[f] || f.toUpperCase();
 }
 
-// Recognize a model format from a filename — mirrors
-// noema_core::inspect::format_from_name so rows that only carry a name (Library,
-// Transfers, the mesh) can show the same badge as the HF browser. Returns "" when
-// nothing recognizable (so the badge is simply omitted).
+// Recognize a model format from a filename — mirrors noema_core::inspect::format_from_name. "" when nothing recognizable.
 export function formatFromName(filename) {
   if (!filename) return "";
   const lower = String(filename).toLowerCase();
@@ -110,9 +125,7 @@ export function rowFormat(format, name) {
   return prettyFormat(format || formatFromName(name));
 }
 
-// The canonical format id (lowercase: "gguf", "mlx", …) for a row, from its
-// explicit format or its filename. "" when unrecognized. Used as the `.f-<id>`
-// chip class so the format badge is color-coded the same everywhere it appears.
+// Canonical lowercase format id ("gguf", "mlx", …) for a row. "" when unrecognized. Used as the `.f-<id>` chip class.
 export function formatId(format, name) {
   return (format ? String(format).toLowerCase() : formatFromName(name)) || "";
 }

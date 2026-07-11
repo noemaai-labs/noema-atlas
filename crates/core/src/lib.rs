@@ -15,6 +15,7 @@ pub mod paths;
 pub mod planner;
 pub mod platform;
 pub mod policy;
+pub mod readme;
 pub mod secret;
 pub mod share;
 pub mod sign;

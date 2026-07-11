@@ -1,18 +1,7 @@
-//! Signed release manifest for in-app auto-update.
-//!
-//! The trust model is the whole point of this module: the public half of the
-//! release-signing key is **compiled into the client** ([`UPDATE_RELEASE_PUBKEYS`]),
-//! and the VPS (atlas.noemaai.com) is treated as an *untrusted* index. The VPS only
-//! ever hands the client this manifest; the client verifies the ed25519 signature
-//! against its baked-in key set, checks freshness + a strictly-greater version, then
-//! downloads the GitHub release asset and re-checks it against the SHA-256 that the
-//! signed manifest pins. A fully compromised VPS — or a network MITM, or even a
-//! tampered GitHub asset — can therefore only ever *withhold* an update, never cause
-//! the client to execute attacker-chosen bytes.
-//!
-//! Like [`crate::announce_auth`], this module is unconditionally compiled (no
-//! feature gate) so the registry — which links `noema-core` without `iroh` — shares
-//! exactly the same verification and asset-selection logic as the clients.
+//! Signed release manifest for in-app auto-update. Clients verify the ed25519 signature
+//! against baked-in [`UPDATE_RELEASE_PUBKEYS`] plus each asset's pinned SHA-256, so an
+//! untrusted VPS/MITM/tampered asset can only withhold an update, never force bad bytes.
+//! Unconditionally compiled (no feature gate) so the registry shares the same logic.
 
 use base64::Engine as _;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -24,24 +13,18 @@ pub const RELEASE_MANIFEST_SCHEMA: u32 = 1;
 
 /// Ed25519 public keys (64-char lowercase hex) trusted to sign release manifests.
 ///
-/// The matching PRIVATE keys are held **offline** by the release manager and never
-/// touch CI — that decoupling is what makes a CI compromise unable to forge an
-/// update. Ship a small *set* (current + next) so a key can be rotated with an
-/// overlap window instead of a forced reinstall. An empty set means "trust nothing",
-/// so verification fails closed and no update is ever offered until a real key is
-/// baked in here.
+/// Matching private keys are held offline (never in CI), so a CI compromise can't forge
+/// an update. Ship a set (current + next) for overlap-window rotation; an empty set
+/// fails closed and no update is ever offered.
 pub const UPDATE_RELEASE_PUBKEYS: &[&str] = &[
-    // Atlas release-signing key #1. The matching secret is held offline by the
-    // release manager (generated 2026-06-24 via `noema update keygen`). Add a second
+    // Atlas release-signing key #1; secret held offline (gen 2026-06-24). Add a second
     // key here ahead of a rotation so both overlap before the first is retired.
     "7a8c8a2a03f606b224f2205595bc50da8495a6b9da9c46f77f3fbd3e51740fc7",
 ];
 
-/// How far past [`ReleaseManifest::expires_at`] a manifest is still tolerated, to
-/// absorb modest client clock skew. The expiry exists for anti-freeze (a stale VPS
-/// replaying an old-but-signed manifest visibly ages out), not as a hard security
-/// boundary — the signature and per-asset hash are the real controls — so a little
-/// slack here costs nothing.
+/// Clock-skew slack past [`ReleaseManifest::expires_at`] within which a manifest is
+/// still tolerated. Expiry is anti-freeze, not a security boundary (the signature and
+/// per-asset hash are the real controls).
 pub const EXPIRY_SKEW_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// A detached signature over a manifest's [`ReleaseManifest::canonical_bytes`].
@@ -165,12 +148,10 @@ impl ReleaseManifest {
         Ok(())
     }
 
-    /// True iff at least one signature is from a `trusted` key **and** verifies over
-    /// the canonical bytes. Never panics — any malformed signature, key, or encoding
-    /// is simply a non-match. Trusted entries may be bare 64-hex or `ed25519:<hex>`
-    /// (both forms are accepted, so pasting a `key_id` works). Pass
-    /// [`UPDATE_RELEASE_PUBKEYS`] in the client; the registry passes its own
-    /// configured trust set (so it can refuse to serve an unsigned manifest).
+    /// True iff some signature is from a `trusted` key and verifies over the canonical
+    /// bytes. Never panics (malformed input is a non-match). Trusted entries may be bare
+    /// 64-hex or `ed25519:<hex>`. Clients pass [`UPDATE_RELEASE_PUBKEYS`]; the registry
+    /// passes its own trust set.
     #[must_use]
     pub fn is_signed_by_trusted(&self, trusted: &[&str]) -> bool {
         let Ok(bytes) = self.canonical_bytes() else {
@@ -199,10 +180,8 @@ impl ReleaseManifest {
 impl AppRelease {
     /// Pick the asset matching `os`/`arch`, optionally constrained to `flavor`.
     ///
-    /// `arm64` is accepted as a synonym for `aarch64`. A `universal` asset matches
-    /// any arch on its OS (covers the universal macOS build). Returns `None` when no
-    /// asset fits — which the caller must treat as "no update for this platform",
-    /// never as a reason to hand over a wrong-arch binary.
+    /// `arm64` aliases `aarch64`; a `universal` asset matches any arch on its OS. `None`
+    /// means "no update for this platform" — never a wrong-arch binary.
     #[must_use]
     pub fn select_asset(
         &self,
@@ -219,9 +198,8 @@ impl AppRelease {
         })
     }
 
-    /// Is `current` strictly older than this release's `version`? An unparsable
-    /// `current` returns `false` (never offer an update we can't reason about, and
-    /// never force one). A non-semver release `version` likewise yields `false`.
+    /// Is `current` strictly older than this release's `version`? Unparsable or
+    /// non-semver inputs return `false` (never offer an update we can't reason about).
     #[must_use]
     pub fn is_newer_than(&self, current: &str) -> bool {
         version_gt(&self.version, current)
@@ -287,11 +265,9 @@ fn signature_is_trusted(bytes: &[u8], sig: &UpdateSignature, trusted: &[&str]) -
     if !sig.algorithm.eq_ignore_ascii_case("ed25519") {
         return false;
     }
-    // The verifying key is carried in the key_id (`ed25519:<hex>`); we only trust it
-    // if that exact public key is in the baked-in set. Normalize an optional
-    // `ed25519:` prefix on BOTH sides so a trusted entry written as a full key_id
-    // (the form `noema update keygen` prints) still matches — pasting that in must
-    // not silently disable updates.
+    // The verifying key is carried in key_id (`ed25519:<hex>`); trust it only if that
+    // exact key is in the baked-in set. Normalize the `ed25519:` prefix on both sides so
+    // a trusted entry written as a full key_id still matches (must not disable updates).
     let norm = |s: &str| s.trim().trim_start_matches("ed25519:").to_ascii_lowercase();
     let pub_hex = norm(&sig.key_id);
     if !trusted.iter().any(|t| norm(t) == pub_hex) {

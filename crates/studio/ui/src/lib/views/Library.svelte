@@ -1,8 +1,12 @@
 <script>
   import { onMount } from "svelte";
   import { api, copyText } from "../api.js";
-  import { fmtSize, rowFormat, formatId } from "../format.js";
+  import { fmtSize, rowFormat, formatId, TRANSPORT_HINTS } from "../format.js";
+  import { receipts } from "../receipts.js";
   import ShareComposer from "../ShareComposer.svelte";
+
+  // Jump to Discover with a search prefilled (the "Update available" hop).
+  export let openDiscover = () => {};
 
   let items = [];
   let loading = true;
@@ -14,14 +18,77 @@
   let confirmStopShare = null;
   let toast = "";
 
+  let scanning = false;
+  let checkingUpdates = false;
+  // manifest_id -> live HF repo, for rows whose pinned revision is behind.
+  let updates = {};
+  let runtimes = { lmstudio: false, ollama: false };
+  let handing = false;
+
+  async function scanImport() {
+    if (scanning) return;
+    scanning = true;
+    try {
+      const r = await api.scanImport();
+      flash(
+        r.imported
+          ? `Imported ${r.imported} model${r.imported === 1 ? "" : "s"}` +
+              (r.failed ? ` · ${r.failed} failed` : "")
+          : r.failed
+            ? `Nothing imported · ${r.failed} failed`
+            : "No GGUF models found in other apps' folders"
+      );
+      if (r.imported) await load();
+    } catch (e) {
+      flash("Scan failed: " + e);
+    } finally {
+      scanning = false;
+    }
+  }
+
+  async function checkUpdates() {
+    if (checkingUpdates) return;
+    checkingUpdates = true;
+    try {
+      const hits = await api.checkModelUpdates();
+      const map = {};
+      for (const h of hits) map[h.manifest_id] = h.repo;
+      updates = map;
+      flash(
+        hits.length
+          ? `${hits.length} model${hits.length === 1 ? " has" : "s have"} an update`
+          : "All Hugging Face models are up to date"
+      );
+    } catch (e) {
+      flash("Update check failed: " + e);
+    } finally {
+      checkingUpdates = false;
+    }
+  }
+
+  const isInstalledGguf = (m) => !!m.install_path && /\.gguf$/i.test(m.install_path);
+  async function handoff(m, target) {
+    if (handing) return;
+    handing = true;
+    try {
+      const msg =
+        target === "ollama"
+          ? await api.handoffOllama(m.install_path, m.name)
+          : await api.handoffLmstudio(m.install_path, m.name);
+      flash(msg);
+    } catch (e) {
+      flash(String(e));
+    } finally {
+      handing = false;
+    }
+  }
+
   async function load() {
     loading = true;
     error = "";
     try {
       items = await api.library();
-      // Enrich each row with its live Iroh-seeding state so the Library can show a
-      // "seeding · Iroh" pill symmetric with the engine-provided `bt_seeding` one.
-      // Best-effort and per-row: a failure just leaves the pill off.
+      // Enrich each row with live Iroh-seeding state (best-effort per-row; a failure just leaves the pill off).
       await Promise.all(
         items.map(async (m) => {
           try {
@@ -29,8 +96,7 @@
           } catch (e) {
             m.iroh_seeding = false;
           }
-          // Per-model seed-ratio override (null = follow the global cap). Surfaced as
-          // an editable number; the input mirrors the override or "" when unset.
+          // Per-model seed-ratio override (null = follow the global cap).
           try {
             const r = await api.btBlobRatio(m.blake3);
             m.ratio_override = r;
@@ -52,6 +118,11 @@
     try {
       modelsDir = (await api.getSettings()).models_dir;
     } catch (e) {}
+    // Which local runtimes are installed — gates the per-row handoff buttons.
+    api
+      .runtimesPresent()
+      .then((r) => (runtimes = r))
+      .catch(() => {});
     await load();
   });
 
@@ -60,18 +131,25 @@
     setTimeout(() => (toast = ""), 2500);
   }
 
-  async function toggleShare(m) {
+  async function toggleShare(m, e) {
+    // The DOM checkbox already flipped on click; Svelte won't rewrite it while
+    // `m.shareable` is unchanged, so every path that doesn't change the backend
+    // state must snap it back explicitly (privacy: never show sharing ON when
+    // the backend never turned it on). Captured before the awaits detach it.
+    const box = e.currentTarget;
+    const snapBack = () => {
+      if (box) box.checked = m.shareable;
+    };
     // Turning sharing ON for a gated / restrictively-licensed model needs an
     // explicit confirmation first (engine.needs_share_confirmation).
     if (!m.shareable) {
       try {
         if (await api.shareNeedsConfirmation(m.manifest_id)) {
+          snapBack();
           confirmShare = m;
-          // Re-render so the checkbox snaps back to off until the user confirms.
-          items = items;
           return;
         }
-      } catch (e) {}
+      } catch (e2) {}
     }
     // Turning sharing OFF while peers are mid-download hard-disconnects them —
     // confirm first instead of silently cutting the cord.
@@ -79,14 +157,15 @@
       try {
         const peers = await api.shareActivity(m.blake3);
         if (peers > 0) {
+          snapBack();
           confirmStopShare = { model: m, peers };
-          // Snap the checkbox back to on until the user confirms.
-          items = items;
           return;
         }
-      } catch (e) {}
+      } catch (e2) {}
     }
     await applyShare(m, !m.shareable);
+    // No-op on success; restores the visual state if applyShare failed.
+    snapBack();
   }
   async function applyShare(m, on) {
     try {
@@ -151,7 +230,8 @@
     }
   }
   async function applyRatio(m) {
-    const raw = (m.ratio_input ?? "").trim();
+    // The number input binds a Number — never assume a string here.
+    const raw = String(m.ratio_input ?? "").trim();
     const cap = raw === "" ? null : Number(raw);
     if (cap != null && (Number.isNaN(cap) || cap < 0)) {
       flash("Ratio must be 0 or higher");
@@ -225,8 +305,24 @@
 
 <div class="view">
   <h2>Your library</h2>
-  <div style="display:flex; gap:8px; margin: -8px 0 16px;">
+  <div style="display:flex; gap:8px; margin: -8px 0 16px; flex-wrap: wrap;">
     <button class="btn sm" on:click={openFolder}>Open folder in Finder</button>
+    <button
+      class="btn sm"
+      disabled={scanning}
+      title="Scan LM Studio / GPT4All / llama.cpp folders for GGUF models and import them"
+      on:click={scanImport}
+    >
+      {scanning ? "Scanning…" : "Import from other apps"}
+    </button>
+    <button
+      class="btn sm"
+      disabled={checkingUpdates}
+      title="Compare each Hugging Face model against its live repo"
+      on:click={checkUpdates}
+    >
+      {checkingUpdates ? "Checking…" : "Check for updates"}
+    </button>
     <button class="btn primary" on:click={() => (composer = { model: null })}>+ Share a model…</button>
   </div>
 
@@ -240,7 +336,19 @@
           <div class="title">
             {m.name}
             {#if rowFormat(m.format, m.name)}<span class="pill fmt f-{formatId(m.format, m.name)}">{rowFormat(m.format, m.name)}</span>{/if}
+            {#if updates[m.manifest_id]}
+              <button
+                class="linklike"
+                title="The repo has moved past your pinned revision — find the fresh version on Discover"
+                on:click={() => openDiscover(updates[m.manifest_id])}
+              >
+                Update available ›
+              </button>
+            {/if}
           </div>
+          {#if $receipts.get(m.manifest_id)}
+            <div class="muted">{$receipts.get(m.manifest_id)}</div>
+          {/if}
           <div class="muted">
             {fmtSize(m.size_bytes)}{m.quant ? " · " + m.quant : ""} ·
             {m.install_path ? "installed" : "cached"}{m.license ? " · " + m.license : ""}
@@ -248,16 +356,16 @@
           {#if m.shareable && (m.bt_seeding || m.iroh_seeding)}
             <div class="muted pills">
               {#if m.iroh_seeding}
-                <span class="pill ok" title="Seeding over Iroh">seeding · Iroh</span>
+                <span class="pill t-iroh" title={"Seeding over Iroh. " + TRANSPORT_HINTS.iroh}>seeding · Iroh</span>
               {/if}
               {#if m.bt_seeding}
-                <span class="pill ok" title="Seeding over BitTorrent">seeding · BitTorrent</span>
+                <span class="pill t-bt" title={"Seeding over BitTorrent. " + TRANSPORT_HINTS.bt}>seeding · BitTorrent</span>
               {/if}
             </div>
           {/if}
         </div>
         <label class="switch" title="Share worldwide">
-          <input type="checkbox" checked={m.shareable} on:change={() => toggleShare(m)} />
+          <input type="checkbox" checked={m.shareable} on:change={(e) => toggleShare(m, e)} />
           <span></span>
         </label>
       </div>
@@ -283,6 +391,28 @@
               <button class="btn xs" on:click={() => clearRatio(m)} title="Clear the override — follow the global ratio cap">×</button>
             {/if}
           </label>
+        {/if}
+        {#if isInstalledGguf(m)}
+          {#if runtimes.ollama}
+            <button
+              class="btn sm"
+              disabled={handing}
+              title="Register this model with Ollama (ollama create)"
+              on:click={() => handoff(m, "ollama")}
+            >
+              Ollama
+            </button>
+          {/if}
+          {#if runtimes.lmstudio}
+            <button
+              class="btn sm"
+              disabled={handing}
+              title="Add this model to LM Studio's models folder"
+              on:click={() => handoff(m, "lmstudio")}
+            >
+              LM Studio
+            </button>
+          {/if}
         {/if}
         <button class="btn sm" on:click={() => (composer = { model: m })}>Edit</button>
         {#if m.install_path}

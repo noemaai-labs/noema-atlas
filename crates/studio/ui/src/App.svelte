@@ -1,6 +1,8 @@
 <script>
   import { onMount } from "svelte";
   import { api, onProgress, onDone, onRegistered } from "./lib/api.js";
+  import { routeClassOf } from "./lib/format.js";
+  import { buildReceipt, setReceipt } from "./lib/receipts.js";
   import { check as checkUpdate } from "@tauri-apps/plugin-updater";
   import { relaunch } from "@tauri-apps/plugin-process";
   import Sidebar from "./lib/Sidebar.svelte";
@@ -13,9 +15,7 @@
 
   let tab = "discover";
   let info = { name: "Noema Studio", version: "", root: "" };
-  // Concurrent transfers, keyed by transfer_id (the engine's stable per-transfer
-  // key, equal to the manifest id). Each row also carries a derived mbps/eta and a
-  // per-row lastTick for the rolling speed estimate.
+  // Concurrent transfers, keyed by transfer_id (equal to the manifest id).
   let transfers = {};
   let settings = null;
   let showIntro = false;
@@ -30,15 +30,23 @@
   let discoverFocus = 0;
   let dropComposer = null;
 
-  // Provisional rows we created optimistically before the engine assigned the real
-  // transfer_id (mesh / link / Hub downloads synthesize the id server-side). Each
-  // start passes its temp key as `client_ref`; the `download://registered` event
-  // echoes it back with the real id, so we re-key that exact row — no FIFO guessing.
+  // A search another view asked Discover to run (e.g. Library's "Update
+  // available" hop to the model's repo). The seq bump makes each hop distinct.
+  let discoverQuery = "";
+  let discoverSeq = 0;
+  function openDiscoverSearch(q) {
+    discoverQuery = q || "";
+    discoverSeq++;
+    tab = "discover";
+  }
+
+  // Provisional rows created before the engine assigns the real transfer_id; each
+  // start passes its temp key as `client_ref` and `download://registered` echoes it
+  // back with the real id, so we re-key that exact row.
   let tmpSeq = 0;
-  // Per-transfer "settled" callbacks the launching view registers so its inline
-  // "Downloading…" acknowledgement clears the moment the transfer reaches a terminal
-  // state (done/stopped/error/waiting) — not just on success. Keyed by the same id
-  // as `transfers`, so it follows the row through the tmp→real re-key (`adopt`).
+  // Per-transfer settle callbacks: fire when a transfer reaches any terminal state
+  // (done/stopped/error/waiting), not just success. Keyed like `transfers`, so they
+  // follow the row through the tmp→real re-key.
   let settleCbs = {};
 
   function applyTheme(theme) {
@@ -56,29 +64,22 @@
     ["done", "paused", "stopped", "waiting"].includes(ph) ||
     String(ph).startsWith("error");
 
-  // Phases a single-row Resume is allowed from: a settled, non-running card. Anything
-  // mid-flight (starting / downloading / pausing / stopping) is already live, so a
-  // second resume is a no-op rather than an error flip. A failed card can be retried
-  // individually, so error is allowed here.
+  // Phases a single-row Resume is allowed from: a settled, non-running card. error is
+  // included so a failed card can be retried individually.
   const isResumablePhase = (ph) =>
     ph === "paused" || ph === "waiting" || String(ph).startsWith("error");
 
-  // Phases Resume-all acts on: only the cards the UI shows as resumable — paused or
-  // waiting-for-peers. Failed / errored rows are excluded (matches the desktop's
-  // resume_all and qBittorrent: a bulk resume doesn't retry failures), as are
-  // mid-flight and done rows.
+  // Phases Resume-all acts on: paused or waiting only. Failed/errored rows are
+  // excluded — a bulk resume doesn't retry failures.
   const isResumeAllPhase = (ph) => ph === "paused" || ph === "waiting";
 
   // A live, pauseable transfer: mid-flight, not already settling or settled.
   const isActivePhase = (ph) =>
     !settledPhase(ph) && ph !== "pausing" && ph !== "stopping";
 
-  // Map a backend lifecycle state (TransferState's Debug string) to the UI phase
-  // a reconciled card should show. The granular live states map to the same lower-
-  // case tokens the progress event emits, so the card caption (via phaseLabel)
-  // reads "Connecting…" / "Verifying…" / "Waiting for peers…" instead of a generic
-  // "Downloading…". Terminal states return null so a finished / failed transfer
-  // never resurrects as a fake live card after a reload.
+  // Map a backend lifecycle state (TransferState's Debug string) to the UI phase a
+  // reconciled card shows. Terminal states return null so a finished/failed transfer
+  // never resurrects as a live card after a reload.
   function phaseFromState(state) {
     switch (state) {
       case "Paused":
@@ -102,10 +103,9 @@
     }
   }
 
-  // Re-key the provisional row identified by `clientRef` to its real transfer_id,
-  // driven by the engine's `download://registered` event. Deterministic: each row
-  // is matched by the exact temp key it was created with, so concurrent starts
-  // never get misattributed (the old FIFO bug).
+  // Re-key the provisional row `clientRef` to its real transfer_id, driven by the
+  // engine's `download://registered` event; matched by the exact temp key it was
+  // created with, so concurrent starts never get misattributed.
   function adopt(clientRef, realId) {
     if (clientRef == null || !transfers[clientRef]) return false;
     if (clientRef === realId) return true;
@@ -219,6 +219,27 @@
       } else {
         row.lastTick = { t: now, bytes: p.bytes_done };
       }
+      // Attribute this tick's byte delta to the active route: feeds the per-path
+      // rate next to the Paths pills and the "fetched from …" completion receipt.
+      // `bytes_done` is cumulative across sources; only forward motion counts.
+      const cls = routeClassOf(p.source);
+      const wall = Date.now();
+      if (cls && row.prevDone != null && p.bytes_done > row.prevDone) {
+        const delta = p.bytes_done - row.prevDone;
+        row.routeBytes = { ...(row.routeBytes || {}) };
+        row.routeBytes[cls] = (row.routeBytes[cls] || 0) + delta;
+        const r = { ...((row.routeRates || {})[cls] || { bps: 0, win: 0, winStart: wall }) };
+        r.win += delta;
+        if (wall - r.winStart >= 500) {
+          const inst = (r.win * 1000) / (wall - r.winStart);
+          r.bps = r.bps > 0 ? r.bps * 0.7 + inst * 0.3 : inst;
+          r.win = 0;
+          r.winStart = wall;
+        }
+        r.at = wall;
+        row.routeRates = { ...(row.routeRates || {}), [cls]: r };
+      }
+      row.prevDone = p.bytes_done;
       const remaining = p.bytes_total - p.bytes_done;
       const etaSec = mbps > 0 && remaining > 0 ? Math.round(remaining / (mbps * 1e6)) : null;
       transfers[id] = { ...row, ...p, manifest_id: id, mbps, etaSec, lastTick: row.lastTick };
@@ -228,10 +249,9 @@
     onDone((payload) => {
       const status = payload && typeof payload === "object" ? payload.status : "done";
       const id = (payload && (payload.transfer_id || payload.manifest_id)) || null;
-      // Clear the launching view's inline "Downloading…" ack on ANY terminal status
-      // (done / stopped / error / waiting) — not just success — so a failed or
-      // stopped download never leaves a stuck button. Done before the row guard
-      // below so it fires even if the row was already pruned.
+      // Clear the launching view's inline ack on ANY terminal status, not just
+      // success. Done before the row guard below so it fires even if the row was
+      // already pruned.
       if (id != null) settle(id);
       // The row is keyed by the engine id (re-keyed at `onRegistered`), so the done
       // event's id matches directly — no FIFO fallback.
@@ -247,6 +267,9 @@
         const msg = (payload && payload.message) || "failed";
         transfers[id] = { ...row, phase: "error: " + msg, mbps: 0, etaSec: null };
       } else {
+        // Record where the verified bytes came from, for this session's receipt
+        // lines (Transfers done-card + Library row).
+        setReceipt(id, buildReceipt(row.routeBytes));
         transfers[id] = { ...row, phase: "done", mbps: 0, etaSec: null };
         // Clear a finished row after a moment so it doesn't linger forever — unless
         // the user is still looking at it / it changed in the meantime.
@@ -282,10 +305,9 @@
       transfers = { ...transfers };
     } catch (e) {}
 
-    // After a full app restart the live registry is empty, but interrupted
-    // downloads survive on disk (kept `.part` + manifest). Re-offer them as Paused
-    // cards so the user can resume; the keyed map means a later live tick for the
-    // same id just updates the existing row.
+    // After a full restart the live registry is empty, but interrupted downloads
+    // survive on disk (kept `.part` + manifest). Re-offer them as Paused cards so
+    // the user can resume.
     try {
       const resumable = await api.resumableDownloads();
       for (const r of resumable) {
@@ -369,10 +391,9 @@
     }
   }
   async function removeTransfer(id) {
-    // A paused / waiting / errored row still has a kept `.part` + resumable DB row
-    // on disk; removing it must discard those (else they leak). A done / stopped
-    // row was already cleaned up, so a registry-only forget is enough. discard is
-    // a superset of remove, so erring toward it is safe.
+    // A paused/waiting/errored row still has a kept `.part` + resumable DB row on
+    // disk; removing it must discard those (else they leak). A done/stopped row was
+    // already cleaned up, so a registry-only forget is enough.
     const phase = (transfers[id] && transfers[id].phase) || "";
     const hasPartial =
       phase === "paused" ||
@@ -388,9 +409,8 @@
   }
 
   // Pause / resume every transfer at once (Transfers header actions). Pause-all
-  // optimistically flips each live row to "pausing" for instant feedback; the per-
-  // transfer done events settle them. Resume-all asks the engine to re-drive every
-  // resumable transfer; each emits its own terminal event handled by onDone.
+  // optimistically flips each live row to "pausing"; the per-transfer done events
+  // settle them.
   async function pauseAll() {
     for (const id of Object.keys(transfers)) {
       const ph = (transfers[id] && transfers[id].phase) || "";
@@ -403,11 +423,10 @@
     } catch (e) {}
   }
   async function resumeAll() {
-    // Snapshot only the rows the UI currently shows as resumable (paused / waiting),
-    // excluding failed/errored cards and any transfer with no visible card. Drive
-    // each through the same per-id resume path as the row's own Resume button — so a
-    // bulk resume can never silently re-drive a failed download or an orphaned
-    // backend row the user can't see (the old `api.resumeAll()` did both).
+    // Snapshot only the rows the UI shows as resumable (paused / waiting) and drive
+    // each through the same per-id resume path as the row's own Resume button, so a
+    // bulk resume never re-drives a failed download or an orphaned backend row the
+    // user can't see.
     const ids = Object.keys(transfers).filter((id) =>
       isResumeAllPhase((transfers[id] && transfers[id].phase) || "")
     );
@@ -420,11 +439,9 @@
     tab = "transfers";
   }
 
-  // Create an optimistic provisional row under a unique temp key and return it.
-  // The key is passed to the backend as `client_ref`; the `download://registered`
-  // event echoes it back with the real id so we re-key exactly this row. An optional
-  // `onSettle` is invoked once the transfer reaches a terminal state, so the
-  // launching view can clear its inline acknowledgement.
+  // Create an optimistic provisional row under a unique temp key (passed to the
+  // backend as `client_ref`) and return it. Optional `onSettle` fires once the
+  // transfer reaches a terminal state.
   function beginProvisional(seed, onSettle) {
     const tmp = "tmp_" + tmpSeq++;
     transfers[tmp] = { manifest_id: tmp, mbps: 0, lastTick: null, ...seed };
@@ -509,7 +526,7 @@
 <svelte:window on:keydown={onKey} />
 
 <div class="app">
-  <Sidebar {tab} {transfers} {info} on:nav={(e) => (tab = e.detail)} />
+  <Sidebar {tab} {transfers} {info} {settings} on:nav={(e) => (tab = e.detail)} />
   <main class="main">
     {#if (updateInfo && !updateDismissed) || updateError}
       <div class="update-banner">
@@ -528,11 +545,17 @@
       </div>
     {/if}
     {#if tab === "discover"}
-      <Discover {startDownload} {goTransfers} focus={discoverFocus} />
+      <Discover
+        {startDownload}
+        {goTransfers}
+        focus={discoverFocus}
+        presetQuery={discoverQuery}
+        presetSeq={discoverSeq}
+      />
     {:else if tab === "explore"}
       <Explore {startLink} {startMesh} {goTransfers} />
     {:else if tab === "library"}
-      <Library />
+      <Library openDiscover={openDiscoverSearch} />
     {:else if tab === "transfers"}
       <Transfers
         {transfers}
@@ -555,11 +578,12 @@
       <div class="modal-head"><h3>Welcome to Noema Studio</h3></div>
       <p class="muted">
         Verified, multi-source model downloads that dedup into one cache and can be
-        shared worldwide over the mesh.
+        shared worldwide over Iroh.
       </p>
       <p class="muted">
         Sharing is on by default — your verified, openly-licensed downloads are
-        re-seeded to peers over BitTorrent and the worldwide mesh. BitTorrent binds
+        re-seeded to peers over BitTorrent and Iroh, Noema's worldwide peer
+        network. BitTorrent binds
         local ports for inbound peers; reachability isn't guaranteed behind every
         NAT, so we can't promise a relay. Gated and privately-imported models stay
         private unless you opt them in.

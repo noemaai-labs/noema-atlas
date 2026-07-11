@@ -5,9 +5,7 @@ use serde::{Deserialize, Serialize};
 /// The schema version this build understands.
 pub const SCHEMA_VERSION: &str = "1.0";
 
-/// Upper bound on a manifest-declared chunk `leaf_size` (256 MiB). Real leaf sizes
-/// are ~1 MiB; this only exists to stop a hostile manifest forcing a huge scratch
-/// allocation during chunk-tree building.
+/// Upper bound on a manifest-declared chunk `leaf_size` (256 MiB); caps scratch allocation against a hostile manifest.
 pub const MAX_LEAF_SIZE: u64 = 256 * 1024 * 1024;
 
 /// Top-level signed manifest.
@@ -116,12 +114,7 @@ impl RedistributionClass {
         })
     }
 
-    /// Whether public peer redistribution (BitTorrent/Iroh advertising) is
-    /// permitted for this class. Public-by-default: open AND unknown/unclassified
-    /// licenses (`PublicP2pAllowed`, `PublicDownloadOnly`) may be reseeded; only the
-    /// explicitly restrictive classes (`GatedNoRedistribution`, `EnterprisePrivate`)
-    /// are withheld — and those are shareable after the user's one-time confirmation
-    /// (handled at the share-toggle layer), not blocked outright.
+    /// Whether public peer redistribution (BitTorrent/Iroh) is permitted; only the restrictive classes are withheld.
     pub fn allows_public_redistribution(&self) -> bool {
         !matches!(
             self,
@@ -129,10 +122,7 @@ impl RedistributionClass {
         )
     }
 
-    /// Classify a license tag (SPDX or HF-style) into a redistribution policy:
-    /// open / open-weight licenses permit P2P reseed; anything unrecognized (or
-    /// absent) is download-only. Shared by the Hugging Face importer and the
-    /// content-link importer so both judge "is this safe to reseed?" identically.
+    /// Classify a license tag (SPDX or HF-style) into a redistribution policy; unrecognized or absent → download-only.
     pub fn for_license(license: Option<&str>) -> RedistributionClass {
         match license {
             Some(s) if license_permits_redistribution(&s.trim().to_lowercase()) => {
@@ -143,11 +133,7 @@ impl RedistributionClass {
     }
 }
 
-/// Whether a (normalized, lowercased) license tag permits redistributing weights.
-/// Matched by family so versioned/cased variants and the common open-weight model
-/// licenses (Llama, Gemma, Qwen, Mistral, Falcon, …) are recognized — not just a
-/// tiny OSI subset. Anything unrecognized stays download-only; the user can still
-/// opt a specific model in from the Library.
+/// Whether a (normalized, lowercased) license tag permits redistributing weights; matched by license family, unrecognized stays download-only.
 fn license_permits_redistribution(l: &str) -> bool {
     // Exact permissive/open licenses.
     const EXACT: &[&str] = &[
@@ -204,12 +190,7 @@ fn default_true() -> bool {
     true
 }
 
-/// Deserialize a `Vec<Source>`, silently dropping any entry whose `type` this build
-/// no longer understands — e.g. an `ipfs` source in a manifest published before IPFS
-/// was removed. Without this, one stale source type fails the *whole* manifest, which
-/// breaks Explore/Library for any pre-existing data. The dropped source is simply
-/// unavailable as a route; the artifact's other sources and its content hashes are
-/// untouched (integrity is always the manifest hash, never the source list).
+/// Deserialize a `Vec<Source>`, silently dropping entries whose `type` this build no longer understands (e.g. legacy `ipfs`) rather than failing the whole manifest.
 fn lenient_sources<'de, D>(d: D) -> std::result::Result<Vec<Source>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -372,12 +353,10 @@ pub enum AuthPolicy {
 pub struct Provenance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
-    /// A reference (often a URL) to the model's source / card — e.g. the old
-    /// Hugging Face page a rescued model used to live at.
+    /// A reference (often a URL) to the model's source / card.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_card_ref: Option<String>,
-    /// A free-text note the sharer wrote describing the model (what it is, what
-    /// it was fine-tuned for, why it left its original home).
+    /// A free-text note the sharer wrote describing the model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -401,11 +380,7 @@ impl Manifest {
         Ok(m)
     }
 
-    /// Whether obtaining this model is access-controlled — it's marked gated, or
-    /// any of its sources needs a bearer token (e.g. a gated Hugging Face repo).
-    /// Such weights are NOT auto-reshared to the public mesh (reseeding them
-    /// would circumvent the access control the author set); the user can still
-    /// opt a specific one in.
+    /// Whether obtaining this model is access-controlled (marked gated, or a source needs a bearer token); such weights are not auto-reshared to the public mesh.
     pub fn is_gated(&self) -> bool {
         self.access.gated
             || self
@@ -422,24 +397,15 @@ impl Manifest {
         )
     }
 
-    /// Whether this model came from the *public* ecosystem — Hugging Face, the
-    /// Noema mesh, or a public web source — as opposed to a private local import.
-    /// Only publicly-sourced models are auto-shared by default; a file the user
-    /// dragged in (publisher `local`, no public source) stays private until they
-    /// opt it in.
+    /// Whether this model came from the *public* ecosystem (vs a private local import); only public models auto-share by default.
     pub fn has_public_provenance(&self) -> bool {
         let pid = self.publisher.id.as_str();
         if pid.starts_with("hf:") {
             return true;
         }
-        // A content-link (`p2p`) manifest reconstructs a model from a bare
-        // content id, so its provenance is only as trustworthy as the license the
-        // link vouched. Treat it as public *only* when that license is a
-        // recognized open/open-weight tag (`PublicP2pAllowed`). An opaque or
-        // unknown license (`PublicDownloadOnly`) must NOT be auto-reseeded — it
-        // could be a gated or private model laundered through a share link, whose
-        // original gated/token-walled manifest never reached this device. The user
-        // can still opt such a model in per-model from the Library.
+        // A `p2p` content-link is only as trustworthy as the license it vouched: treat as
+        // public only for a recognized open tag, since an unknown license could be a gated
+        // model laundered through a share link.
         if pid == "p2p" {
             return matches!(
                 self.license.redistribution,
@@ -457,13 +423,7 @@ impl Manifest {
         })
     }
 
-    /// Whether Atlas seeds this model to the public mesh *by default* when
-    /// worldwide sharing is on. Openly-licensed models from the public ecosystem
-    /// it) always qualify. Gated/token-walled or restrictively-licensed *public*
-    /// models qualify only when `include_gated` is set — the operator's "also
-    /// share gated/licensed models" opt-in (default off). A *private* local
-    /// import (no public provenance) never auto-shares; it stays opt-in. A
-    /// per-model user override always wins, in either direction.
+    /// Whether Atlas seeds this model to the public mesh by default; gated/token-walled or restrictively-licensed public models qualify only when `include_gated` is set.
     pub fn auto_shareable(&self, include_gated: bool) -> bool {
         if !self.has_public_provenance() {
             return false;
@@ -476,11 +436,8 @@ impl Manifest {
         Ok(serde_json::to_string_pretty(self)?)
     }
 
-    /// The canonical byte representation used for signing and verification:
-    /// the manifest with `signatures` removed, serialized as compact JSON with
-    /// recursively sorted object keys.
-    ///
-    /// keys deterministically. We must NOT enable the `preserve_order` feature.)
+    /// Canonical bytes for signing/verification: manifest without `signatures`, compact JSON
+    /// with recursively sorted object keys (do not enable serde_json's `preserve_order`).
     pub fn canonical_bytes(&self) -> Result<Vec<u8>> {
         let mut value = serde_json::to_value(self)?;
         if let serde_json::Value::Object(map) = &mut value {
@@ -511,11 +468,8 @@ impl Manifest {
         }
         for art in &self.artifacts {
             validate_artifact_path(&art.path)?;
-            // At least one strong digest is required. blake3 may be absent for
-            // sources that only publish sha256 ahead of time (e.g. Hugging Face);
-            // the engine computes blake3 during download and keys the cache on it.
-            // A multi-file model's small non-LFS sidecars carry only a git blob
-            // OID — the only digest the Hub publishes for them.
+            // At least one strong digest is required; blake3 may be absent (HF publishes
+            // sha256, or only a git-blob OID for small sidecars) and is computed on download.
             if !art.hashes.has_blake3()
                 && !art.hashes.has_sha256()
                 && !art.hashes.has_git_blob_sha1()
@@ -542,9 +496,7 @@ impl Manifest {
                         art.path
                     )));
                 }
-                // A manifest-declared leaf_size drives a `vec![0u8; leaf_size]`
-                // scratch buffer during chunk-tree building; cap it so a hostile
-                // manifest can't force a multi-gigabyte allocation.
+                // Cap leaf_size so a hostile manifest can't force a multi-gigabyte scratch allocation.
                 if c.leaf_size > MAX_LEAF_SIZE {
                     return Err(Error::InvalidManifest(format!(
                         "artifact `{}` leaf_size {} exceeds maximum {}",
@@ -600,9 +552,7 @@ pub fn validate_manifest_id(id: &str) -> Result<()> {
             "manifest_id starts with `.`: `{id}`"
         )));
     }
-    // Allow only a safe filename charset: alphanumerics plus `. _ : -`.
-    // (`:` is permitted because ids look like `mdl_b3_...`; it is not a path
-    // separator on the platforms we target and is rejected by serve routes too.)
+    // Safe filename charset only; `:` is allowed because it is not a path separator on target platforms.
     if !id
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b':'))
@@ -701,10 +651,9 @@ mod tests {
 
     #[test]
     fn legacy_ipfs_source_and_class_are_dropped_not_fatal() {
-        // A manifest published before IPFS removal carries `{"type":"ipfs",...}` and
-        // "ipfs" in allowed_source_classes. The new build must LOAD it (dropping the
-        // ipfs bits) instead of failing the whole manifest with "unknown variant
-        // `ipfs`" — which previously broke Explore/Library on any pre-existing data.
+        // A pre-IPFS-removal manifest carries `{"type":"ipfs",...}` and "ipfs" in
+        // allowed_source_classes; the build must LOAD it (dropping the ipfs bits)
+        // instead of failing the whole manifest.
         let m = sample();
         let original_sources = m.artifacts[0].sources.len();
         let original_classes = m.access.allowed_source_classes.clone();

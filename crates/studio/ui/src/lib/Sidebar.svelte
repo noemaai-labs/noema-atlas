@@ -1,10 +1,32 @@
 <script>
-  import { createEventDispatcher } from "svelte";
+  import { createEventDispatcher, onMount, onDestroy } from "svelte";
   import logo from "./logo.png?inline";
+  import { api } from "./api.js";
+  import { TRANSPORT_HINTS } from "./format.js";
   export let tab;
   export let transfers = {};
   export let info;
+  // settings snapshot paints the chips first; polling keeps them fresh after edits.
+  export let settings = null;
   const dispatch = createEventDispatcher();
+
+  let polled = null;
+  let seeding = false;
+  let chipTimer = null;
+  $: chipS = polled || settings;
+  async function refreshChips() {
+    try {
+      polled = await api.getSettings();
+    } catch (e) {}
+    try {
+      seeding = !!(await api.worldwideStatus()).sharing;
+    } catch (e) {}
+  }
+  onMount(() => {
+    refreshChips();
+    chipTimer = setInterval(refreshChips, 30000);
+  });
+  onDestroy(() => chipTimer && clearInterval(chipTimer));
   const items = [
     { id: "discover", label: "Discover" },
     { id: "explore", label: "Explore" },
@@ -12,10 +34,7 @@
     { id: "transfers", label: "Transfers" },
     { id: "settings", label: "Settings" },
   ];
-  // Active = genuinely running, fetching bytes. Exclude paused / waiting-for-peers /
-  // pausing / stopping and the terminal states (done / stopped / error) — a paused or
-  // stalled transfer isn't "downloading" and must not inflate the badge or the
-  // aggregate speed. The running phases mirror the engine's live tokens.
+  // "Active" = genuinely running (fetching bytes), not paused/terminal, so those don't inflate the badge or speed.
   const RUNNING = new Set([
     "starting",
     "queued",
@@ -68,6 +87,27 @@
     {:else}
       <div class="muted">idle</div>
     {/if}
+    <div class="side-chips">
+      <span
+        class="pill t-iroh {chipS && chipS.iroh_enabled ? (seeding ? 'hot' : '') : 'dim'}"
+        title={"Iroh is " +
+          (chipS && chipS.iroh_enabled ? (seeding ? "on — seeding now" : "on") : "off") +
+          ". " +
+          TRANSPORT_HINTS.iroh}>Iroh</span
+      >
+      <span
+        class="pill t-bt {chipS && chipS.bt_enabled ? '' : 'dim'}"
+        title={"BitTorrent is " + (chipS && chipS.bt_enabled ? "on" : "off") + ". " + TRANSPORT_HINTS.bt}
+        >BT</span
+      >
+      <span
+        class="pill t-hf {chipS && chipS.allow_hf_download ? '' : 'dim'}"
+        title={"Hugging Face fallback is " +
+          (chipS && chipS.allow_hf_download ? "on" : "off") +
+          ". " +
+          TRANSPORT_HINTS.hf}>HF</span
+      >
+    </div>
     {#if info.version}<div class="ver">v{info.version}</div>{/if}
   </div>
 </aside>

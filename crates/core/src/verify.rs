@@ -2,9 +2,7 @@ use crate::error::{Error, Result};
 use crate::hash::{ChunkTree, DualHasher, Hashes};
 use std::path::Path;
 
-/// Verifies a byte stream incrementally against expected digests and, when a
-/// chunk tree is available, against per-leaf hashes the moment each leaf is
-/// complete — so a poisoning source is caught after one leaf, not after GBs.
+/// Incrementally verifies a byte stream against expected digests and per-leaf hashes as each leaf completes, so a poisoning source is caught early.
 pub struct StreamingVerifier {
     dual: DualHasher,
     chunk_tree: Option<ChunkTree>,
@@ -22,9 +20,7 @@ impl StreamingVerifier {
         chunk_tree: Option<ChunkTree>,
         what: impl Into<String>,
     ) -> Self {
-        // Compute the git blob OID alongside blake3/sha256 only when the manifest
-        // declares one (sidecar files) and we know the full length up front — the
-        // OID hashes a `blob <len>\0` header, so the length is required.
+        // Git blob OID hashes a `blob <len>\0` header, so it needs the length up front; compute it only when the manifest declares one.
         let dual = if expected.has_git_blob_sha1() && expected_size > 0 {
             DualHasher::with_git_blob_len(expected_size)
         } else {
@@ -88,9 +84,7 @@ impl StreamingVerifier {
             }
         }
         let size = self.dual.len();
-        // `expected_size == 0` means the size was unknown up front (e.g. a bare
-        // Content-ID add); the full-file digests below are the real integrity
-        // guarantee, so only enforce the size when it was actually declared.
+        // expected_size == 0 means the size was unknown up front (e.g. a bare Content-ID add); digests are the real guarantee, so only enforce size when declared.
         if self.expected_size != 0 && size != self.expected_size {
             return Err(Error::SizeMismatch {
                 what: self.what.clone(),
@@ -165,8 +159,7 @@ pub fn verify_file(
     }
     Ok(got)
 }
-/// How risky a file is to handle, based on its type. Model weight downloaders
-/// are a juicy target: pickle-based formats can execute arbitrary code on load.
+/// How risky a file is to handle, based on type — pickle-based formats can execute arbitrary code on load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileSafety {
     /// Pure data formats we allow by default (still header-validated).

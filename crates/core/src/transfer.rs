@@ -1,10 +1,7 @@
-//! Per-transfer control + registry for concurrent downloads.
-//!
-//! The engine used to run one download at a time behind a pair of global
-//! cancel/discard flags. To support concurrent transfers (and a queue), each
-//! transfer now owns its own [`TransferControl`]; the one currently executing is
-//! stashed in the [`CURRENT_TRANSFER`] task-local so the streaming/verify code can
-//! read its cancel flags without threading the control through every function.
+//! Per-transfer control + registry for concurrent downloads. Each transfer owns
+//! its own [`TransferControl`]; the executing one is stashed in the
+//! [`CURRENT_TRANSFER`] task-local so streaming/verify code can read its cancel
+//! flags without threading the control through every function.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -52,21 +49,19 @@ pub enum TransferState {
     WaitingForPeers,
 }
 
-/// Per-transfer cooperative control: the cancel/discard flags that used to be
-/// global on the engine, now one set per concurrent transfer.
+/// Per-transfer cooperative control: cancel/discard flags, one set per transfer.
 #[derive(Debug)]
 pub struct TransferControl {
     pub id: TransferId,
     pub manifest_id: String,
-    /// Cooperative cancel flag, kept as a shared atomic so it can be handed to
-    /// in-`open()` transports via `FetchCtx` and to blocking verify tasks.
+    /// Cooperative cancel flag; shared atomic so it can be handed to `open()`
+    /// transports via `FetchCtx` and to blocking verify tasks.
     pub cancel: Arc<AtomicBool>,
     /// `true` = a Stop (discard the partial); `false` = a Pause (keep it).
     pub discard_partial: Arc<AtomicBool>,
     state: Mutex<TransferState>,
-    /// Set while a `run_transfer` task is executing this control, so a second
-    /// concurrent run (e.g. the UI resuming a still-queued transfer) is rejected
-    /// instead of racing two writers on the same partial file.
+    /// Set while a `run_transfer` task drives this control, so a second concurrent
+    /// run is rejected instead of racing two writers on the same partial.
     executing: AtomicBool,
 }
 
@@ -120,16 +115,15 @@ impl TransferControl {
         *self.state.lock().expect("transfer state mutex poisoned") = s;
     }
 
-    /// Mark this control as executing; returns `false` if a run is already in
-    /// progress (so the caller must NOT start a second one — that would race two
-    /// writers on the same partial). Pair with [`TransferControl::end`].
+    /// Mark this control executing; returns `false` if a run is already in progress
+    /// (starting a second would race two writers on the same partial). Pair with
+    /// [`TransferControl::end`].
     pub fn try_begin(&self) -> bool {
         if self.executing.swap(true, Ordering::SeqCst) {
             return false; // already running — do NOT clear a concurrent run's flags
         }
-        // We are the sole runner now: clear stale pause/stop flags from a prior
-        // attempt here (atomically with admission) so a Stop issued the instant we
-        // become executing isn't erased by a separate later reset().
+        // Sole runner now: clear stale pause/stop flags atomically with admission,
+        // so a Stop issued the instant we become executing isn't erased by a later reset().
         self.cancel.store(false, Ordering::SeqCst);
         self.discard_partial.store(false, Ordering::SeqCst);
         true
@@ -191,9 +185,8 @@ impl TransferManager {
 }
 
 tokio::task_local! {
-    /// The control for the transfer running on the current task. Set by
-    /// `Engine::run_transfer` via `CURRENT_TRANSFER.scope(...)`, so the streaming
-    /// and verify code can poll its cancel flags without an extra parameter.
+    /// Control for the transfer running on the current task, so streaming/verify
+    /// code can poll its cancel flags without an extra parameter.
     pub static CURRENT_TRANSFER: Arc<TransferControl>;
 }
 

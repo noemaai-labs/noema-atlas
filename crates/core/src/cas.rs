@@ -146,10 +146,8 @@ impl Cas {
         self.tmp_dir().join(format!("{download_id}.{suffix}.part"))
     }
 
-    /// Every in-flight `.part` temp belonging to a download id. The filename
-    /// encodes an artifact-hash suffix (`{download_id}.{suffix}.part`) that the
-    /// caller may not know, so we match by the `{download_id}.` prefix — the `.`
-    /// separator keeps a longer id sharing the same leading hex from matching.
+    /// Every in-flight `.part` temp for a download id. The trailing `.` in the
+    /// `{download_id}.` match prefix stops a longer id sharing the leading hex.
     fn download_temp_paths(&self, download_id: &str) -> Vec<PathBuf> {
         let prefix = format!("{download_id}.");
         let mut out = Vec::new();

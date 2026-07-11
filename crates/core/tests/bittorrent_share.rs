@@ -1,6 +1,5 @@
-//! Two-instance BitTorrent seed/leech round-trips. Networked (real DHT + a live
-//! swarm), so every test here is `#[ignore]`d — they compile in CI but only run
-//! on a developer's networked machine (`cargo test --features bittorrent -- --ignored`).
+//! Two-instance BitTorrent seed/leech round-trips. Networked, so every test is
+//! `#[ignore]`d: `cargo test --features bittorrent -- --ignored`.
 #![cfg(feature = "bittorrent")]
 
 use std::sync::{Arc, Mutex};
@@ -17,9 +16,7 @@ fn sample(seed: u8, len: usize) -> Vec<u8> {
         .collect()
 }
 
-/// Adapter config for one test instance: outbound + DHT only (no inbound
-/// listener, no UPnP), uncapped, public trackers off (this is a private
-/// two-node swarm), ratio unlimited.
+/// Adapter config for one test instance: outbound + DHT only, public trackers off (private two-node swarm).
 fn bt_cfg(store_dir: std::path::PathBuf, seed: bool) -> TransportConfig {
     TransportConfig {
         bittorrent_store_dir: store_dir,
@@ -36,15 +33,12 @@ fn leecher(store_dir: std::path::PathBuf) -> BittorrentAdapter {
     BittorrentAdapter::new(&bt_cfg(store_dir, false), None)
 }
 
-/// A seeding adapter. Returned as an `Arc` because `seed_blob` takes
-/// `self: &Arc<Self>` (it detaches the seed work, including the cold session
-/// init, onto a spawned task).
+/// A seeding adapter. `Arc` because `seed_blob` takes `self: &Arc<Self>`.
 fn seeder(store_dir: std::path::PathBuf) -> Arc<BittorrentAdapter> {
     Arc::new(BittorrentAdapter::new(&bt_cfg(store_dir, true), None))
 }
 
-/// Build the manifest artifact a leecher passes to `open()` so the adapter can pick
-/// the right file out of the torrent and the engine can verify it afterwards.
+/// Manifest artifact a leecher passes to `open()`, used to select the file and verify it.
 fn artifact(name: &str, bytes: &[u8]) -> Artifact {
     Artifact {
         path: name.to_string(),
@@ -57,11 +51,7 @@ fn artifact(name: &str, bytes: &[u8]) -> Artifact {
     }
 }
 
-/// Seed `bytes` from one BitTorrent instance, then fetch them by the generated
-/// magnet from a second instance and assert the bytes round-trip exactly.
-///
-/// The transport never trusts the swarm: this drains the leecher's stream and
-/// compares it to the original, exactly as the engine's verify pass would.
+/// Seed `bytes` from one instance, fetch them by magnet from a second, and assert an exact round-trip.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a live BitTorrent swarm/DHT; run on a networked machine"]
 async fn bittorrent_two_instance_seed_leech() {
@@ -71,7 +61,6 @@ async fn bittorrent_two_instance_seed_leech() {
     std::fs::write(&blob, &bytes).unwrap();
     let blake3 = hash_bytes(&bytes).blake3;
 
-    // --- Seeder: build a torrent over the blob and capture its magnet. ----------
     let seeder = seeder(tmp.path().join("seeder"));
     let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let sink = captured.clone();
@@ -99,7 +88,6 @@ async fn bittorrent_two_instance_seed_leech() {
     .await
     .expect("seeder should produce a magnet");
 
-    // --- Leecher: add the file by that magnet and stream it back. ----------------
     let leecher = leecher(tmp.path().join("leecher"));
     let source = Source::BittorrentV2 {
         magnet_uri: magnet,
@@ -120,10 +108,8 @@ async fn bittorrent_two_instance_seed_leech() {
     assert_eq!(got, bytes, "the leeched bytes must match the seeded blob");
 }
 
-/// A download interrupted partway resumes from its on-disk pieces after the leecher
-/// process restarts, rather than starting over. The persistent librqbit session
-/// keys its resume data off `store_dir`, so a second adapter pointed at the same dir
-/// re-attaches the in-progress torrent.
+/// A download interrupted partway resumes from on-disk pieces after the leecher restarts.
+/// The persistent librqbit session keys resume data off `store_dir`, so a second adapter on the same dir re-attaches.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a live BitTorrent swarm/DHT; run on a networked machine"]
 async fn bittorrent_resume_across_restart() {

@@ -2,6 +2,8 @@ use crate::settings::StudioSettings;
 use crate::AppState;
 use noema_core::engine::{DownloadProgress, Progress};
 use serde::Serialize;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 
@@ -31,8 +33,7 @@ pub struct ModelHit {
     downloads: u64,
     likes: u64,
     gated: bool,
-    /// Weight formats this repo publishes (`gguf`, `safetensors`, `mlx`, …), shown
-    /// as per-format chips on the card. Canonical ids — pretty-printed in the UI.
+    /// Weight formats this repo publishes (`gguf`, `safetensors`, `mlx`, …); shown as per-format chips.
     formats: Vec<String>,
     license: Option<String>,
     tags: Vec<String>,
@@ -78,6 +79,76 @@ pub async fn popular_models(state: State<'_, AppState>) -> Result<Vec<ModelHit>,
     Ok(models.into_iter().map(to_hit).collect())
 }
 
+/// One page of a Hub model listing plus the cursor of the next page.
+#[derive(Serialize)]
+pub struct ListPage {
+    models: Vec<ModelHit>,
+    next: Option<String>,
+}
+
+fn to_page(page: noema_core::hf::ModelPage) -> ListPage {
+    ListPage {
+        models: page.models.into_iter().map(to_hit).collect(),
+        next: page.next,
+    }
+}
+
+/// Browse the Hub with sort / GGUF facet / optional search — Discover's feed.
+#[tauri::command]
+pub async fn model_list(
+    state: State<'_, AppState>,
+    search: Option<String>,
+    sort: String,
+    gguf_only: bool,
+    limit: Option<u32>,
+) -> Result<ListPage, String> {
+    use noema_core::hf::ModelSort;
+    let sort = match sort.as_str() {
+        "downloads" => ModelSort::Downloads,
+        "likes" => ModelSort::Likes,
+        "updated" => ModelSort::Updated,
+        _ => ModelSort::Trending,
+    };
+    let q = noema_core::hf::ModelListQuery {
+        search: search.filter(|s| !s.trim().is_empty()),
+        author: None,
+        filters: if gguf_only {
+            vec!["gguf".into()]
+        } else {
+            Vec::new()
+        },
+        sort,
+        limit: limit.unwrap_or(30).clamp(1, 100) as usize,
+    };
+    let page = state.engine.hf_list(&q).await.map_err(|e| e.to_string())?;
+    Ok(to_page(page))
+}
+
+/// The next page of a listing, from a prior [`ListPage::next`] cursor.
+#[tauri::command]
+pub async fn model_list_page(state: State<'_, AppState>, next: String) -> Result<ListPage, String> {
+    let page = state
+        .engine
+        .hf_list_page(&next)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(to_page(page))
+}
+
+/// Community GGUF conversions of a base repo, most-downloaded first.
+#[tauri::command]
+pub async fn model_conversions(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Vec<ModelHit>, String> {
+    let models = state
+        .engine
+        .hf_conversions(&id, 6)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(models.into_iter().map(to_hit).collect())
+}
+
 /// A downloadable choice within a model: a single GGUF quant, or the whole
 /// safetensors/MLX bundle.
 #[derive(Serialize)]
@@ -96,11 +167,17 @@ pub struct Variant {
     fit_reason: String,
     /// The file's sha256 content id, when known (GGUF quants).
     content_id: String,
+    /// Coarse quality tier for a GGUF quant label ("balanced", "near-lossless", …).
+    tier: Option<String>,
+    /// Hover hint explaining the tier.
+    tier_hint: Option<String>,
+    /// Whether this quant fits the detected memory budget (with 1.2x headroom).
+    /// `None` when the budget is unknown or for bundles.
+    fits: Option<bool>,
 }
 
 /// Pick the recommended quant by total size against the detected memory budget.
-/// Returns the index into `sizes` plus a short human rationale. Operates on
-/// quant totals, so a split GGUF is judged by its whole size, not one shard.
+/// Judges a split GGUF by its whole size, not one shard.
 fn recommend_quant_index(sizes: &[u64], budget: u64) -> Option<(usize, String)> {
     if sizes.is_empty() {
         return None;
@@ -154,12 +231,24 @@ fn pick_default_quant(detail: &noema_core::hf::HfModelDetail) -> Option<noema_co
 #[derive(Serialize)]
 pub struct ModelDetail {
     id: String,
+    /// The short human name (the part after `org/`).
+    name: String,
     revision: String,
     gated: bool,
     license: Option<String>,
     variants: Vec<Variant>,
     /// Detected memory budget (bytes) used for the recommendation; 0 if unknown.
     budget_bytes: u64,
+    downloads: u64,
+    likes: u64,
+    last_modified: Option<String>,
+    /// Compact parameter-count label ("7.6B"), when the Hub reports it.
+    params_label: Option<String>,
+    /// Compact context-window label ("128K"), when the Hub reports it.
+    context_label: Option<String>,
+    architecture: Option<String>,
+    /// Whether this repo publishes any GGUF quants (drives the conversions hop).
+    has_gguf: bool,
 }
 
 #[tauri::command]
@@ -179,6 +268,7 @@ pub async fn model_detail(state: State<'_, AppState>, id: String) -> Result<Mode
     let mut variants = Vec::new();
     for (i, q) in quants.iter().enumerate() {
         let recommended = rec.as_ref().map(|(ri, _)| *ri == i).unwrap_or(false);
+        let tier = noema_core::hf::quant_quality_tier(&q.label);
         variants.push(Variant {
             label: q.label.clone(),
             file: Some(q.files[0].rfilename.clone()),
@@ -199,6 +289,9 @@ pub async fn model_detail(state: State<'_, AppState>, id: String) -> Result<Mode
             } else {
                 String::new()
             },
+            tier: tier.map(|(t, _)| t.to_string()),
+            tier_hint: tier.map(|(_, h)| h.to_string()),
+            fits: (budget > 0).then(|| q.total_size() as f64 * 1.2 <= budget as f64),
         });
     }
     if d.has_safetensors_bundle() {
@@ -212,17 +305,82 @@ pub async fn model_detail(state: State<'_, AppState>, id: String) -> Result<Mode
             recommended: false,
             fit_reason: String::new(),
             content_id: String::new(),
+            tier: None,
+            tier_hint: None,
+            fits: None,
         });
     }
 
     Ok(ModelDetail {
         id: d.id.clone(),
+        name: d.name().to_string(),
         revision: d.revision.clone(),
         gated: d.gated,
         license: d.license.clone(),
         variants,
         budget_bytes: budget,
+        downloads: d.downloads,
+        likes: d.likes,
+        last_modified: d.last_modified.clone(),
+        params_label: d.params_label(),
+        context_label: d.context_label(),
+        architecture: d.architecture.clone(),
+        has_gguf: !quants.is_empty(),
     })
+}
+
+/// The model card (README) parsed into renderable blocks — the UI renders these
+/// natively (no HTML injection). `None` = the repo has no README.
+#[tauri::command]
+pub async fn model_readme(
+    state: State<'_, AppState>,
+    id: String,
+    revision: String,
+) -> Result<Option<Vec<noema_core::readme::Block>>, String> {
+    let raw = state
+        .engine
+        .hf_model_readme(&id, &revision)
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(raw) = raw else { return Ok(None) };
+    // Parsing is CPU-bound; keep it off the async runtime's core threads.
+    let doc = tauri::async_runtime::spawn_blocking(move || noema_core::readme::parse(&raw))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(Some(doc.blocks))
+}
+
+/// Open an http(s) URL in the system browser. Links inside the app (model-card
+/// links especially) must never navigate the app's own webview.
+#[tauri::command]
+pub fn open_external(url: String) -> Result<(), String> {
+    let url = url.trim();
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("only http(s) links can be opened".into());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(url)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("rundll32")
+            .arg("url.dll,FileProtocolHandler")
+            .arg(url)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(url)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// Progress event payload pushed to the webview during a download. `transfer_id`
@@ -243,8 +401,7 @@ pub struct ProgressEvent {
     effective_start: Option<u64>,
     /// Connected swarm peers (BitTorrent; `0` for byte-only sources).
     peers: u32,
-    /// Cumulative bytes uploaded to peers this transfer (BitTorrent seeding) —
-    /// lets the UI show a seed ratio. `0` for non-swarm transports.
+    /// Cumulative bytes uploaded to peers this transfer (BitTorrent seeding); `0` for non-swarm transports.
     uploaded_bytes: u64,
 }
 
@@ -276,10 +433,8 @@ pub struct DownloadResult {
     artifacts: usize,
 }
 
-/// Classify a download outcome for the UI: a user Pause keeps the partial and is
-/// resumable, a Stop discards it, no eligible source (typically a peer-only model
-/// with nobody online) is a resumable "waiting for peers", anything else is a
-/// genuine failure.
+/// Classify a download outcome for the UI: Pause keeps a resumable partial, Stop
+/// discards it, no eligible source is a resumable "waiting", else a genuine failure.
 fn download_end_status(e: &noema_core::Error) -> &'static str {
     match e {
         noema_core::Error::Cancelled => "paused",
@@ -290,16 +445,14 @@ fn download_end_status(e: &noema_core::Error) -> &'static str {
 }
 
 /// A double-press of Resume hits the engine's already-running guard, which is not
-/// a real failure — the first run is still live and will emit its own `done`. Detect
-/// it so the command can stay silent instead of flipping the live card to "error".
+/// a real failure — the first run is still live and will emit its own `done`.
 fn is_already_running(e: &noema_core::Error) -> bool {
     matches!(e, noema_core::Error::Other(msg) if msg.contains("already running"))
 }
 
 /// The engine's deterministic manifest id for a content / link download
-/// (`mdl_p2p_<seed[..12]>`, seed = sha256 if 64 chars else blake3). Mirrors
-/// `content_manifest` in the engine so the front-end can re-key its provisional
-/// row by the exact id before the download starts, without a FIFO adopt.
+/// (`mdl_p2p_<seed[..12]>`, seed = sha256 if 64 chars else blake3). Mirrors the
+/// engine so the front-end can re-key its provisional row up front (no FIFO adopt).
 fn content_manifest_id(sha256: &str, blake3: &str) -> String {
     let seed = if sha256.len() == 64 { sha256 } else { blake3 };
     // Slice on char boundaries: an untrusted link's id may be non-ASCII, and
@@ -307,13 +460,8 @@ fn content_manifest_id(sha256: &str, blake3: &str) -> String {
     format!("mdl_p2p_{}", seed.chars().take(12).collect::<String>())
 }
 
-/// Import the chosen variant's manifest, then download it, streaming verified
-/// bytes into the cache. Emits `download://progress` per chunk-boundary and
-/// `download://done` at the end.
-/// Tell the front-end the engine's real transfer id for a download it kicked off
-/// with a provisional (`tmp_…`) key, so it can re-key *its own* row deterministically
-/// instead of guessing via FIFO. Emitted right after the manifest is registered,
-/// before the (long) download await.
+/// Tells the front-end the engine's real transfer id for a provisional (`tmp_…`)
+/// download, so it can re-key its own row deterministically instead of guessing.
 #[derive(Serialize, Clone)]
 struct RegisteredEvent {
     client_ref: String,
@@ -366,8 +514,7 @@ pub async fn download_model(
 
     // Resolve the import: the explicitly requested safetensors/MLX bundle (its
     // variant has no `file`, so without this flag a mixed repo would fall through
-    // to a GGUF quant the user didn't pick), else an explicit GGUF file, else the
-    // first GGUF, else the bundle.
+    // to a GGUF quant the user didn't pick), else the chosen/first GGUF, else bundle.
     let quants = detail.gguf_quants();
     let import = if bundle.unwrap_or(false) {
         if !detail.has_safetensors_bundle() {
@@ -441,9 +588,8 @@ pub async fn download_model(
     }
 }
 
-/// Resume a paused (or peer-stalled) download straight from the Transfers page.
-/// The engine picks up from the kept `.part` and re-plans sources, so it tries
-/// whatever peers or fallbacks are reachable now. Best-effort: if no source is
+/// Resume a paused (or peer-stalled) download from the Transfers page: the engine
+/// picks up from the kept `.part` and re-plans sources. Best-effort — if none is
 /// available it reports "waiting" and can be resumed again later.
 #[tauri::command]
 pub async fn resume_download(
@@ -557,13 +703,10 @@ pub async fn add_by_link(
     let engine = state.engine.clone();
 
     if noema_core::is_bundle_link(&link) {
-        // A bundle is N independent files, each with its own deterministic
-        // manifest id. The engine downloads them one by one (each emitting progress
-        // under its own id), so the UI sees N cards. Drive them per-file here: the
-        // FIRST file re-keys the provisional row the UI created (via client_ref),
-        // and every file gets its own `registered` + terminal `done`. Without the
-        // per-file done, files 2..N spawned orphan cards (created on first progress)
-        // that never settled and lingered forever.
+        // A bundle is N independent files, each with its own deterministic manifest
+        // id, downloaded one by one (each emitting progress under its own id). The
+        // first file re-keys the UI's provisional row (via client_ref); every file
+        // needs its own terminal `done`, or files 2..N linger as orphan cards.
         let bundle = noema_core::ShareBundle::decode(&link).map_err(|e| e.to_string())?;
         let files: Vec<_> = bundle
             .files
@@ -881,11 +1024,9 @@ pub async fn save_settings(
     ));
 
     // Turning the gated-share toggle OFF must promptly stop sharing every confirmed
-    // gated model — clear the confirmations and sever its blobs (Iroh + BitTorrent)
-    // — instead of leaving them seeding until the slow background reconcile.
+    // gated model, not leave them seeding until the slow background reconcile.
     // `revoke_gated_shares` clears the overrides and tears down BT seeding itself,
     // returning each cleared `(blake3, sha256)` so we Iroh-unseed + withdraw here.
-    // Best-effort.
     let gated_was_on = engine.share_gated_enabled();
     if gated_was_on && !settings.share_gated {
         engine.set_share_gated_enabled(false);
@@ -951,11 +1092,9 @@ pub async fn worldwide_status(state: State<'_, AppState>) -> Result<serde_json::
     }))
 }
 
-/// Per-model upload activity: every shared model in the library together with how
-/// many peers are pulling it right now (Iroh) and whether it's being seeded over
-/// BitTorrent. Drives the live "sharing" view. BitTorrent seeding is engine-owned
-/// and runs even when the Iroh worldwide session isn't up, so a model can be
-/// truthfully "sharing" over BT alone.
+/// Per-model upload activity: every shared model with how many peers are pulling it
+/// now (Iroh) and whether it's seeded over BitTorrent. Drives the live "sharing"
+/// view; BT seeding is engine-owned and can be live even when the Iroh session isn't.
 #[tauri::command]
 pub async fn uploads_list(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let iroh_live = state.share.lock().await.is_some();
@@ -1198,10 +1337,9 @@ pub async fn import_local(
         .await
         .map_err(|e| e.to_string())?;
 
-    // The bytes are now durably in the cache — the import has succeeded. Announce
-    // to the worldwide mesh in the *background*: a slow or unreachable seeder /
-    // tracker must never keep the user staring at "Working…" after the import is
-    // already done on disk. `SeederHandle` is cloneable + `Send` for exactly this.
+    // The bytes are now durably in the cache, so the import has succeeded. Announce
+    // to the worldwide mesh in the background: a slow or unreachable seeder / tracker
+    // must not block the user after the import is already done on disk.
     if out.shareable {
         if let Ok(items) = state.engine.share_announce_items() {
             let handle = state.share.lock().await.as_ref().map(|w| w.seeder_handle());
@@ -1317,8 +1455,7 @@ pub fn copy_share_link(state: State<'_, AppState>, manifest_id: String) -> Resul
 }
 
 /// The BitTorrent magnet for a seeded blob (empty string when it isn't seeded over
-/// BT). Returned to the front-end so a Library / Transfers row can copy it to the
-/// clipboard. The blob must be seeded over BitTorrent for a magnet to exist.
+/// BT). Returned to the front-end so a Library / Transfers row can copy it.
 #[tauri::command]
 pub fn bt_magnet(state: State<'_, AppState>, blake3: String) -> String {
     state.engine.bt_magnet(&blake3)
@@ -1362,11 +1499,9 @@ fn to_peer_rows(peers: Vec<noema_core::transport::BtPeer>) -> Vec<PeerRow> {
         .collect()
 }
 
-/// Live BitTorrent peers for a transfer, by its transfer/manifest id (the key the
-/// Transfers list already holds). Resolves the manifest's blob blake3(s) and
-/// aggregates each blob's managed-torrent peers (its seed and/or in-flight leech).
-/// Empty when BitTorrent is off / not built in, the session isn't up, the manifest
-/// is unknown, or the blob isn't a live torrent here. Synchronous.
+/// Live BitTorrent peers for a transfer, by its transfer/manifest id. Resolves the
+/// manifest's blob blake3(s) and aggregates each blob's managed-torrent peers.
+/// Empty when BT is off, the session isn't up, or the blob isn't a live torrent.
 #[tauri::command]
 pub fn bt_peers(state: State<'_, AppState>, transfer_id: String) -> Vec<PeerRow> {
     let manifest = match state.engine.get_manifest(&transfer_id) {
@@ -1391,9 +1526,8 @@ pub fn bt_peers_for_blob(state: State<'_, AppState>, blake3: String) -> Vec<Peer
     to_peer_rows(state.engine.bt_peers(&blake3))
 }
 
-/// Set the download-routing preference live (no restart). Mirrors the engine's
-/// other runtime toggles; persisted separately in `StudioSettings` via
-/// `save_settings`.
+/// Set the download-routing preference live (no restart); persisted separately in
+/// `StudioSettings` via `save_settings`.
 #[tauri::command]
 pub fn set_download_preference(state: State<'_, AppState>, preference: u8) {
     state
@@ -1566,4 +1700,275 @@ pub fn reveal(path: String) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// One Library model whose Hugging Face repo has moved past the pinned revision.
+#[derive(Serialize)]
+pub struct UpdateHit {
+    manifest_id: String,
+    repo: String,
+}
+
+/// Compare each HF-sourced Library model's pinned revision against the live repo.
+/// Manifests pin the exact commit, so this is a cheap equality check; one detail
+/// fetch per unique repo, not per model.
+#[tauri::command]
+pub async fn check_model_updates(state: State<'_, AppState>) -> Result<Vec<UpdateHit>, String> {
+    let engine = state.engine.clone();
+    let installed = engine.installed_models().map_err(|e| e.to_string())?;
+    let mut targets: Vec<(String, String, String)> = Vec::new();
+    for m in &installed {
+        if !m.from_hf {
+            continue;
+        }
+        if let Ok(Some(man)) = engine.get_manifest(&m.manifest_id) {
+            'outer: for a in &man.artifacts {
+                for src in &a.sources {
+                    if let noema_core::Source::Huggingface {
+                        repo_id, revision, ..
+                    } = src
+                    {
+                        targets.push((m.manifest_id.clone(), repo_id.clone(), revision.clone()));
+                        break 'outer;
+                    }
+                }
+            }
+        }
+    }
+    let mut live: HashMap<String, Option<String>> = HashMap::new();
+    for (_, repo, _) in &targets {
+        if !live.contains_key(repo) {
+            let rev = engine.hf_model_detail(repo).await.ok().map(|d| d.revision);
+            live.insert(repo.clone(), rev);
+        }
+    }
+    let mut out = Vec::new();
+    for (manifest_id, repo, pinned) in targets {
+        if let Some(Some(rev)) = live.get(&repo) {
+            if *rev != pinned {
+                out.push(UpdateHit { manifest_id, repo });
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[derive(Serialize)]
+pub struct ScanResult {
+    imported: usize,
+    failed: usize,
+}
+
+/// Scan the common locations other local-LLM tools keep GGUF models and import
+/// every file found (content-addressed, so re-imports dedupe).
+#[tauri::command]
+pub async fn scan_import(state: State<'_, AppState>) -> Result<ScanResult, String> {
+    // The directory walk is blocking I/O.
+    let files = tauri::async_runtime::spawn_blocking(|| {
+        let mut files = Vec::new();
+        for dir in common_model_dirs() {
+            find_gguf_files(&dir, &mut files, 6);
+        }
+        files
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    let mut imported = 0usize;
+    let mut failed = 0usize;
+    for f in files {
+        match state.engine.import_local_file(&f).await {
+            Ok(_) => imported += 1,
+            Err(_) => failed += 1,
+        }
+    }
+    Ok(ScanResult { imported, failed })
+}
+
+#[derive(Serialize)]
+pub struct RuntimesPresent {
+    lmstudio: bool,
+    ollama: bool,
+}
+
+/// Which local runtimes look installed on this machine (drives the per-row
+/// handoff buttons in the Library).
+#[tauri::command]
+pub async fn runtimes_present() -> Result<RuntimesPresent, String> {
+    tauri::async_runtime::spawn_blocking(|| RuntimesPresent {
+        lmstudio: detect_lmstudio(),
+        ollama: detect_ollama(),
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Link an installed GGUF into LM Studio's models folder layout.
+#[tauri::command]
+pub async fn handoff_lmstudio(path: String, name: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || lmstudio_place(&path, &name))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Register an installed GGUF with Ollama via `ollama create`.
+#[tauri::command]
+pub async fn handoff_ollama(path: String, name: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || ollama_create(&path, &name))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+/// Common locations other local-LLM tools keep GGUF models (mirrors the CLI's
+/// scan-import). Only existing directories are returned.
+fn common_model_dirs() -> Vec<PathBuf> {
+    let Some(h) = home_dir() else {
+        return Vec::new();
+    };
+    let candidates = [
+        h.join(".lmstudio").join("models"),
+        h.join(".cache").join("lm-studio").join("models"),
+        h.join(".cache").join("llama.cpp"),
+        h.join("Library")
+            .join("Application Support")
+            .join("nomic.ai")
+            .join("GPT4All"),
+        h.join(".cache").join("gpt4all"),
+        h.join(".cache").join("huggingface").join("hub"),
+    ];
+    candidates.into_iter().filter(|d| d.is_dir()).collect()
+}
+
+fn find_gguf_files(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
+    if depth == 0 || !dir.is_dir() {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            find_gguf_files(&path, out, depth - 1);
+        } else if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("gguf"))
+            .unwrap_or(false)
+        {
+            out.push(path);
+        }
+    }
+}
+
+fn detect_lmstudio() -> bool {
+    if let Some(h) = home_dir() {
+        if h.join(".lmstudio").is_dir() || h.join(".cache").join("lm-studio").is_dir() {
+            return true;
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if Path::new("/Applications/LM Studio.app").exists() {
+        return true;
+    }
+    false
+}
+
+fn detect_ollama() -> bool {
+    let path_hit = std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths)
+            .any(|d| d.join("ollama").is_file() || d.join("ollama.exe").is_file())
+    });
+    path_hit
+        || Path::new("/usr/local/bin/ollama").is_file()
+        || Path::new("/opt/homebrew/bin/ollama").is_file()
+}
+
+/// Link (or copy) a verified model file into LM Studio's models folder layout
+/// (`models/<publisher>/<model>/file.gguf`), then open LM Studio if possible.
+fn lmstudio_place(path: &str, name: &str) -> Result<String, String> {
+    let src = Path::new(path);
+    if !src.is_file() {
+        return Err("the model file isn't on disk anymore".into());
+    }
+    let home = home_dir().ok_or("no home directory")?;
+    let folder = sanitize_handoff_name(name);
+    let base = home
+        .join(".lmstudio")
+        .join("models")
+        .join("noema-atlas")
+        .join(&folder);
+    std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
+    let file_name = src.file_name().ok_or("bad file name")?;
+    let dest = base.join(file_name);
+    if !dest.exists() {
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(src, &dest).is_ok();
+        #[cfg(windows)]
+        let linked = std::fs::hard_link(src, &dest).is_ok();
+        if !linked {
+            std::fs::copy(src, &dest).map_err(|e| e.to_string())?;
+        }
+    }
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open")
+        .arg("-a")
+        .arg("LM Studio")
+        .spawn();
+    Ok(format!(
+        "Added to LM Studio under noema-atlas/{folder} — pick it from LM Studio's model list."
+    ))
+}
+
+/// Register a GGUF with Ollama via `ollama create` and a minimal Modelfile.
+fn ollama_create(path: &str, name: &str) -> Result<String, String> {
+    let src = Path::new(path);
+    if !src.is_file() {
+        return Err("the model file isn't on disk anymore".into());
+    }
+    let tag = sanitize_handoff_name(name).to_lowercase();
+    let modelfile = std::env::temp_dir().join(format!("noema-modelfile-{tag}"));
+    std::fs::write(&modelfile, format!("FROM {}\n", src.display())).map_err(|e| e.to_string())?;
+    let out = std::process::Command::new("ollama")
+        .arg("create")
+        .arg(&tag)
+        .arg("-f")
+        .arg(&modelfile)
+        .output()
+        .map_err(|e| format!("couldn't run ollama: {e}"))?;
+    let _ = std::fs::remove_file(&modelfile);
+    if out.status.success() {
+        Ok(format!("Registered with Ollama — run `ollama run {tag}`."))
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .last()
+            .unwrap_or("ollama create failed")
+            .to_string())
+    }
+}
+
+/// A safe folder/tag name for runtime handoffs.
+fn sanitize_handoff_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches('-');
+    if trimmed.is_empty() {
+        "model".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }

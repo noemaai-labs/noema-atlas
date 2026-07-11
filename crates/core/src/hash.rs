@@ -5,8 +5,7 @@ use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::Path;
 
-/// Default Merkle leaf size (1 MiB). Chosen as a balance between proof size and
-/// verification granularity for multi-gigabyte weight files.
+/// Default Merkle leaf size (1 MiB), balancing proof size against verification granularity.
 pub const DEFAULT_LEAF_SIZE: u64 = 1 << 20;
 
 /// A set of content digests in lowercase hex.
@@ -17,9 +16,7 @@ pub struct Hashes {
     /// SHA-256 hash of the whole artifact (hex, 64 chars).
     pub sha256: String,
     /// Git blob OID (hex sha1, 40 chars): `sha1("blob " + len + "\0" + bytes)`.
-    /// Carried for the small non-LFS sidecar files of a multi-file model, where
-    /// the Hub publishes only this `blobId` and never an LFS sha256. Empty when
-    /// not applicable (the common case — weights are sha256-backed).
+    /// Set for non-LFS sidecar files (the Hub's only pre-published digest); empty otherwise.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub git_blob_sha1: String,
 }
@@ -33,8 +30,7 @@ impl Hashes {
         }
     }
 
-    /// A hashes value carrying only a sha256 (blake3 unknown until downloaded).
-    /// Used for sources like Hugging Face that publish sha256 ahead of time.
+    /// A hashes value carrying only a sha256 (sources that publish sha256 ahead of time).
     pub fn sha256_only(sha256: impl Into<String>) -> Self {
         Hashes {
             blake3: String::new(),
@@ -43,9 +39,8 @@ impl Hashes {
         }
     }
 
-    /// A hashes value carrying only a git blob OID (the only pre-published
-    /// digest the Hub exposes for non-LFS files). The blake3/sha256 are computed
-    /// and recorded on download; until then this is the integrity anchor.
+    /// A hashes value carrying only a git blob OID (the Hub's only pre-published digest
+    /// for non-LFS files); blake3/sha256 are computed on download.
     pub fn git_blob_sha1_only(git_blob_sha1: impl Into<String>) -> Self {
         Hashes {
             blake3: String::new(),
@@ -75,11 +70,9 @@ impl Hashes {
                 .eq_ignore_ascii_case(&other.git_blob_sha1)
     }
 
-    /// Check the *expected* digests in `self` against freshly-`computed` ones,
-    /// comparing only the digests that are present (non-empty) in `self`.
-    /// Returns the first `(label, expected, actual)` that diverged, or `None`
-    /// if every present digest matched. At least one expected digest must be
-    /// present (callers guarantee this via manifest validation).
+    /// Compare the present (non-empty) digests in `self` against freshly-`computed` ones,
+    /// returning the first `(label, expected, actual)` that diverged, or `None` if all matched.
+    /// At least one expected digest must be present (callers guarantee this).
     pub fn mismatch_against(&self, computed: &Hashes) -> Option<(&'static str, String, String)> {
         if self.has_blake3() && !self.blake3.eq_ignore_ascii_case(&computed.blake3) {
             return Some(("blake3", self.blake3.clone(), computed.blake3.clone()));
@@ -102,13 +95,12 @@ impl Hashes {
     }
 }
 
-/// Streaming hasher producing BLAKE3 + SHA-256 (and, when a git-blob length is
-/// supplied up front, the git blob OID — sha1 of `"blob <len>\0" + content`).
+/// Streaming hasher producing BLAKE3 + SHA-256, plus the git blob OID when a
+/// git-blob length is supplied up front.
 pub struct DualHasher {
     blake3: blake3::Hasher,
     sha256: Sha256,
-    /// Present only when built with [`DualHasher::with_git_blob_len`]; the git
-    /// header (`blob <len>\0`) is fed at construction, then content streams in.
+    /// Present only when built with [`DualHasher::with_git_blob_len`] (git header fed at construction).
     git: Option<Sha1>,
     len: u64,
 }
@@ -129,10 +121,8 @@ impl DualHasher {
         }
     }
 
-    /// Build a hasher that *also* computes the git blob OID. `content_len` is the
-    /// total byte length of the artifact (known ahead of time for Hub files): the
-    /// git OID hashes `"blob <content_len>\0"` followed by every content byte, so
-    /// the length must be the whole file's, even across a resumed download.
+    /// Build a hasher that *also* computes the git blob OID. `content_len` must be the
+    /// whole artifact's byte length (not a partial), even across a resumed download.
     pub fn with_git_blob_len(content_len: u64) -> Self {
         let mut git = Sha1::new();
         git.update(format!("blob {content_len}\0").as_bytes());
@@ -175,9 +165,7 @@ impl DualHasher {
     }
 }
 
-/// Compute the git blob OID of an in-memory byte slice (`sha1("blob <len>\0" +
-/// data)`), as lowercase hex. This is exactly the `blobId` the Hub publishes for
-/// non-LFS files.
+/// Compute the git blob OID of a byte slice (`sha1("blob <len>\0" + data)`), lowercase hex.
 pub fn git_blob_oid(data: &[u8]) -> String {
     let mut h = Sha1::new();
     h.update(format!("blob {}\0", data.len()).as_bytes());
@@ -190,15 +178,13 @@ pub fn hash_file(path: &Path) -> Result<(Hashes, u64)> {
     hash_file_inner(path, false, &mut |_, _| {})
 }
 
-/// Like [`hash_file`], but *also* computes the git blob OID. Used to verify a
-/// non-LFS sidecar file against the Hub's published `blobId`.
+/// Like [`hash_file`], but *also* computes the git blob OID (for non-LFS sidecar files).
 pub fn hash_file_with_git(path: &Path) -> Result<(Hashes, u64)> {
     hash_file_inner(path, true, &mut |_, _| {})
 }
 
 /// Like [`hash_file`], but reports `(bytes_hashed, bytes_total)` after each chunk
-/// so a UI can show live progress while a multi-gigabyte file is read (a local
-/// import's dominant cost). `bytes_total` is the file's size, taken up front.
+/// so a UI can show live progress. `bytes_total` is the file's size, taken up front.
 pub fn hash_file_with_progress(
     path: &Path,
     mut on_progress: impl FnMut(u64, u64),
@@ -295,8 +281,7 @@ impl ChunkTree {
         Self::from_file_cancellable(path, leaf_size, None)
     }
 
-    /// As [`from_file`], but aborts with [`Error::Cancelled`] when `cancel` flips —
-    /// the read is a whole (multi-GB) blob pass that runs after a download succeeds.
+    /// As [`from_file`], but aborts with [`Error::Cancelled`] when `cancel` flips.
     pub fn from_file_cancellable(
         path: &Path,
         leaf_size: u64,

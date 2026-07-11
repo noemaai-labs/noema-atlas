@@ -44,21 +44,12 @@ pub async fn run(engine: Arc<Engine>, addr: std::net::SocketAddr) -> anyhow::Res
     Ok(())
 }
 
-/// Gate every request: it must look genuinely local and same-origin. The
-/// dashboard is an unauthenticated admin surface (it can import manifests, start
-/// downloads, and install/delete blobs at caller-chosen paths), so without this a
-/// page the user merely *visits* could drive it via the loopback address.
-///
-/// - A loopback `Host` header is required, which defeats DNS rebinding (a remote
-///   name resolving to 127.0.0.1 still carries its own `Host`).
-/// - State-changing methods must not be cross-site: browsers tag the request with
-///   `Sec-Fetch-Site`, and the dashboard's own JS additionally sends
-///   `X-Noema-Local`, which a cross-origin page cannot add without a CORS preflight
-///   that we never grant.
+/// Gate every request to a genuinely-local, same-origin caller: this
+/// unauthenticated admin surface (imports, downloads, install/delete at
+/// caller-chosen paths) must not be drivable by a page the user merely visits.
 async fn local_guard(req: Request, next: Next) -> Response {
-    // The unspoofable check: the peer's socket address must be loopback. This holds
-    // even if the server is bound to a public interface, and defeats DNS rebinding
-    // (a rebound request still originates from the remote peer's IP).
+    // Unspoofable check: the peer socket must be loopback — holds even on a public
+    // bind, and defeats DNS rebinding.
     if let Some(axum::extract::ConnectInfo(peer)) = req
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
@@ -91,8 +82,7 @@ async fn local_guard(req: Request, next: Next) -> Response {
     next.run(req).await
 }
 
-/// Whether a `Host` header names the loopback interface (port and IPv6 brackets
-/// stripped). Anything else — including a rebinding domain — is rejected.
+/// Whether a `Host` header names the loopback interface (port and IPv6 brackets stripped).
 fn host_is_local(host: &str) -> bool {
     let h = host.trim();
     let h = if let Some(rest) = h.strip_prefix('[') {
@@ -167,7 +157,6 @@ async fn api_manifest(State(s): State<UiState>, AxPath(id): AxPath<String>) -> R
             })
         })
         .collect();
-    // Which artifacts are already cached?
     let cached: std::collections::HashSet<String> = s
         .engine
         .list_cache()

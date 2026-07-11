@@ -35,8 +35,7 @@ pub enum Error {
 
     #[error("manifest is not signed by any trusted key")]
     Untrusted,
-    /// A digest did not match what the manifest declared. This is the central
-    /// integrity failure: the bytes are not what they claim to be.
+    /// A digest did not match what the manifest declared.
     #[error("hash mismatch for {what}: expected {expected}, got {actual}")]
     HashMismatch {
         what: String,
@@ -94,9 +93,7 @@ pub enum Error {
     Other(String),
 }
 
-/// Fine-grained classification of transport failures. The planner uses this to
-/// decide whether to retry the same source, fail over to another, or ban a
-/// source outright.
+/// Fine-grained classification of transport failures; drives planner retry/failover/ban decisions.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum TransportErrorKind {
@@ -120,8 +117,7 @@ pub enum TransportErrorKind {
     #[error("capability unsupported: {0}")]
     Unsupported(String),
 
-    /// Source served bytes that failed integrity verification. This is the most
-    /// serious transport error: the source is poisoning or corrupt.
+    /// Source served bytes that failed integrity verification.
     #[error("integrity failure: {0}")]
     Integrity(String),
 

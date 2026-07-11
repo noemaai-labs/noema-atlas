@@ -26,33 +26,25 @@ pub struct AppState {
 fn build_engine(root: &std::path::Path, s: &StudioSettings) -> anyhow::Result<Engine> {
     let mut cfg = EngineConfig::new(root.to_path_buf());
     cfg.max_download_connections = s.download_connections.max(1) as usize;
-    // Max simultaneous active transfers. Bound at engine open (the download
-    // scheduler sizes its slots here), so it takes effect on next launch — the
-    // Settings field is labelled as much.
+    // Bound at engine open, so takes effect on next launch.
     cfg.max_concurrent_downloads = s.bt_max_concurrent.max(1) as usize;
     cfg.rate_limit.set_bps(s.cap_bps());
     cfg.share_gated = s.share_gated;
-    // Always wire the tracker (falls back to the hosted default) so Explore /
-    // worldwide discovery works.
+    // Always wire the tracker (falls back to the hosted default) so discovery works.
     cfg.tracker_url = Some(s.tracker());
-    // Iroh fetch route: master AND its download sub-switch. The worldwide seeder is
-    // gated separately (the share toggle / launch auto-start below), so "seed on,
-    // download off" and "download on, seed off" both work.
+    // Iroh fetch route: master AND its download sub-switch (seeding is gated separately).
     cfg.transport.iroh_enabled = s.iroh_enabled && s.iroh_download;
-    // BitTorrent settings take effect on next launch (the session binds ports and
-    // opens the store at engine open) — the front-end says as much.
+    // BitTorrent settings take effect on next launch (bound at engine open).
     cfg.transport.bittorrent_enabled = s.bt_enabled;
     cfg.transport.bittorrent_download = s.bt_download;
     cfg.transport.bittorrent_seed = s.bt_seed;
     cfg.transport.bittorrent_listen_port_range = s.bt_listen_range();
     cfg.transport.bittorrent_max_up_bps = s.bt_up_bps();
     cfg.transport.bittorrent_max_down_bps = s.bt_down_bps();
-    // Stop-at-ratio: the seeding watch is armed at session open, so this takes
-    // effect on next launch (the Settings field says as much).
+    // Stop-at-ratio: armed at session open, so takes effect on next launch.
     cfg.transport.bittorrent_max_ratio = s.bt_max_ratio.max(0.0);
     cfg.transport.bittorrent_sequential = s.bt_sequential;
-    // Public trackers (in addition to the DHT). Privacy-relevant — see the Settings
-    // disclosure. Takes effect on next launch (trackers are attached at add-time).
+    // Public trackers (in addition to the DHT). Privacy-relevant; takes effect on next launch.
     cfg.transport.bittorrent_use_public_trackers = s.bt_use_public_trackers;
     // Connection/discovery options — all bind at session init, so next launch.
     cfg.transport.bittorrent_enable_upnp = s.bt_upnp;
@@ -61,8 +53,7 @@ fn build_engine(root: &std::path::Path, s: &StudioSettings) -> anyhow::Result<En
     cfg.transport.bittorrent_peer_protocol = noema_core::BtPeerProtocol::from_u8(s.bt_protocol);
     cfg.transport.bittorrent_max_peers_per_torrent = s.bt_max_peers;
     cfg.transport.bittorrent_anonymous = s.bt_anonymous;
-    // Download-routing preference: applied live by `set_download_preference`, but
-    // also seed the initial value so the first download honors it before any save.
+    // Applied live by `set_download_preference`; seeded so the first download honors it.
     cfg.download_preference = noema_core::DownloadPreference::from_u8(s.download_preference);
     if s.proxy_enabled {
         if let Some(p) = nonempty(&s.proxy_url) {
@@ -86,8 +77,7 @@ fn main() {
     let root = noema_core::paths::default_root();
     let mut settings = StudioSettings::load(&root);
 
-    // First-run identity bootstrap: a stable id + a friendly device name, both
-    // persisted so peers see a consistent name.
+    // First-run identity bootstrap: stable id + device name, persisted so peers see a consistent name.
     let mut dirty = false;
     if settings.device_id.trim().is_empty() {
         settings.device_id = noema_core::identity::new_device_id();
@@ -103,8 +93,7 @@ fn main() {
 
     let engine = build_engine(&root, &settings).expect("failed to open the Noema engine");
     engine.set_hf_download_enabled(settings.allow_hf_download);
-    // Install the time-of-day bandwidth schedule (alternative speed limits) and start
-    // its per-minute ticker.
+    // Install the time-of-day bandwidth schedule and start its ticker.
     engine.set_bandwidth_schedule(settings.bandwidth_schedule());
 
     // Seed over Iroh only when the master is on AND the seed sub-switch is on.
@@ -124,7 +113,17 @@ fn main() {
             commands::app_info,
             commands::search_models,
             commands::popular_models,
+            commands::model_list,
+            commands::model_list_page,
+            commands::model_conversions,
             commands::model_detail,
+            commands::check_model_updates,
+            commands::scan_import,
+            commands::runtimes_present,
+            commands::handoff_lmstudio,
+            commands::handoff_ollama,
+            commands::model_readme,
+            commands::open_external,
             commands::download_model,
             commands::resume_download,
             commands::mesh_search,
@@ -195,11 +194,8 @@ fn main() {
     app.run(|handle, event| match &event {
         // Quit (Cmd+Q / the Quit menu).
         tauri::RunEvent::ExitRequested { .. } => shutdown_cleanup(handle),
-        // Window close (the red traffic-light button). On macOS this does *not*
-        // quit the process by default, so without handling it the seeder would keep
-        // running and re-announcing after the user thinks the app is closed — and
-        // the device would linger as a peer in everyone else's Explore. Clean up,
-        // then exit so a close behaves like a quit.
+        // Window close: on macOS this doesn't quit by default, so clean up and exit
+        // to stop the seeder lingering as a peer in others' Explore.
         tauri::RunEvent::WindowEvent {
             event: tauri::WindowEvent::CloseRequested { .. },
             ..
@@ -211,10 +207,7 @@ fn main() {
     });
 }
 
-/// Stop seeding and withdraw this device's announces from the tracker, so it stops
-/// showing as a peer in others' Explore the instant the app closes rather than
-/// lingering until the announce TTL. Runs once (guarded against the close→exit
-/// re-entry), and is bounded so a slow or unreachable tracker can't hang the quit.
+/// Stop seeding and withdraw tracker announces on close; runs once and is time-bounded.
 fn shutdown_cleanup(handle: &tauri::AppHandle) {
     use std::sync::atomic::{AtomicBool, Ordering};
     static DONE: AtomicBool = AtomicBool::new(false);
@@ -222,10 +215,7 @@ fn shutdown_cleanup(handle: &tauri::AppHandle) {
         return;
     }
     let state = handle.state::<AppState>();
-    // Pause every in-flight transfer before tearing anything down (parity with the
-    // desktop's on-exit handler). Each pause keeps the partial on disk and lets the
-    // BitTorrent session flush fastresume, so a relaunch resumes cleanly instead of
-    // losing progress when the process exits mid-download. Synchronous + immediate.
+    // Pause every in-flight transfer first so partials survive and BT flushes fastresume for a clean resume.
     state.engine.request_pause();
     tauri::async_runtime::block_on(async {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), async {

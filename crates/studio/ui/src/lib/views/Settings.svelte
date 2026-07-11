@@ -108,9 +108,7 @@
     }
   }
 
-  // Iroh's seeder toggles live; the download route applies on next launch. Both the
-  // "Use Iroh" master and the "Seed worldwide" sub-switch reconcile through here, so
-  // the live seeder matches (iroh_enabled && share_worldwide).
+  // Keeps the live seeder in sync with (iroh_enabled && share_worldwide); seeding applies live, download route on next launch.
   async function reconcileIroh() {
     try {
       await api.saveSettings(s);
@@ -202,7 +200,8 @@
         <div class="muted">
           NAT-traversing peer-to-peer networking — no ports to open. Turn it off to disable
           Iroh entirely; while it's on, the switches below choose whether you download from
-          peers, seed back to the mesh, or both.
+          peers, seed back over Iroh, or both. Seeding reacts immediately; the download
+          route applies on next launch.
           {#if sharing}<span class="pill ok">seeding</span>{/if}
         </div>
       </div>
@@ -214,7 +213,7 @@
         <label class="switch"><input type="checkbox" bind:checked={s.iroh_download} on:change={save} disabled={!s.iroh_enabled} /><span></span></label>
       </div>
       <div class="row">
-        <div><div>Seed my models to the world</div><div class="muted">Share verified, openly-licensed models so peers can find them in Discover</div></div>
+        <div><div>Seed my models to the world over Iroh</div><div class="muted">Share verified, openly-licensed models so peers can find them in Discover</div></div>
         <label class="switch"><input type="checkbox" bind:checked={s.share_worldwide} on:change={reconcileIroh} disabled={!s.iroh_enabled} /><span></span></label>
       </div>
       <div class="row">
@@ -227,7 +226,7 @@
     <div class="row">
       <div>
         <div>Use BitTorrent</div>
-        <div class="muted">Connect to the BitTorrent swarm. While connected, the switches below choose whether you download from the swarm, seed back to it, or both — and how it finds and connects to peers.</div>
+        <div class="muted">Connect to the BitTorrent swarm. While connected, the switches below choose whether you download from the swarm, seed back to it, or both — and how it finds and connects to peers. Applies on next launch.</div>
       </div>
       <label class="switch"><input type="checkbox" bind:checked={s.bt_enabled} on:change={save} /><span></span></label>
     </div>
@@ -239,7 +238,7 @@
       <div class="row">
         <div>
           <div>Seed openly-licensed models</div>
-          <div class="muted">Re-share verified, openly-licensed blobs back over BitTorrent</div>
+          <div class="muted">Re-share verified, openly-licensed blobs back over BitTorrent. Applies on next launch.</div>
         </div>
         <label class="switch"><input type="checkbox" bind:checked={s.bt_seed} on:change={save} disabled={!s.bt_enabled} /><span></span></label>
       </div>
@@ -286,7 +285,7 @@
       the proxy; any other proxy still exposes your real IP to BitTorrent peers.
     </p>
     <div class="field">
-      <span>Preferred listen port (0 = default range)</span>
+      <span>Preferred listen port (0 = inbound off)</span>
       <div style="display:flex; gap:8px; align-items:center">
         <input type="number" min="0" max="65535" bind:value={s.bt_port} on:change={save} disabled={!s.bt_enabled} style="flex:1" />
         <button class="btn sm" type="button" on:click={randomPort} disabled={!s.bt_enabled}>Random</button>
@@ -366,7 +365,7 @@
       <span>Download preference</span>
       <select bind:value={s.download_preference} on:change={applyPreference}>
         <option value={0}>Auto (balanced)</option>
-        <option value={1}>Prefer peer-to-peer</option>
+        <option value={1}>Prefer peers (Iroh + BitTorrent)</option>
         <option value={2}>Prefer BitTorrent</option>
         <option value={3}>Save data (single mirror)</option>
       </select>

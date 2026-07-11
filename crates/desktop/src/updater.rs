@@ -1,22 +1,12 @@
-//! In-app auto-update for Atlas.
-//!
-//! Flow: ping the VPS (`{tracker}/update/latest`) for the signed release manifest,
-//! verify it against the release key baked into the client
-//! ([`noema_core::update::UPDATE_RELEASE_PUBKEYS`]), confirm a strictly-newer version
-//! with an asset for this platform, then — on the user's click — download that asset,
-//! re-verify it byte-for-byte against the SHA-256 the signed manifest pins, and apply
-//! it in place. The VPS is never trusted to do more than point; the bytes executed
-//! must match a hash the offline release key signed.
-//!
-//! `UPDATE_RELEASE_PUBKEYS` is empty until the real release key is baked in, so until
-//! then [`check`] returns `Ok(None)` (no update is ever offered) — fail-closed.
+//! In-app auto-update for Atlas: verify a signed release manifest against the baked-in
+//! release key, then download + SHA-256-re-verify the asset before applying in place.
+//! The VPS only points; executed bytes must match a hash the offline release key signed.
+//! `UPDATE_RELEASE_PUBKEYS` is empty until shipped, so [`check`] returns `Ok(None)` — fail-closed.
 
 use noema_core::update::{PlatformAsset, ReleaseManifest, UPDATE_RELEASE_PUBKEYS};
 use std::path::{Path, PathBuf};
 
-/// How the running copy was installed — decides the apply mechanism. Variants are
-/// constructed per-platform (see [`detect_flavor`]), so any given build only builds a
-/// subset.
+/// How the running copy was installed — decides the apply mechanism (per-platform; see [`detect_flavor`]).
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Flavor {
@@ -76,6 +66,10 @@ pub struct UpdateUi {
     pub progress: Option<f32>,
     /// A version the user dismissed — hide its banner until something newer shows.
     pub dismissed: Option<String>,
+    /// Outcome of the most recent finished check: `None` = never checked this
+    /// session, `Some(Ok(()))` = confirmed current, `Some(Err(_))` = check
+    /// failed. The Settings row must not claim "up to date" without evidence.
+    pub last_check: Option<Result<(), String>>,
 }
 
 impl UpdateUi {
@@ -111,13 +105,9 @@ pub enum ApplyOutcome {
 }
 
 /// Build a proxy-aware rustls HTTP client, mirroring how the engine routes traffic.
-///
-/// `https_only` rejects an http:// manifest URL or a redirect that downgrades to
-/// `read_timeout` bounds the inter-byte gap so a stalled/slow-loris stream errors out
-/// instead of pinning the task forever — large assets still download fine since the
-/// bound is per read, not overall. (We deliberately do NOT force `https_only`: a
-/// self-hosted registry may be plain http, and the signature + SHA-256 gate already
-/// makes a downgraded/redirected transport unable to deliver attacker-chosen bytes.)
+/// `read_timeout` bounds the inter-byte gap so a stalled stream errors out. Not
+/// `https_only`: a self-hosted registry may be plain http, and the signature + SHA-256
+/// gate already stops a downgraded transport delivering attacker-chosen bytes.
 fn http_client(proxy: Option<&str>) -> Result<reqwest::Client, String> {
     let mut b = reqwest::Client::builder()
         .user_agent(concat!("noema-atlas/", env!("CARGO_PKG_VERSION")))
@@ -131,11 +121,8 @@ fn http_client(proxy: Option<&str>) -> Result<reqwest::Client, String> {
 }
 
 /// Ping the VPS for the signed manifest and decide whether an update applies.
-///
-/// Returns `Ok(None)` for every "nothing to do" case — no trusted signature, expired
-/// manifest, not newer, or no asset for this platform — so the caller treats a missing
-/// update and a healthy "you're current" identically. Network/parse failures are
-/// `Err` (surfaced only on a manual check, swallowed on the silent startup ping).
+/// `Ok(None)` = nothing to do (untrusted/expired/not-newer/no asset); `Err` = network/parse
+/// failure (surfaced only on a manual check, swallowed on the silent startup ping).
 pub async fn check(
     tracker_url: &str,
     current: &str,
@@ -310,8 +297,7 @@ pub fn stage_dir() -> PathBuf {
 }
 
 /// Detect how this copy was installed. Conservative: anything ambiguous falls back to
-/// [`Flavor::Managed`] so we never swap a binary we don't own. A `#[cfg]`-on-`let` per
-/// platform keeps the branches mutually exclusive and the return single.
+/// [`Flavor::Managed`] so we never swap a binary we don't own.
 pub fn detect_flavor() -> Flavor {
     let exe = std::env::current_exe().unwrap_or_default();
     let _ = &exe; // used on every supported target; silences the fallback arm
@@ -420,10 +406,8 @@ fn relaunched_or_failed(path: &Path) -> ApplyOutcome {
 
 /// Swap the running binary in place (portable builds) and relaunch.
 ///
-/// The portable/tarball assets are archives (`Noema-Atlas-windows-x86_64.zip`,
-/// `noema-atlas-linux-x86_64.tar.gz`) holding several binaries, so the one matching
-/// this executable is extracted first — swapping the raw archive bytes over the
-/// running exe would destroy the install.
+/// The portable/tarball assets are archives, so the binary matching this executable is
+/// extracted first — swapping raw archive bytes over the running exe would destroy it.
 fn apply_self_replace(staged: &Path) -> Result<ApplyOutcome, String> {
     // Resolve our own path BEFORE the swap: on Linux `/proc/self/exe` reads
     // "<path> (deleted)" once the old inode is unlinked, which can never be spawned.
@@ -461,9 +445,8 @@ fn apply_self_replace(staged: &Path) -> Result<ApplyOutcome, String> {
     Ok(relaunched_or_failed(&exe))
 }
 
-/// Unpack a verified `.zip` / `.tar.gz` into `dest` with the platform's own tools
-/// (mirrors how the macOS path shells out to `unzip`). Windows' `tar.exe` (bsdtar,
-/// present since Windows 10 1803) reads zips too; `Expand-Archive` is the fallback.
+/// Unpack a verified `.zip` / `.tar.gz` into `dest` with the platform's own tools.
+/// Windows' `tar.exe` reads zips too; `Expand-Archive` is the fallback.
 fn extract_archive(archive: &Path, dest: &Path) -> Result<(), String> {
     use std::process::Command;
     let name = archive
@@ -704,9 +687,8 @@ mod tests {
     use noema_core::update::{AppRelease, PlatformAsset, ReleaseManifest, RELEASE_MANIFEST_SCHEMA};
     use std::io::{Read, Write};
 
-    /// Serve a single canned `200 OK` JSON body on a throwaway loopback port, then
-    /// return the `http://127.0.0.1:PORT` base. Dependency-free (raw `TcpListener`),
-    /// so the client's real HTTP + parse + decision path is exercised end to end.
+    /// Serve a single canned `200 OK` JSON body on a throwaway loopback port and return
+    /// its `http://127.0.0.1:PORT` base, so the real HTTP + parse + decision path runs.
     fn serve_once(body: String) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
